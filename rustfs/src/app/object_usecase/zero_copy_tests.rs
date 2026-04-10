@@ -287,20 +287,11 @@ async fn select_reconstructed_chunk_read(
             continue;
         }
 
-        let candidate = get_object_zero_copy::prepare_get_object_chunk_read(
-            request_context,
-            ecstore,
-            manager,
-            &request_context.bucket,
-            &request_context.key,
-            request_context.rs.clone(),
-            request_context.part_number,
-            &request_context.opts,
-            std::time::Instant::now(),
-        )
-        .await
-        .unwrap()
-        .expect("expected chunk fast path");
+        let candidate =
+            get_object_zero_copy::prepare_get_object_chunk_read(request_context, ecstore, manager, std::time::Instant::now())
+                .await
+                .unwrap()
+                .expect("expected chunk fast path");
 
         let is_reconstructed = matches!(
             &candidate.body_source,
@@ -377,20 +368,11 @@ async fn prepare_get_object_chunk_read_marks_direct_path_for_single_disk_store()
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, copy_mode, .. } => {
@@ -441,19 +423,10 @@ async fn prepare_get_object_chunk_read_falls_back_to_legacy_when_chunk_bridge_fa
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap();
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap();
 
     assert!(read_setup.is_none(), "chunk bridge failure should fall back to legacy reader");
 }
@@ -489,20 +462,11 @@ async fn execute_get_object_range_marks_direct_path_for_single_disk_store() {
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, .. } => {
@@ -562,20 +526,11 @@ async fn execute_get_object_range_marks_direct_path_for_multi_disk_store_without
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, copy_mode, .. } => {
@@ -646,20 +601,11 @@ async fn execute_get_object_range_marks_reconstructed_path_for_multi_disk_store_
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, copy_mode, .. } => {
@@ -708,20 +654,11 @@ async fn execute_get_object_part_number_marks_direct_path_for_single_disk_store(
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, copy_mode, .. } => {
@@ -765,20 +702,11 @@ async fn execute_get_object_whole_multipart_marks_direct_path_for_single_disk_st
     let request_context = prepare_get_object_request_context(&req).await.unwrap();
     let manager = get_concurrency_manager();
 
-    let read_setup = get_object_zero_copy::prepare_get_object_chunk_read(
-        &request_context,
-        &ecstore,
-        manager,
-        &request_context.bucket,
-        &request_context.key,
-        request_context.rs.clone(),
-        request_context.part_number,
-        &request_context.opts,
-        std::time::Instant::now(),
-    )
-    .await
-    .unwrap()
-    .expect("expected chunk fast path");
+    let read_setup =
+        get_object_zero_copy::prepare_get_object_chunk_read(&request_context, &ecstore, manager, std::time::Instant::now())
+            .await
+            .unwrap()
+            .expect("expected chunk fast path");
 
     match read_setup.body_source {
         GetObjectBodySource::Chunk { path, copy_mode, .. } => {

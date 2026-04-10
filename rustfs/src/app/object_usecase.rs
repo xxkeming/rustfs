@@ -14,17 +14,13 @@
 
 //! Object application use-case contracts.
 
-mod app_adapters;
 mod get_object_flow;
 mod get_object_zero_copy;
 mod put_object_extract;
 mod put_object_flow;
-mod types;
 #[cfg(test)]
 mod zero_copy_tests;
-use self::app_adapters::*;
-use self::get_object_flow::{GetObjectBootstrap, GetObjectFlowRuntime};
-use self::types::*;
+use self::get_object_flow::GetObjectBootstrap;
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::capacity::record_capacity_write;
@@ -40,8 +36,8 @@ use crate::storage::options::{
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
     validate_archive_content_encoding,
 };
+use crate::storage::s3_api::acl;
 use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::s3_api::{acl, restore, select};
 use crate::storage::timeout_wrapper::{RequestTimeoutWrapper, TimeoutConfig};
 use crate::storage::*;
 use bytes::Bytes;
@@ -143,6 +139,34 @@ struct DeadlockRequestGuard {
     request_id: String,
 }
 
+#[derive(Clone)]
+pub(super) struct GetObjectRequestContext {
+    pub(super) bucket: String,
+    pub(super) key: String,
+    pub(super) part_number: Option<usize>,
+    pub(super) rs: Option<HTTPRangeSpec>,
+    pub(super) opts: ObjectOptions,
+    pub(super) headers: HeaderMap,
+    pub(super) sse_customer_key: Option<String>,
+    pub(super) sse_customer_key_md5: Option<String>,
+}
+
+pub(super) type PutObjectChecksums = rustfs_object_io::put::PutObjectChecksums;
+
+#[derive(Clone)]
+pub(super) struct PutObjectRequestContext {
+    pub(super) headers: HeaderMap,
+    pub(super) trailing_headers: Option<s3s::TrailingHeaders>,
+    pub(super) uri_query: Option<String>,
+    pub(super) is_post_object: bool,
+    pub(super) method: hyper::Method,
+    pub(super) uri: hyper::Uri,
+    pub(super) extensions: http::Extensions,
+    pub(super) credentials: Option<s3s::auth::Credentials>,
+    pub(super) region: Option<s3s::region::Region>,
+    pub(super) service: Option<String>,
+}
+
 impl DeadlockRequestGuard {
     fn new(deadlock_detector: Arc<deadlock_detector::DeadlockDetector>, request_id: String) -> Self {
         Self {
@@ -156,6 +180,26 @@ impl Drop for DeadlockRequestGuard {
     fn drop(&mut self) {
         self.deadlock_detector.unregister_request(&self.request_id);
     }
+}
+
+async fn resolve_bucket_default_server_side_encryption(bucket: &str) -> (Option<ServerSideEncryption>, Option<String>) {
+    let Some((config, _timestamp)) = metadata_sys::get_sse_config(bucket).await.ok() else {
+        return (None, None);
+    };
+    let Some(default_sse) = config
+        .rules
+        .first()
+        .and_then(|rule| rule.apply_server_side_encryption_by_default.as_ref())
+    else {
+        return (None, None);
+    };
+
+    let server_side_encryption = Some(match default_sse.sse_algorithm.as_str() {
+        "aws:kms" => ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+        _ => ServerSideEncryption::from_static(ServerSideEncryption::AES256),
+    });
+
+    (server_side_encryption, default_sse.kms_master_key_id.clone())
 }
 
 async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &ObjectOptions, existing: Option<&ObjectInfo>) {
@@ -267,10 +311,6 @@ mod deadlock_request_guard_tests {
         assert_eq!(detector.tracked_count(), 0);
     }
 }
-async fn maybe_enqueue_transition_immediate(obj_info: &ObjectInfo, src: LcEventSrc) {
-    enqueue_transition_immediate(obj_info, src).await;
-}
-
 fn normalize_delete_objects_version_id(version_id: Option<String>) -> Result<(Option<String>, Option<Uuid>), String> {
     let version_id = version_id.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
     match version_id {
@@ -299,6 +339,58 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 
     let expiry_date = expire_time.format(&Rfc3339).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+}
+
+async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
+    let GetObjectInput {
+        bucket,
+        key,
+        version_id,
+        part_number,
+        range,
+        ..
+    } = req.input.clone();
+
+    validate_object_key(&key, "GET")?;
+
+    let part_number = part_number.map(|value| value as usize);
+    if let Some(part_number) = part_number
+        && part_number == 0
+    {
+        return Err(s3_error!(InvalidArgument, "Invalid part number: part number must be greater than 0"));
+    }
+
+    let rs = range.map(|value| match value {
+        Range::Int { first, last } => HTTPRangeSpec {
+            is_suffix_length: false,
+            start: first as i64,
+            end: last.map_or(-1, |last| last as i64),
+        },
+        Range::Suffix { length } => HTTPRangeSpec {
+            is_suffix_length: true,
+            start: length as i64,
+            end: -1,
+        },
+    });
+
+    if rs.is_some() && part_number.is_some() {
+        return Err(s3_error!(InvalidArgument, "range and part_number invalid"));
+    }
+
+    let opts: ObjectOptions = get_opts(&bucket, &key, version_id, part_number, &req.headers)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(GetObjectRequestContext {
+        bucket,
+        key,
+        part_number,
+        rs,
+        opts,
+        headers: req.headers.clone(),
+        sse_customer_key: req.input.sse_customer_key.clone(),
+        sse_customer_key_md5: req.input.sse_customer_key_md5.clone(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -605,10 +697,23 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_context = prepare_put_object_request_context(&req);
-        let (event_name, quota_operation, request_method_name) = put_object_execution_context(&req);
-        let helper = new_operation_helper(&req, event_name, S3Operation::PutObject, false);
-
+        let request_context = PutObjectRequestContext {
+            headers: req.headers.clone(),
+            trailing_headers: req.trailing_headers.clone(),
+            uri_query: req.uri.query().map(str::to_string),
+            is_post_object: req.extensions.get::<PostObjectRequestMarker>().is_some(),
+            method: req.method.clone(),
+            uri: req.uri.clone(),
+            extensions: req.extensions.clone(),
+            credentials: req.credentials.clone(),
+            region: req.region.clone(),
+            service: req.service.clone(),
+        };
+        let (event_name, quota_operation) = if request_context.is_post_object {
+            (EventName::ObjectCreatedPost, QuotaOperation::PostObject)
+        } else {
+            (EventName::ObjectCreatedPut, QuotaOperation::PutObject)
+        };
         if request_context.is_post_object && is_post_object_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for POST object uploads"));
         }
@@ -618,18 +723,27 @@ impl DefaultObjectUsecase {
             return Err(s3_error!(InvalidStorageClass));
         }
         if is_put_object_extract_requested(&request_context.headers) {
-            return self.execute_put_object_extract(req).await;
+            return self.execute_put_object_extract(req, request_context).await;
         }
+
+        let helper = OperationHelper::new(&req, event_name, S3Operation::PutObject);
 
         let resolved_size = resolve_put_body_size(req.input.content_length, &request_context.headers)?;
         self.check_bucket_quota(&req.input.bucket, quota_operation, resolved_size as u64)
             .await?;
 
         let input = req.input;
-        let flow_result =
-            DefaultObjectUsecase::run_put_object_flow(input, request_context, request_method_name, resolved_size).await?;
-        let helper = bind_helper_object(helper, flow_result.helper_object, flow_result.helper_version_id);
-        complete_put_response(helper, flow_result.output)
+        let (output, helper_object) = DefaultObjectUsecase::run_put_object_flow(input, request_context, resolved_size).await?;
+        let helper_version_id = helper_object.version_id.map(|version_id| version_id.to_string());
+        let helper = helper.object(helper_object);
+        let helper = if let Some(version_id) = helper_version_id {
+            helper.version_id(version_id)
+        } else {
+            helper
+        };
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 
     pub async fn execute_put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
@@ -914,42 +1028,11 @@ impl DefaultObjectUsecase {
             ..
         } = req.input.clone();
 
-        if tagging.tag_set.len() > 10 {
-            error!("Tag set exceeds maximum of 10 tags: {}", tagging.tag_set.len());
-            return Err(s3_error!(InvalidTag, "Cannot have more than 10 tags per object"));
-        }
+        crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
-
-        let mut tag_keys = std::collections::HashSet::with_capacity(tagging.tag_set.len());
-        for tag in &tagging.tag_set {
-            let key = tag.key.as_ref().filter(|k| !k.is_empty()).ok_or_else(|| {
-                error!("Empty tag key");
-                s3_error!(InvalidTag, "Tag key cannot be empty")
-            })?;
-
-            if key.len() > 128 {
-                error!("Tag key too long: {} bytes", key.len());
-                return Err(s3_error!(InvalidTag, "Tag key is too long, maximum allowed length is 128 characters"));
-            }
-
-            let value = tag.value.as_ref().ok_or_else(|| {
-                error!("Null tag value");
-                s3_error!(InvalidTag, "Tag value cannot be null")
-            })?;
-
-            if value.len() > 256 {
-                error!("Tag value too long: {} bytes", value.len());
-                return Err(s3_error!(InvalidTag, "Tag value is too long, maximum allowed length is 256 characters"));
-            }
-
-            if !tag_keys.insert(key) {
-                error!("Duplicate tag key: {}", key);
-                return Err(s3_error!(InvalidTag, "Cannot provide multiple Tags with the same key"));
-            }
-        }
 
         let tags = encode_tags(tagging.tag_set);
         debug!("Encoded tags: {}", tags);
@@ -1023,17 +1106,54 @@ impl DefaultObjectUsecase {
             .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
-        let bootstrap = init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
+        let bootstrap = {
+            let timeout_config = TimeoutConfig::from_env();
+            let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.clone());
+            let request_start = std::time::Instant::now();
+            let request_guard = crate::storage::concurrency::ConcurrencyManager::track_request();
+            let concurrent_requests = GetObjectGuard::concurrent_requests();
+
+            let deadlock_detector = deadlock_detector::get_deadlock_detector();
+            deadlock_detector.register_request(&request_id, format!("GetObject {}/{}", req.input.bucket, req.input.key));
+            let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+
+            if wrapper.is_timeout() {
+                warn!(
+                    bucket = %req.input.bucket,
+                    key = %req.input.key,
+                    timeout_secs = timeout_config.get_object_timeout.as_secs(),
+                    elapsed_ms = wrapper.elapsed().as_millis(),
+                    "GetObject request timed out before processing"
+                );
+                return Err(s3_error!(InternalError, "Request timeout before processing"));
+            }
+
+            rustfs_io_metrics::record_get_object_request_start(concurrent_requests);
+
+            debug!(
+                "GetObject request started with {} concurrent requests, timeout={:?}",
+                concurrent_requests, timeout_config.get_object_timeout
+            );
+
+            GetObjectBootstrap {
+                timeout_config,
+                wrapper,
+                request_start,
+                request_guard,
+                _deadlock_request_guard: deadlock_request_guard,
+            }
+        };
+        let version_id_for_event = req.input.version_id.clone().unwrap_or_default();
         let request_context = prepare_get_object_request_context(&req).await?;
         let base_buffer_size = self.base_buffer_size();
         let manager = get_concurrency_manager();
-        let flow_runtime = GetObjectFlowRuntime {
-            manager,
-            bootstrap: &bootstrap,
-            base_buffer_size,
-        };
-        let helper = new_operation_helper(&req, EventName::ObjectAccessedGet, S3Operation::GetObject, true);
-        let flow_result = get_object_flow::run_get_object_flow(request_context.clone(), flow_runtime).await;
+        let cors_bucket = request_context.bucket.clone();
+        let cors_method = req.method.clone();
+        let cors_headers = request_context.headers.clone();
+        let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
+        let flow_result =
+            get_object_flow::run_get_object_flow(request_context, version_id_for_event, manager, &bootstrap, base_buffer_size)
+                .await;
 
         let GetObjectBootstrap {
             mut request_guard,
@@ -1042,7 +1162,15 @@ impl DefaultObjectUsecase {
         } = bootstrap;
 
         let result = match flow_result {
-            Ok(flow_result) => complete_get_flow_result(helper, &request_context, flow_result).await,
+            Ok(flow_result) => {
+                let helper = helper
+                    .object(flow_result.event_info)
+                    .version_id(flow_result.version_id_for_event);
+                let response = wrap_response_with_cors(&cors_bucket, &cors_method, &cors_headers, flow_result.output).await;
+                let result = Ok(response);
+                let _ = helper.complete(&result);
+                result
+            }
             Err(err) => Err(err),
         };
 
@@ -1766,7 +1894,7 @@ impl DefaultObjectUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+        enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
@@ -2831,8 +2959,10 @@ impl DefaultObjectUsecase {
                 .map_err(|_| S3Error::with_message(S3ErrorCode::Custom("ErrCopyObject".into()), "restore object failed."))?;
 
             if already_restored {
-                let output =
-                    restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
+                let output = RestoreObjectOutput {
+                    request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+                    restore_output_path: None,
+                };
                 helper = helper
                     .object(event_object_info.clone())
                     .version_id(version_id_str.clone())
@@ -2887,7 +3017,10 @@ impl DefaultObjectUsecase {
             }
         });
 
-        let output = restore::build_restore_object_output(Some(RequestCharged::from_static(RequestCharged::REQUESTER)), None);
+        let output = RestoreObjectOutput {
+            request_charged: Some(RequestCharged::from_static(RequestCharged::REQUESTER)),
+            restore_output_path: None,
+        };
         helper = helper.object(event_object_info).version_id(version_id_str);
         let result = Ok(S3Response::with_headers(output, header));
         let _ = helper.complete(&result);
@@ -2968,15 +3101,18 @@ impl DefaultObjectUsecase {
             drop(tx);
         });
 
-        Ok(S3Response::new(select::build_select_object_content_output(
-            SelectObjectContentEventStream::new(stream),
-        )))
+        Ok(S3Response::new(SelectObjectContentOutput {
+            payload: Some(SelectObjectContentEventStream::new(stream)),
+        }))
     }
 
-    #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_put_object_extract(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        let request_context = prepare_put_object_request_context(&req);
-        let helper = new_operation_helper(&req, EventName::ObjectCreatedPut, S3Operation::PutObject, true);
+    #[instrument(level = "debug", skip(self, req, request_context))]
+    async fn execute_put_object_extract(
+        &self,
+        req: S3Request<PutObjectInput>,
+        request_context: PutObjectRequestContext,
+    ) -> S3Result<S3Response<PutObjectOutput>> {
+        let helper = OperationHelper::new(&req, EventName::ObjectCreatedPut, S3Operation::PutObject).suppress_event();
         if is_sse_kms_requested(&req.input, &request_context.headers) {
             return Err(s3_error!(NotImplemented, "SSE-KMS is not supported for extract uploads"));
         }
@@ -2990,7 +3126,9 @@ impl DefaultObjectUsecase {
             .unwrap_or_else(default_notify_interface);
         let input = req.input;
         let output = DefaultObjectUsecase::run_put_object_extract_flow(input, request_context, notify, resolved_size).await?;
-        complete_put_response(helper, output)
+        let result = Ok(S3Response::new(output));
+        let _ = helper.complete(&result);
+        result
     }
 }
 
@@ -3022,37 +3160,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn put_object_execution_context_defaults_to_put() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let req = build_request(input, Method::PUT);
-
-        let (event_name, quota_operation, method_name) = put_object_execution_context(&req);
-        assert_eq!(event_name, EventName::ObjectCreatedPut);
-        assert!(matches!(quota_operation, QuotaOperation::PutObject));
-        assert_eq!(method_name, "PUT");
-    }
-
-    #[test]
-    fn put_object_execution_context_uses_post_marker() {
-        let input = PutObjectInput::builder()
-            .bucket("test-bucket".to_string())
-            .key("test-key".to_string())
-            .build()
-            .unwrap();
-        let mut req = build_request(input, Method::POST);
-        req.extensions.insert(PostObjectRequestMarker);
-
-        let (event_name, quota_operation, method_name) = put_object_execution_context(&req);
-        assert_eq!(event_name, EventName::ObjectCreatedPost);
-        assert!(matches!(quota_operation, QuotaOperation::PostObject));
-        assert_eq!(method_name, "POST");
-    }
-
     #[tokio::test]
     async fn execute_put_object_rejects_invalid_storage_class() {
         let input = PutObjectInput::builder()
@@ -3068,6 +3175,51 @@ mod tests {
 
         let err = usecase.execute_put_object(&fs, req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidStorageClass);
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_tagging_rejects_too_many_tags() {
+        let tag_set = (0..11)
+            .map(|index| Tag {
+                key: Some(format!("k{index}")),
+                value: Some(format!("v{index}")),
+            })
+            .collect();
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging { tag_set })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Cannot have more than 10 tags per object"));
+    }
+
+    #[tokio::test]
+    async fn execute_put_object_tagging_rejects_empty_tag_key_before_store_lookup() {
+        let input = PutObjectTaggingInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .tagging(Tagging {
+                tag_set: vec![Tag {
+                    key: Some(String::new()),
+                    value: Some("v1".to_string()),
+                }],
+            })
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::PUT);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = usecase.execute_put_object_tagging(req).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidTag);
+        assert!(err.to_string().contains("Tag key cannot be empty"));
     }
 
     #[tokio::test]
