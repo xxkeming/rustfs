@@ -23,10 +23,9 @@ use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
 use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::s3_api::acl;
 use crate::storage::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
 };
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::*;
@@ -130,29 +129,6 @@ struct ObjectMetadataPermissions {
     tags_allowed: bool,
 }
 
-#[derive(Debug, Clone)]
-struct ListObjectVersionsMResponseContext {
-    bucket: String,
-    prefix: String,
-    delimiter: Option<String>,
-    max_keys: i32,
-    encoding_type: Option<EncodingType>,
-    key_marker: Option<String>,
-    version_id_marker: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct ListObjectsV2MResponseContext {
-    bucket: String,
-    prefix: String,
-    delimiter: Option<String>,
-    max_keys: i32,
-    encoding_type: Option<EncodingType>,
-    continuation_token: Option<String>,
-    start_after: Option<String>,
-    fetch_owner: bool,
-}
-
 fn encode_list_versions_value(value: &str, encoding_type: Option<&EncodingType>) -> String {
     if encoding_type.is_some_and(|encoding| encoding.as_str() == EncodingType::URL) {
         encode(value).into_owned()
@@ -250,7 +226,9 @@ async fn collect_list_objects_metadata_permissions<T>(
 
 fn build_list_object_versions_m_output(
     object_infos: ListObjectVersionsInfo,
-    context: &ListObjectVersionsMResponseContext,
+    bucket: &str,
+    params: &ListObjectVersionsParams,
+    encoding_type: Option<&EncodingType>,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectVersionsMOutput {
     let owner = rustfs_owner();
@@ -258,7 +236,7 @@ fn build_list_object_versions_m_output(
         .prefixes
         .into_iter()
         .map(|prefix_value| CommonPrefix {
-            prefix: Some(encode_list_versions_value(&prefix_value, context.encoding_type.as_ref())),
+            prefix: Some(encode_list_versions_value(&prefix_value, encoding_type)),
         })
         .collect::<Vec<_>>();
 
@@ -267,7 +245,7 @@ fn build_list_object_versions_m_output(
         .into_iter()
         .filter(|object| !object.name.is_empty())
         .map(|object| {
-            let object_name = encode_list_versions_value(&object.name, context.encoding_type.as_ref());
+            let object_name = encode_list_versions_value(&object.name, encoding_type);
             let version_id = object
                 .version_id
                 .map(|version| version.to_string())
@@ -328,34 +306,38 @@ fn build_list_object_versions_m_output(
     let next_key_marker = object_infos
         .next_marker
         .filter(|marker| !marker.is_empty())
-        .map(|marker| encode_list_versions_value(&marker, context.encoding_type.as_ref()));
+        .map(|marker| encode_list_versions_value(&marker, encoding_type));
+    let next_version_id_marker = object_infos.next_version_idmarker.filter(|marker| !marker.is_empty());
 
     ListObjectVersionsMOutput {
         common_prefixes: Some(common_prefixes),
-        delimiter: context
+        delimiter: params
             .delimiter
             .clone()
-            .map(|value| encode_list_versions_value(&value, context.encoding_type.as_ref())),
-        encoding_type: context.encoding_type.clone(),
+            .map(|value| encode_list_versions_value(&value, encoding_type)),
+        encoding_type: encoding_type.cloned(),
         is_truncated: Some(object_infos.is_truncated),
         key_marker: Some(encode_list_versions_value(
-            context.key_marker.as_deref().unwrap_or_default(),
-            context.encoding_type.as_ref(),
+            params.key_marker.as_deref().unwrap_or_default(),
+            encoding_type,
         )),
-        max_keys: Some(context.max_keys),
-        name: Some(context.bucket.clone()),
+        max_keys: Some(params.max_keys),
+        name: Some(bucket.to_owned()),
         next_key_marker,
-        next_version_id_marker: Some(object_infos.next_version_idmarker.unwrap_or_default()),
-        prefix: Some(encode_list_versions_value(&context.prefix, context.encoding_type.as_ref())),
+        next_version_id_marker,
+        prefix: Some(encode_list_versions_value(&params.prefix, encoding_type)),
         request_charged: None,
-        version_id_marker: Some(context.version_id_marker.clone().unwrap_or_default()),
+        version_id_marker: Some(params.version_id_marker.clone().unwrap_or_default()),
         entries,
     }
 }
 
 fn build_list_objects_v2m_output(
     object_infos: ListObjectsV2Info,
-    context: &ListObjectsV2MResponseContext,
+    bucket: &str,
+    params: &ListObjectsV2Params,
+    encoding_type: Option<&EncodingType>,
+    fetch_owner: bool,
     permissions: &HashMap<String, ObjectMetadataPermissions>,
 ) -> ListObjectsV2MOutput {
     let owner = rustfs_owner();
@@ -386,7 +368,7 @@ fn build_list_objects_v2m_output(
             };
 
             ObjectM {
-                key: Some(encode_list_objects_v2_value(&object.name, context.encoding_type.as_ref())),
+                key: Some(encode_list_objects_v2_value(&object.name, encoding_type)),
                 last_modified: object.mod_time.map(Timestamp::from),
                 size: Some(object.get_actual_size().unwrap_or_default()),
                 e_tag: object.etag.clone().map(|etag| to_s3s_etag(&etag)),
@@ -396,7 +378,7 @@ fn build_list_objects_v2m_output(
                         .clone()
                         .unwrap_or_else(|| ObjectStorageClass::STANDARD.to_string()),
                 )),
-                owner: context.fetch_owner.then_some(owner.clone()),
+                owner: fetch_owner.then_some(owner.clone()),
                 user_metadata,
                 user_tags,
                 internal,
@@ -408,7 +390,7 @@ fn build_list_objects_v2m_output(
         .prefixes
         .into_iter()
         .map(|prefix| CommonPrefix {
-            prefix: Some(encode_list_objects_v2_value(&prefix, context.encoding_type.as_ref())),
+            prefix: Some(encode_list_objects_v2_value(&prefix, encoding_type)),
         })
         .collect::<Vec<_>>();
 
@@ -418,18 +400,18 @@ fn build_list_objects_v2m_output(
         .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
 
     ListObjectsV2MOutput {
-        name: Some(context.bucket.clone()),
-        prefix: Some(context.prefix.clone()),
-        max_keys: Some(context.max_keys),
+        name: Some(bucket.to_owned()),
+        prefix: Some(params.prefix.clone()),
+        max_keys: Some(params.max_keys),
         key_count: Some(key_count),
-        continuation_token: context.continuation_token.clone(),
+        continuation_token: params.response_continuation_token.clone(),
         is_truncated: Some(object_infos.is_truncated),
         next_continuation_token,
         contents: Some(contents),
         common_prefixes: Some(common_prefixes),
-        delimiter: context.delimiter.clone(),
-        encoding_type: context.encoding_type.clone(),
-        start_after: context.start_after.clone(),
+        delimiter: params.delimiter.clone(),
+        encoding_type: encoding_type.cloned(),
+        start_after: params.response_start_after.clone(),
         ..Default::default()
     }
 }
@@ -539,10 +521,6 @@ impl DefaultBucketUsecase {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     pub async fn execute_create_bucket(&self, req: S3Request<CreateBucketInput>) -> S3Result<S3Response<CreateBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let requester_is_owner = match req_info_ref(&req) {
             Ok(r) => r.is_owner,
@@ -595,42 +573,8 @@ impl DefaultBucketUsecase {
         result
     }
 
-    pub async fn execute_put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
-        let PutBucketAclInput {
-            bucket,
-            access_control_policy,
-            ..
-        } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        if access_control_policy.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
-            ));
-        }
-
-        Ok(S3Response::new(PutBucketAclOutput::default()))
-    }
-
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket(&self, mut req: S3Request<DeleteBucketInput>) -> S3Result<S3Response<DeleteBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let helper = OperationHelper::new(&req, EventName::BucketRemoved, S3Operation::DeleteBucket);
         let input = req.input.clone();
 
@@ -670,10 +614,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_head_bucket(&self, req: S3Request<HeadBucketInput>) -> S3Result<S3Response<HeadBucketOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -688,34 +628,11 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(HeadBucketOutput::default()))
     }
 
-    pub async fn execute_get_bucket_acl(&self, req: S3Request<GetBucketAclInput>) -> S3Result<S3Response<GetBucketAclOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
-        let GetBucketAclInput { bucket, .. } = req.input;
-
-        let Some(store) = new_object_layer_fn() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        Ok(S3Response::new(acl::build_get_bucket_acl_output()))
-    }
-
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_location(
         &self,
         req: S3Request<GetBucketLocationInput>,
     ) -> S3Result<S3Response<GetBucketLocationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -738,10 +655,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -798,10 +711,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -830,10 +739,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -862,10 +767,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketLifecycleInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -893,10 +794,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -924,10 +821,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -958,10 +851,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
@@ -981,10 +870,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let DeletePublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1007,10 +892,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketEncryptionInput>,
     ) -> S3Result<S3Response<GetBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1040,10 +921,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1079,10 +956,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketLifecycleConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketLifecycleConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1111,10 +984,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketNotificationConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketNotificationConfigurationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1153,10 +1022,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketPolicyInput>,
     ) -> S3Result<S3Response<GetBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketPolicyInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1187,10 +1052,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketPolicyStatusInput>,
     ) -> S3Result<S3Response<GetBucketPolicyStatusOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketPolicyStatusInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1268,10 +1129,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketReplicationInput>,
     ) -> S3Result<S3Response<GetBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1307,10 +1164,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketTaggingInput>,
     ) -> S3Result<S3Response<GetBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1341,10 +1194,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
     ) -> S3Result<S3Response<GetPublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetPublicAccessBlockInput { bucket, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1379,10 +1228,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<GetBucketVersioningInput>,
     ) -> S3Result<S3Response<GetBucketVersioningOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let GetBucketVersioningInput { bucket, .. } = req.input;
         let Some(store) = new_object_layer_fn() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1405,10 +1250,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketEncryptionInput {
             bucket,
             server_side_encryption_configuration,
@@ -1447,10 +1288,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketLifecycleConfigurationInput {
             bucket,
             lifecycle_configuration,
@@ -1512,9 +1349,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
         let request_region = req.region.clone();
 
         let PutBucketNotificationConfigurationInput {
@@ -1588,10 +1422,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketPolicyInput>,
     ) -> S3Result<S3Response<PutBucketPolicyOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketPolicyInput { bucket, policy, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1649,10 +1479,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketCorsInput {
             bucket,
             cors_configuration,
@@ -1687,10 +1513,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketReplicationInput {
             bucket,
             replication_configuration,
@@ -1729,10 +1551,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutPublicAccessBlockInput {
             bucket,
             public_access_block_configuration,
@@ -1761,10 +1579,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
         let Some(store) = new_object_layer_fn() else {
@@ -1796,10 +1610,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let PutBucketVersioningInput {
             bucket,
             versioning_configuration,
@@ -1827,10 +1637,6 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         // warn!("list_objects_v2 req {:?}", &req.input);
         let ListObjectsV2Input {
             bucket,
@@ -1844,17 +1650,9 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
 
-        let ListObjectsV2Params {
-            prefix,
-            max_keys,
-            delimiter,
-            response_start_after,
-            start_after_for_query,
-            response_continuation_token,
-            decoded_continuation_token,
-        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
 
@@ -1865,12 +1663,12 @@ impl DefaultBucketUsecase {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.decoded_continuation_token.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
                 fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                params.start_after_for_query.clone(),
                 incl_deleted,
             )
             .await
@@ -1879,13 +1677,13 @@ impl DefaultBucketUsecase {
         let output = build_list_objects_v2_output(
             object_infos,
             fetch_owner.unwrap_or_default(),
-            max_keys,
+            params.max_keys,
             bucket,
-            prefix,
-            delimiter,
+            params.prefix,
+            params.delimiter,
             encoding_type,
-            response_continuation_token,
-            response_start_after,
+            params.response_continuation_token,
+            params.response_start_after,
         );
 
         Ok(S3Response::new(output))
@@ -1895,10 +1693,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectsV2Input>,
     ) -> S3Result<S3Response<ListObjectsV2MOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input.clone();
         let ListObjectsV2Input {
             bucket,
@@ -1912,17 +1706,9 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let ListObjectsV2Params {
-            prefix,
-            max_keys,
-            delimiter,
-            response_start_after,
-            start_after_for_query,
-            response_continuation_token,
-            decoded_continuation_token,
-        } = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
+        let params = parse_list_objects_v2_params(prefix, delimiter, max_keys, continuation_token, start_after)?;
 
-        validate_list_object_unordered_with_delimiter(delimiter.as_ref(), req.uri.query())?;
+        validate_list_object_unordered_with_delimiter(params.delimiter.as_ref(), req.uri.query())?;
 
         let store = get_validated_store(&bucket).await?;
         let incl_deleted = get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED)
@@ -1932,29 +1718,26 @@ impl DefaultBucketUsecase {
         let object_infos = store
             .list_objects_v2(
                 &bucket,
-                &prefix,
-                decoded_continuation_token,
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.decoded_continuation_token.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
                 fetch_owner.unwrap_or_default(),
-                start_after_for_query,
+                params.start_after_for_query.clone(),
                 incl_deleted,
             )
             .await
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let context = ListObjectsV2MResponseContext {
-            bucket,
-            prefix,
-            delimiter,
-            max_keys,
-            encoding_type,
-            continuation_token: response_continuation_token,
-            start_after: response_start_after,
-            fetch_owner: fetch_owner.unwrap_or_default(),
-        };
-        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            &bucket,
+            &params,
+            encoding_type.as_ref(),
+            fetch_owner.unwrap_or_default(),
+            &permissions,
+        );
 
         Ok(S3Response::new(output))
     }
@@ -1963,10 +1746,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let ListObjectVersionsInput {
             bucket,
             delimiter,
@@ -2001,10 +1780,6 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsMOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let input = req.input.clone();
         let ListObjectVersionsInput {
             bucket,
@@ -2017,99 +1792,33 @@ impl DefaultBucketUsecase {
             ..
         } = input;
 
-        let ListObjectVersionsParams {
-            prefix,
-            delimiter,
-            key_marker,
-            version_id_marker,
-            max_keys,
-        } = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
+        let params = parse_list_object_versions_params(prefix, delimiter, key_marker, version_id_marker, max_keys)?;
 
         let store = get_validated_store(&bucket).await?;
         let object_infos = store
             .list_object_versions(
                 &bucket,
-                &prefix,
-                key_marker.clone(),
-                version_id_marker.clone(),
-                delimiter.clone(),
-                max_keys,
+                &params.prefix,
+                params.key_marker.clone(),
+                params.version_id_marker.clone(),
+                params.delimiter.clone(),
+                params.max_keys,
             )
             .await
             .map_err(ApiError::from)?;
 
         let permissions = collect_list_objects_metadata_permissions(&req, &bucket, &object_infos.objects).await?;
-        let context = ListObjectVersionsMResponseContext {
-            bucket,
-            prefix,
-            delimiter,
-            max_keys,
-            encoding_type,
-            key_marker,
-            version_id_marker,
-        };
-        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
+        let output = build_list_object_versions_m_output(object_infos, &bucket, &params, encoding_type.as_ref(), &permissions);
 
         Ok(S3Response::new(output))
     }
 
     #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
-        if let Some(context) = &self.context {
-            let _ = context.object_store();
-        }
-
         let request_marker = req.input.marker.clone();
         let v2_resp = self.execute_list_objects_v2(req.map_input(Into::into)).await?;
 
-        Ok(v2_resp.map_output(|v2| {
-            let next_marker = if v2.is_truncated.unwrap_or(false) {
-                let last_key = v2
-                    .contents
-                    .as_ref()
-                    .and_then(|contents| contents.last())
-                    .and_then(|obj| obj.key.as_ref())
-                    .cloned();
-
-                let last_prefix = v2
-                    .common_prefixes
-                    .as_ref()
-                    .and_then(|prefixes| prefixes.last())
-                    .and_then(|prefix| prefix.prefix.as_ref())
-                    .cloned();
-
-                match (last_key, last_prefix) {
-                    (Some(k), Some(p)) => {
-                        if k > p {
-                            Some(k)
-                        } else {
-                            Some(p)
-                        }
-                    }
-                    (Some(k), None) => Some(k),
-                    (None, Some(p)) => Some(p),
-                    (None, None) => None,
-                }
-            } else {
-                None
-            };
-
-            let marker = Some(request_marker.unwrap_or_default());
-
-            ListObjectsOutput {
-                contents: v2.contents,
-                delimiter: v2.delimiter,
-                encoding_type: v2.encoding_type,
-                name: v2.name,
-                prefix: v2.prefix,
-                max_keys: v2.max_keys,
-                common_prefixes: v2.common_prefixes,
-                is_truncated: v2.is_truncated,
-                marker,
-                next_marker,
-                ..Default::default()
-            }
-        }))
+        Ok(v2_resp.map_output(|v2| build_list_objects_output(v2, request_marker)))
     }
 }
 
@@ -2296,20 +2005,6 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_get_bucket_policy(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_get_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        let input = GetBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::GET);
-        let usecase = DefaultBucketUsecase::without_context();
-
-        let err = usecase.execute_get_bucket_acl(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 
@@ -2646,16 +2341,20 @@ mod tests {
             ),
         ]);
 
-        let context = ListObjectVersionsMResponseContext {
-            bucket: "demo-bucket".to_string(),
+        let params = ListObjectVersionsParams {
             prefix: "pre".to_string(),
             delimiter: Some("/".to_string()),
-            max_keys: 1000,
-            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
             key_marker: Some("start marker".to_string()),
             version_id_marker: Some("vid-1".to_string()),
+            max_keys: 1000,
         };
-        let output = build_list_object_versions_m_output(object_infos, &context, &permissions);
+        let output = build_list_object_versions_m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            &permissions,
+        );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("pre"));
@@ -2695,6 +2394,63 @@ mod tests {
                 );
             }
             other => panic!("expected delete marker entry, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_list_object_versions_m_output_uses_params_and_hides_metadata_without_permissions() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectVersionsInfo {
+            is_truncated: false,
+            next_marker: Some(String::new()),
+            next_version_idmarker: Some(String::new()),
+            prefixes: vec!["logs and more/".to_string()],
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs and more/object one.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-04 00:00 UTC)),
+                size: 7,
+                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
+                user_tags: "env=prod".to_string(),
+                parity_blocks: 1,
+                data_blocks: 2,
+                ..Default::default()
+            }],
+        };
+
+        let params = ListObjectVersionsParams {
+            prefix: "logs and more/".to_string(),
+            delimiter: Some(" ".to_string()),
+            key_marker: Some("marker value".to_string()),
+            version_id_marker: None,
+            max_keys: 25,
+        };
+
+        let output = build_list_object_versions_m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            &HashMap::new(),
+        );
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs%20and%20more%2F"));
+        assert_eq!(output.delimiter.as_deref(), Some("%20"));
+        assert_eq!(output.key_marker.as_deref(), Some("marker%20value"));
+        assert_eq!(output.version_id_marker.as_deref(), Some(""));
+        assert_eq!(output.next_key_marker, None);
+        assert_eq!(output.next_version_id_marker, None);
+
+        match &output.entries[0] {
+            ListObjectVersionMEntry::Version(version) => {
+                assert_eq!(version.key.as_deref(), Some("logs%20and%20more%2Fobject%20one.txt"));
+                assert!(version.user_metadata.is_none());
+                assert!(version.user_tags.is_none());
+                assert!(version.internal.is_none());
+            }
+            other => panic!("expected version entry, got {other:?}"),
         }
     }
 
@@ -2754,18 +2510,24 @@ mod tests {
             },
         )]);
 
-        let context = ListObjectsV2MResponseContext {
-            bucket: "demo-bucket".to_string(),
+        let params = ListObjectsV2Params {
             prefix: "logs/".to_string(),
-            delimiter: Some("/".to_string()),
             max_keys: 1000,
-            encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
-            continuation_token: Some("start token".to_string()),
-            start_after: Some("logs/start after".to_string()),
-            fetch_owner: true,
+            delimiter: Some("/".to_string()),
+            response_start_after: Some("logs/start after".to_string()),
+            start_after_for_query: None,
+            response_continuation_token: Some("start token".to_string()),
+            decoded_continuation_token: None,
         };
 
-        let output = build_list_objects_v2m_output(object_infos, &context, &permissions);
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            true,
+            &permissions,
+        );
 
         assert_eq!(output.name.as_deref(), Some("demo-bucket"));
         assert_eq!(output.prefix.as_deref(), Some("logs/"));
@@ -2791,6 +2553,66 @@ mod tests {
 
         let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
         assert_eq!(prefix.prefix.as_deref(), Some("logs/archive/"));
+    }
+
+    #[test]
+    fn build_list_objects_v2m_output_uses_params_and_hides_owner_without_fetch_owner() {
+        use time::macros::datetime;
+
+        let object_infos = ListObjectsV2Info {
+            is_truncated: false,
+            next_continuation_token: None,
+            objects: vec![ObjectInfo {
+                bucket: "demo-bucket".to_string(),
+                name: "logs and more/object one.txt".to_string(),
+                mod_time: Some(datetime!(2025-01-05 00:00 UTC)),
+                size: 13,
+                user_defined: HashMap::from([("secret".to_string(), "value".to_string())]),
+                user_tags: "env=prod".to_string(),
+                parity_blocks: 1,
+                data_blocks: 2,
+                ..Default::default()
+            }],
+            prefixes: vec!["logs and more/archive/".to_string()],
+            ..Default::default()
+        };
+
+        let params = ListObjectsV2Params {
+            prefix: "logs and more/".to_string(),
+            max_keys: 25,
+            delimiter: Some("/".to_string()),
+            response_start_after: Some("logs and more/start after".to_string()),
+            start_after_for_query: Some("decoded start after".to_string()),
+            response_continuation_token: Some("opaque token".to_string()),
+            decoded_continuation_token: Some("decoded token".to_string()),
+        };
+
+        let output = build_list_objects_v2m_output(
+            object_infos,
+            "demo-bucket",
+            &params,
+            Some(&EncodingType::from_static(EncodingType::URL)),
+            false,
+            &HashMap::new(),
+        );
+
+        assert_eq!(output.name.as_deref(), Some("demo-bucket"));
+        assert_eq!(output.prefix.as_deref(), Some("logs and more/"));
+        assert_eq!(output.delimiter.as_deref(), Some("/"));
+        assert_eq!(output.continuation_token.as_deref(), Some("opaque token"));
+        assert_eq!(output.start_after.as_deref(), Some("logs and more/start after"));
+        assert_eq!(output.key_count, Some(2));
+        assert_eq!(output.encoding_type.as_ref().map(EncodingType::as_str), Some(EncodingType::URL));
+
+        let object = output.contents.as_ref().unwrap().first().unwrap();
+        assert_eq!(object.key.as_deref(), Some("logs%20and%20more/object%20one.txt"));
+        assert!(object.owner.is_none());
+        assert!(object.user_metadata.is_none());
+        assert!(object.user_tags.is_none());
+        assert!(object.internal.is_none());
+
+        let prefix = output.common_prefixes.as_ref().unwrap().first().unwrap();
+        assert_eq!(prefix.prefix.as_deref(), Some("logs%20and%20more/archive/"));
     }
 
     #[tokio::test]
@@ -2852,20 +2674,6 @@ mod tests {
         let usecase = DefaultBucketUsecase::without_context();
 
         let err = usecase.execute_put_bucket_replication(req).await.unwrap_err();
-        assert_eq!(err.code(), &S3ErrorCode::InternalError);
-    }
-
-    #[tokio::test]
-    async fn execute_put_bucket_acl_returns_internal_error_when_store_uninitialized() {
-        let input = PutBucketAclInput::builder()
-            .bucket("test-bucket".to_string())
-            .build()
-            .unwrap();
-
-        let req = build_request(input, Method::PUT);
-        let usecase = DefaultBucketUsecase::without_context();
-
-        let err = usecase.execute_put_bucket_acl(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
     }
 

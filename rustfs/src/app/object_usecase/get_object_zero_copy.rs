@@ -22,16 +22,13 @@ use crate::storage::{
 };
 use http::HeaderMap;
 use rustfs_concurrency::GetObjectQueueSnapshot;
-use rustfs_ecstore::store_api::{ObjectIO, ObjectOperations};
+use rustfs_ecstore::store_api::ObjectIO;
 use rustfs_object_io::get::{
-    ChunkReadDecision, ChunkReadPlanError, GetObjectEncryptionState as ObjectIoGetObjectEncryptionState, GetObjectReadSetup,
-    build_reader_read_setup as object_io_build_reader_read_setup,
-    finalize_chunk_read_setup as object_io_finalize_chunk_read_setup,
-    get_object_chunk_fast_path_guard as object_io_get_object_chunk_fast_path_guard, plan_chunk_read as object_io_plan_chunk_read,
-    plan_legacy_read as object_io_plan_legacy_read,
+    GetObjectEncryptionState as ObjectIoGetObjectEncryptionState, GetObjectReadSetup,
+    build_reader_read_setup as object_io_build_reader_read_setup, plan_legacy_read as object_io_plan_legacy_read,
 };
 use rustfs_rio::{Reader, WarpReader};
-use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
+use s3s::{S3Result, s3_error};
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -227,99 +224,7 @@ pub(super) async fn prepare_get_object_read_execution<'a>(
     let io_planning =
         acquire_get_object_io_planning(manager, wrapper, timeout_config, &request_context.bucket, &request_context.key).await?;
     let store = get_validated_store(&request_context.bucket).await?;
-
-    let read_start = std::time::Instant::now();
-    let read_setup = match object_io_get_object_chunk_fast_path_guard(
-        request_context.sse_customer_key.is_some(),
-        request_context.sse_customer_key_md5.is_some(),
-    ) {
-        Ok(()) => match prepare_get_object_chunk_read(request_context, &store, manager, read_start).await? {
-            Some(read_setup) => read_setup,
-            None => prepare_get_object_read(request_context, &store, manager, read_start).await?,
-        },
-        Err(fallback) => {
-            rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
-            prepare_get_object_read(request_context, &store, manager, read_start).await?
-        }
-    };
+    let read_setup = prepare_get_object_read(request_context, &store, manager, std::time::Instant::now()).await?;
 
     Ok(GetObjectPreparedRead { io_planning, read_setup })
-}
-
-pub(super) async fn prepare_get_object_chunk_read(
-    request_context: &GetObjectRequestContext,
-    store: &rustfs_ecstore::store::ECStore,
-    manager: &ConcurrencyManager,
-    read_start: std::time::Instant,
-) -> S3Result<Option<GetObjectReadSetup>> {
-    let info = store
-        .get_object_info(&request_context.bucket, &request_context.key, &request_context.opts)
-        .await
-        .map_err(ApiError::from)?;
-
-    validate_sse_headers_for_read(&info.user_defined, &request_context.headers)?;
-    validate_ssec_for_read(
-        &info.user_defined,
-        request_context.sse_customer_key.as_ref(),
-        request_context.sse_customer_key_md5.as_ref(),
-    )?;
-    check_preconditions(&request_context.headers, &info)?;
-
-    let encrypted_object = info.user_defined.contains_key("x-rustfs-encryption-key")
-        || info
-            .user_defined
-            .contains_key("x-amz-server-side-encryption-customer-algorithm");
-    if encrypted_object {
-        rustfs_io_metrics::record_io_fallback(
-            rustfs_io_metrics::IoStage::ReadSetup,
-            rustfs_io_metrics::FallbackReason::EncryptionEnabled,
-        );
-        return Ok(None);
-    }
-
-    let plan = match object_io_plan_chunk_read(
-        &info,
-        request_context.opts.version_id.is_none(),
-        request_context.rs.clone(),
-        request_context.part_number,
-    ) {
-        Ok(ChunkReadDecision::Eligible(plan)) => plan,
-        Ok(ChunkReadDecision::Fallback(fallback)) => {
-            rustfs_io_metrics::record_io_fallback(fallback.stage, fallback.reason);
-            return Ok(None);
-        }
-        Err(ChunkReadPlanError::NoSuchKey) => return Err(S3Error::new(S3ErrorCode::NoSuchKey)),
-        Err(ChunkReadPlanError::MethodNotAllowed) => return Err(S3Error::new(S3ErrorCode::MethodNotAllowed)),
-        Err(ChunkReadPlanError::Io(err)) => return Err(ApiError::from(err).into()),
-    };
-    let rs = plan.rs.clone();
-
-    let read_duration = read_start.elapsed();
-    manager.record_disk_operation(info.size as u64, read_duration, true).await;
-    let event_info = info.clone();
-
-    let chunk_result = match store
-        .get_object_chunks(
-            &request_context.bucket,
-            &request_context.key,
-            rs.clone(),
-            HeaderMap::new(),
-            &request_context.opts,
-        )
-        .await
-        .map_err(ApiError::from)
-    {
-        Ok(result) => result,
-        Err(_err) => {
-            rustfs_io_metrics::record_io_fallback(
-                rustfs_io_metrics::IoStage::HttpBridge,
-                rustfs_io_metrics::FallbackReason::ChunkBridgeUnavailable,
-            );
-            return Ok(None);
-        }
-    };
-    let setup_result = object_io_finalize_chunk_read_setup(info, event_info, chunk_result, plan);
-    rustfs_io_metrics::record_io_path_selected("get", setup_result.io_path);
-
-    Ok(Some(setup_result.read_setup))
 }

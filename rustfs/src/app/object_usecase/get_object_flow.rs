@@ -26,11 +26,9 @@ use rustfs_object_io::get::{
     GetObjectBodyPlan as ObjectIoGetObjectBodyPlan, GetObjectBodyPlanningInputs as ObjectIoGetObjectBodyPlanningInputs,
     GetObjectBodySource, GetObjectDataPlaneMetricContract as ObjectIoGetObjectDataPlaneMetricContract, GetObjectFlowResult,
     GetObjectOutputContext, GetObjectReadSetup, MaterializeGetObjectBodyError as ObjectIoMaterializeGetObjectBodyError,
-    build_chunk_blob as object_io_build_chunk_blob,
     build_cors_wrapped_get_object_flow_result as object_io_build_cors_wrapped_get_object_flow_result,
     build_get_object_checksums as object_io_build_get_object_checksums,
     build_get_object_output_context as object_io_build_get_object_output_context,
-    chunk_body_data_plane_labels as object_io_chunk_body_data_plane_labels,
     materialize_get_object_body as object_io_materialize_get_object_body, plan_get_object_body as object_io_plan_get_object_body,
     plan_get_object_strategy_layout as object_io_plan_get_object_strategy_layout,
 };
@@ -271,41 +269,26 @@ pub(super) async fn build_get_object_output_context(
         io_planning,
     );
 
-    let (body, metric_contract) = match body_source {
-        GetObjectBodySource::Reader(final_stream) => {
-            let body = build_get_object_body_adapter(
-                final_stream,
-                bucket,
-                key,
-                response_content_length,
-                optimal_buffer_size,
-                ObjectIoGetObjectBodyPlanningInputs {
-                    is_part_request: part_number.is_some(),
-                    is_range_request: rs.is_some(),
-                    encryption_applied,
-                    response_size: response_content_length,
-                },
-            )
-            .await?;
-            let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::disk(
-                rustfs_io_metrics::IoPath::Legacy,
-                rustfs_io_metrics::CopyMode::SingleCopy,
-            );
+    let GetObjectBodySource::Reader(final_stream) = body_source;
 
-            (body, metric_contract)
-        }
-        GetObjectBodySource::Chunk {
-            stream: chunk_stream,
-            path,
-            copy_mode,
-        } => {
-            let (io_path, copy_mode) = object_io_chunk_body_data_plane_labels(path, copy_mode);
-            (
-                object_io_build_chunk_blob(chunk_stream),
-                ObjectIoGetObjectDataPlaneMetricContract::disk(io_path, copy_mode),
-            )
-        }
-    };
+    let body = build_get_object_body_adapter(
+        final_stream,
+        bucket,
+        key,
+        response_content_length,
+        optimal_buffer_size,
+        ObjectIoGetObjectBodyPlanningInputs {
+            is_part_request: part_number.is_some(),
+            is_range_request: rs.is_some(),
+            encryption_applied,
+            response_size: response_content_length,
+        },
+    )
+    .await?;
+    let metric_contract = ObjectIoGetObjectDataPlaneMetricContract::disk(
+        rustfs_io_metrics::IoPath::Legacy,
+        rustfs_io_metrics::CopyMode::SingleCopy,
+    );
 
     let checksums = object_io_build_get_object_checksums(&info, &request_context.headers, part_number, rs.as_ref())
         .map_err(ApiError::from)?;
