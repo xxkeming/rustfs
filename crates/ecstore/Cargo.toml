@@ -70,7 +70,6 @@ reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
 rustfs-lock.workspace = true
-rustfs-io-core.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
 path-absolutize = { workspace = true }
@@ -87,7 +86,7 @@ hyper.workspace = true
 hyper-util.workspace = true
 hyper-rustls.workspace = true
 rustls.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal"] }
+tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
 tonic.workspace = true
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
 tower.workspace = true

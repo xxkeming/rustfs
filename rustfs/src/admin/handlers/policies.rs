@@ -377,6 +377,7 @@ impl Operation for RemoveCannedPolicy {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct SetPolicyForUserOrGroupQuery {
+    #[serde(default)]
     #[serde(rename = "policyName", alias = "policy")]
     pub policy_name: String,
     #[serde(rename = "userOrGroup", alias = "user-or-group")]
@@ -640,8 +641,8 @@ fn build_policy_mappings(
     }
 
     let mut results: Vec<PolicyEntities> = policy_map
-        .into_iter()
-        .filter_map(|(_, mut mapping)| {
+        .into_values()
+        .filter_map(|mut mapping| {
             if !requested_policies.is_empty() && !requested_policies.iter().any(|policy| policy == &mapping.policy) {
                 return None;
             }
@@ -981,6 +982,16 @@ mod tests {
         assert_eq!(query.policy_name, "readwrite");
         assert_eq!(query.user_or_group, "test-user");
         assert!(!query.is_group);
+    }
+
+    #[test]
+    fn set_policy_query_allows_missing_policy_name_for_policy_removal() {
+        let query: SetPolicyForUserOrGroupQuery =
+            serde_urlencoded::from_str("userOrGroup=test-group&isGroup=true").expect("query should parse");
+
+        assert!(query.policy_name.is_empty());
+        assert_eq!(query.user_or_group, "test-group");
+        assert!(query.is_group);
     }
 
     #[test]

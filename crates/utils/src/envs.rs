@@ -173,6 +173,8 @@ const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
     "REGION",
     "ROOT_PASSWORD",
     "ROOT_USER",
+    "SCANNER_CYCLE",
+    "SCANNER_SPEED",
     "SECRET_KEY",
     "SECRET_KEY_FILE",
     "STORAGE_CLASS_INLINE_BLOCK",
@@ -680,6 +682,28 @@ mod tests {
                 .iter()
                 .any(|(input_key, rustfs_key)| input_key == &source_key("STORAGE_CLASS_STANDARD")
                     && rustfs_key == "RUSTFS_STORAGE_CLASS_STANDARD")
+        );
+        assert_eq!(report.conflict_count(), 0);
+    }
+
+    #[test]
+    fn scanner_aliases_are_mapped_when_rustfs_missing() {
+        let report = build_external_env_compat_report_from_entries(vec![
+            (source_key("SCANNER_SPEED"), "slow".to_string()),
+            (source_key("SCANNER_CYCLE"), "600".to_string()),
+        ]);
+        assert_eq!(report.mapped_count(), 2);
+        assert!(
+            report
+                .mapped_pairs
+                .iter()
+                .any(|(input_key, rustfs_key)| input_key == &source_key("SCANNER_SPEED") && rustfs_key == "RUSTFS_SCANNER_SPEED")
+        );
+        assert!(
+            report
+                .mapped_pairs
+                .iter()
+                .any(|(input_key, rustfs_key)| input_key == &source_key("SCANNER_CYCLE") && rustfs_key == "RUSTFS_SCANNER_CYCLE")
         );
         assert_eq!(report.conflict_count(), 0);
     }

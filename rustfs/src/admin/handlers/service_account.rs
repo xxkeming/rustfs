@@ -193,9 +193,7 @@ impl Operation for AddServiceAccount {
             return Err(s3_error!(InvalidRequest, "access key has spaces"));
         }
 
-        create_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        create_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let session_policy = if let Some(policy) = &create_req.policy {
             let policy_bytes =
@@ -252,7 +250,7 @@ impl Operation for AddServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false, // Always require explicit Allow permission
             })
             .await
@@ -528,9 +526,7 @@ impl Operation for UpdateServiceAccount {
         let update_req: UpdateServiceAccountReq =
             serde_json::from_slice(&body[..]).map_err(|e| s3_error!(InvalidRequest, "unmarshal body failed, e: {:?}", e))?;
 
-        update_req
-            .validate()
-            .map_err(|e| S3Error::with_message(InvalidRequest, e.to_string()))?;
+        update_req.validate().map_err(|e| S3Error::with_message(InvalidRequest, e))?;
 
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
@@ -550,7 +546,7 @@ impl Operation for UpdateServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -666,7 +662,7 @@ impl Operation for InfoServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -733,7 +729,7 @@ impl Operation for TemporaryAccountInfo {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -807,7 +803,7 @@ impl Operation for InfoAccessKey {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -944,7 +940,7 @@ impl Operation for ListServiceAccount {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1022,7 +1018,9 @@ fn parse_list_access_keys_query(query: Option<&str>) -> ListAccessKeysQuery {
 
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
         match key.as_ref() {
-            "users" => parsed.users.push(value.into_owned()),
+            "users" if !value.is_empty() => {
+                parsed.users.push(value.into_owned());
+            }
             "all" => parsed.all = parse_bool_param(value.as_ref()),
             "listType" => parsed.list_type = value.into_owned(),
             _ => {}
@@ -1080,7 +1078,7 @@ impl Operation for ListAccessKeysBulk {
                     ),
                     is_owner: owner,
                     object: "",
-                    claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                    claims: cred.claims_or_empty(),
                     deny_only: false,
                 })
                 .await
@@ -1103,7 +1101,7 @@ impl Operation for ListAccessKeysBulk {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: self_only,
             })
             .await
@@ -1128,13 +1126,9 @@ impl Operation for ListAccessKeysBulk {
             }
             users
         } else {
-            let mut checked = Vec::new();
-            for user in requested_users {
-                if iam_store.get_user(&user).await.is_some() {
-                    checked.push(user);
-                }
-            }
-            checked
+            // Keep requested identities as-is. Some valid parent users (for example external
+            // identities) may not be persisted as regular IAM users, but can still own keys.
+            requested_users
         };
 
         let (list_sts_keys, list_service_accounts) = match query.list_type.as_str() {
@@ -1272,7 +1266,7 @@ impl Operation for DeleteServiceAccount {
                 ),
                 is_owner: owner,
                 object: "",
-                claims: cred.claims.as_ref().unwrap_or(&HashMap::new()),
+                claims: cred.claims_or_empty(),
                 deny_only: false,
             })
             .await
@@ -1401,6 +1395,25 @@ mod tests {
         assert_eq!(query.users, vec!["alice".to_string(), "bob".to_string()]);
         assert!(query.all);
         assert_eq!(query.list_type, ACCESS_KEY_LIST_SVCACC_ONLY);
+    }
+
+    #[test]
+    fn list_access_keys_query_ignores_empty_users_values() {
+        let query = parse_list_access_keys_query(Some("users=&users=alice&users=&listType=all"));
+
+        assert_eq!(query.users, vec!["alice".to_string()]);
+        assert!(!query.all);
+        assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+    }
+
+    #[test]
+    fn list_access_keys_query_all_with_empty_users_does_not_conflict() {
+        let query = parse_list_access_keys_query(Some("users=&all=true&listType=all"));
+
+        assert!(query.users.is_empty());
+        assert!(query.all);
+        assert_eq!(query.list_type, ACCESS_KEY_LIST_ALL);
+        assert!(!query.all || query.users.is_empty());
     }
 
     #[test]

@@ -16,7 +16,7 @@ use crate::config::{Config, GLOBAL_STORAGE_CLASS, KVS, audit, notify, oidc, stor
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::global::is_first_cluster_node_local;
-use crate::store_api::{ChunkNativePutData, ObjectInfo, ObjectOptions, StorageAPI};
+use crate::store_api::{ObjectInfo, ObjectOptions, PutObjReader, StorageAPI};
 use http::HeaderMap;
 use rustfs_config::audit::{AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_KEYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_KEYS, NOTIFY_WEBHOOK_SUB_SYS};
@@ -128,7 +128,7 @@ pub async fn delete_config<S: StorageAPI>(api: Arc<S>, file: &str) -> Result<()>
 }
 
 pub async fn save_config_with_opts<S: StorageAPI>(api: Arc<S>, file: &str, data: Vec<u8>, opts: &ObjectOptions) -> Result<()> {
-    let mut put_data = ChunkNativePutData::from_vec(data);
+    let mut put_data = PutObjReader::from_vec(data);
     if let Err(err) = api.put_object(RUSTFS_META_BUCKET, file, &mut put_data, opts).await {
         error!("save_config_with_opts: err: {:?}, file: {}", err, file);
         return Err(err);
@@ -537,7 +537,7 @@ fn build_oidc_object(cfg: &Config) -> Map<String, Value> {
     };
 
     let mut providers = subsystem.iter().collect::<Vec<_>>();
-    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    providers.sort_by_key(|(lhs, _)| *lhs);
 
     let mut oidc_obj = Map::new();
     for (instance_key, kvs) in providers {
@@ -572,7 +572,7 @@ fn build_semantic_oidc_object(cfg: &Config) -> Map<String, Value> {
     };
 
     let mut providers = subsystem.iter().collect::<Vec<_>>();
-    providers.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    providers.sort_by_key(|(lhs, _)| *lhs);
 
     let mut oidc_obj = Map::new();
     for (instance_key, kvs) in providers {
@@ -691,7 +691,7 @@ fn build_notify_subsystem_object(
         .iter()
         .filter(|(instance_key, _)| instance_key.as_str() != DEFAULT_DELIMITER)
         .collect::<Vec<_>>();
-    instances.sort_by(|(lhs, _), (rhs, _)| lhs.cmp(rhs));
+    instances.sort_by_key(|(lhs, _)| *lhs);
 
     for (instance_key, kvs) in instances {
         let instance_obj = build_notify_instance_diff_object(kvs, &effective_default, valid_keys, default_kvs);
@@ -1076,10 +1076,10 @@ mod tests {
     use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::set_disk::SetDisks;
     use crate::store_api::{
-        BucketInfo, BucketOperations, BucketOptions, ChunkNativePutData, CompletePart, DeleteBucketOptions, DeletedObject,
-        GetObjectReader, HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info,
-        ListOperations, MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo,
-        ObjectOperations, ObjectOptions, ObjectToDelete, PartInfo, StorageAPI, WalkOptions,
+        BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, GetObjectReader,
+        HTTPRangeSpec, HealOperations, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, MultipartInfo, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectInfo, ObjectOperations,
+        ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAPI, WalkOptions,
     };
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
@@ -1302,7 +1302,7 @@ mod tests {
             &self,
             _bucket: &str,
             _object: &str,
-            _data: &mut ChunkNativePutData,
+            _data: &mut PutObjReader,
             _opts: &ObjectOptions,
         ) -> Result<ObjectInfo> {
             panic!("unused in test")
@@ -1489,7 +1489,7 @@ mod tests {
             _object: &str,
             _upload_id: &str,
             _part_id: usize,
-            _data: &mut ChunkNativePutData,
+            _data: &mut PutObjReader,
             _opts: &ObjectOptions,
         ) -> Result<PartInfo> {
             panic!("unused in test")
