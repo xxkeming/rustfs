@@ -18,6 +18,7 @@
 use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
+use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
 use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -707,6 +708,10 @@ impl ObjectIO for SetDisks {
         tokio::spawn(async move {
             let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
             let mut writer = wd;
+            // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
+            // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
+            // would incorrectly treat downstream backpressure as disk-read latency.
+            // Disk read timeouts must be enforced at the actual disk I/O operations.
             if let Err(e) = Self::get_object_with_fileinfo(
                 &bucket,
                 &object,
@@ -757,7 +762,6 @@ impl ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-
         let sc_parity_drives = {
             if let Some(sc) = GLOBAL_STORAGE_CLASS.get() {
                 sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
@@ -1338,6 +1342,22 @@ impl BucketOperations for SetDisks {
     async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
         unimplemented!()
     }
+}
+
+fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &ObjectInfo, opts: &ObjectOptions) -> Result<()> {
+    if let Some(retention) = &opts.object_lock_retention
+        && check_retention_for_modification(
+            &obj_info.user_defined,
+            retention.mode.as_deref(),
+            retention.retain_until,
+            retention.bypass_governance,
+        )
+        .is_some()
+    {
+        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+    }
+
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -1985,6 +2005,8 @@ impl ObjectOperations for SetDisks {
         }
 
         let obj_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+
+        check_object_lock_retention_update(bucket, object, &obj_info, opts)?;
 
         for (k, v) in obj_info.user_defined {
             fi.metadata.insert(k, v);
@@ -4126,6 +4148,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                         total_space: res.total,
                         used_space: res.used,
                         available_space: res.free,
+                        physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
                         utilization: {
                             if res.total > 0 {
                                 res.used as f64 / res.total as f64 * 100_f64
@@ -5481,6 +5504,74 @@ mod tests {
     }
 
     #[test]
+    fn test_check_object_lock_retention_update_blocks_compliance_shorten() {
+        let now = OffsetDateTime::now_utc();
+        let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
+        let requested_until = now + Duration::from_secs(60 * 60 * 24);
+
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+                mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
+                retain_until: Some(requested_until),
+                bypass_governance: true,
+            }),
+            ..Default::default()
+        };
+
+        let err = check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+            .expect_err("COMPLIANCE shortening must be blocked");
+
+        assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)));
+    }
+
+    #[test]
+    fn test_check_object_lock_retention_update_allows_governance_shorten_with_bypass() {
+        let now = OffsetDateTime::now_utc();
+        let existing_until = now + Duration::from_secs(60 * 60 * 24 * 60);
+        let requested_until = now + Duration::from_secs(60 * 60 * 24);
+
+        let mut user_defined = HashMap::new();
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_MODE.as_str().to_string(),
+            s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string(),
+        );
+        user_defined.insert(
+            X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str().to_string(),
+            existing_until.format(&time::format_description::well_known::Rfc3339).unwrap(),
+        );
+
+        let obj_info = ObjectInfo {
+            user_defined,
+            ..Default::default()
+        };
+        let opts = ObjectOptions {
+            object_lock_retention: Some(crate::store_api::ObjectLockRetentionOptions {
+                mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
+                retain_until: Some(requested_until),
+                bypass_governance: true,
+            }),
+            ..Default::default()
+        };
+
+        check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
+            .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[test]
     fn test_should_prevent_write() {
         let oi = ObjectInfo {
             etag: Some("abc".to_string()),
@@ -5571,6 +5662,100 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(complete_part_checksum(&part, full_object_crc32), Some(Some("AAAAAA==".to_string())));
+    }
+
+    #[tokio::test]
+    async fn range_reads_use_shard_span_length_for_non_zero_offsets() {
+        use tokio::io::AsyncReadExt;
+        use uuid::Uuid;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "object";
+        let payload = vec![b'x'; 3 * 1024 * 1024 + 1234];
+        let range_offset = 2 * 1024 * 1024 + 17;
+        let range_length = 512 * 1024;
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
+        fi.size = payload.len() as i64;
+        fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
+
+        let erasure = erasure_coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        let shard_path = format!("{object}/{data_dir}/part.1");
+        let checksum_info = fi.erasure.get_checksum_info(1);
+
+        let mut bitrot_writer = create_bitrot_writer(
+            true,
+            None,
+            bucket,
+            &shard_path,
+            payload.len() as i64,
+            erasure.shard_size(),
+            checksum_info.algorithm.clone(),
+        )
+        .await
+        .expect("bitrot writer should be created");
+
+        for chunk in payload.chunks(erasure.shard_size()) {
+            bitrot_writer.write(chunk).await.expect("payload chunk should be written");
+        }
+
+        let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
+        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+            .await
+            .expect("encoded shard should be stored");
+
+        let files = vec![fi.clone()];
+        let disks = vec![Some(disk.clone())];
+        let (mut reader, mut writer) = tokio::io::duplex(range_length * 2);
+
+        let read_task = tokio::spawn(async move {
+            SetDisks::get_object_with_fileinfo(
+                bucket,
+                object,
+                range_offset,
+                range_length as i64,
+                &mut writer,
+                fi,
+                files,
+                &disks,
+                0,
+                0,
+                true,
+            )
+            .await
+        });
+
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("range bytes should be readable");
+
+        read_task
+            .await
+            .expect("read task should complete")
+            .expect("range read should succeed");
+
+        assert_eq!(out, payload[range_offset..range_offset + range_length]);
     }
 
     #[test]

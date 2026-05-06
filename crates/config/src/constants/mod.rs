@@ -20,6 +20,8 @@ pub(crate) mod console;
 pub(crate) mod drive;
 pub(crate) mod env;
 pub(crate) mod heal;
+pub(crate) mod health;
+pub(crate) mod internode;
 pub(crate) mod object;
 pub(crate) mod oidc;
 pub(crate) mod profiler;

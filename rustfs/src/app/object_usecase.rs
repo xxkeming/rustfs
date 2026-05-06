@@ -16,6 +16,7 @@
 
 use crate::app::context::{AppContext, default_notify_interface, get_global_app_context};
 use crate::config::RustFSBufferConfig;
+use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
@@ -23,7 +24,7 @@ use crate::storage::concurrency::{
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background, spawn_background_with_context};
+use crate::storage::helper::{OperationHelper, spawn_background_with_context};
 use crate::storage::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -36,7 +37,7 @@ use bytes::Bytes;
 use datafusion::arrow::{
     csv::WriterBuilder as CsvWriterBuilder, json::WriterBuilder as JsonWriterBuilder, json::writer::JsonArray,
 };
-use futures::{StreamExt, stream};
+use futures::StreamExt;
 use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
@@ -118,7 +119,8 @@ use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::io::{AsyncRead, ReadBuf};
@@ -129,6 +131,10 @@ use tokio_tar::Archive;
 use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
+
+const ACCEPT_RANGES_BYTES: &str = "bytes";
+const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 struct DeadlockRequestGuard {
     deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
@@ -213,6 +219,7 @@ async fn enqueue_transitioned_delete_cleanup(bucket: &str, object: &str, opts: &
     let Some(existing) = existing else {
         return;
     };
+    let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
         rustfs_ecstore::bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
@@ -252,6 +259,38 @@ pin_project! {
         md5: Md5Context,
         finished: bool,
         etag: Arc<Mutex<Option<String>>>,
+    }
+}
+
+pin_project! {
+    struct MemoryTrackedBytesStream {
+        bytes: Bytes,
+        emitted: bool,
+        _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
+    }
+}
+
+impl MemoryTrackedBytesStream {
+    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+        Self {
+            bytes,
+            emitted: false,
+            _guard: guard,
+        }
+    }
+}
+
+impl futures::Stream for MemoryTrackedBytesStream {
+    type Item = std::io::Result<Bytes>;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        let this = self.project();
+        if *this.emitted {
+            return std::task::Poll::Ready(None);
+        }
+
+        *this.emitted = true;
+        std::task::Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
 
@@ -343,6 +382,57 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
                 return false;
             }
         }
+    }
+
+    true
+}
+
+fn object_seek_support_threshold() -> usize {
+    static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
+    *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_SEEK_SUPPORT_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD,
+        )
+    })
+}
+
+fn should_buffer_get_object_in_memory(
+    info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+) -> bool {
+    let configured_threshold = object_seek_support_threshold() as i64;
+    should_buffer_get_object_in_memory_with_threshold(info, response_content_length, part_number, has_range, configured_threshold)
+}
+
+fn should_buffer_get_object_in_memory_with_threshold(
+    _info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+    configured_threshold: i64,
+) -> bool {
+    if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
+        return false;
+    }
+
+    let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
+        && GET_OBJECT_BUFFER_THRESHOLD_WARNED
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        warn!(
+            configured_threshold_bytes = configured_threshold,
+            hard_limit_bytes = MAX_GET_OBJECT_MEMORY_BUFFER_BYTES,
+            "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD exceeds safety cap; using capped in-memory buffer threshold"
+        );
+    }
+
+    if response_content_length > effective_threshold {
+        return false;
     }
 
     true
@@ -515,7 +605,8 @@ async fn enrich_delete_replication_state_if_needed(
     let Some(replication_state) = delete_object.replication_state.as_ref() else {
         return;
     };
-    if !replication_state.replicate_decision_str.is_empty()
+    if obj_info.replication_status != ReplicationStatusType::Replica
+        && !replication_state.replicate_decision_str.is_empty()
         && (!replication_state.targets.is_empty() || !replication_state.purge_targets.is_empty())
     {
         return;
@@ -550,10 +641,59 @@ fn should_schedule_delete_replication(
         return false;
     }
 
+    if opts.version_id.is_some() && !deleted_delete_marker_version && !replication_source.delete_marker {
+        return matches!(
+            replication_source.replication_status,
+            ReplicationStatusType::Replica
+                | ReplicationStatusType::Pending
+                | ReplicationStatusType::Completed
+                | ReplicationStatusType::Failed
+        );
+    }
+
     replication_source.replication_status == ReplicationStatusType::Replica
         || replication_source.replication_status == ReplicationStatusType::Pending
         || replication_source.version_purge_status == VersionPurgeStatusType::Pending
         || (deleted_delete_marker_version && replication_source.replication_status == ReplicationStatusType::Completed)
+}
+
+async fn should_schedule_replica_delete_replication(
+    bucket: &str,
+    replication_source: &ObjectInfo,
+    version_id: Option<Uuid>,
+) -> bool {
+    let Ok((config, _)) = metadata_sys::get_replication_config(bucket).await else {
+        return false;
+    };
+
+    delete_replication_state_from_config(&config, replication_source, version_id, true).is_some()
+}
+
+fn delete_replication_version_id(replication_source: &ObjectInfo, deleted_delete_marker_version: bool) -> Option<Uuid> {
+    if replication_source.delete_marker && !deleted_delete_marker_version {
+        None
+    } else {
+        replication_source.version_id
+    }
+}
+
+fn should_use_existing_delete_replication_info(opts: &ObjectOptions) -> bool {
+    opts.version_id.is_some() && !opts.delete_marker
+}
+
+fn delete_replication_state_source<'a>(
+    opts: &ObjectOptions,
+    existing_object_info: Option<&'a ObjectInfo>,
+    deleted_object_info: &'a ObjectInfo,
+) -> &'a ObjectInfo {
+    if opts.replication_request
+        && deleted_object_info.delete_marker
+        && let Some(existing) = existing_object_info
+    {
+        return existing;
+    }
+
+    deleted_object_info
 }
 
 const AMZ_SNOWBALL_EXTRACT_COMPAT: &str = "X-Amz-Snowball-Auto-Extract";
@@ -944,8 +1084,10 @@ impl DefaultObjectUsecase {
     }
 
     fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(buf.len());
+        let bytes = Bytes::from(buf);
         Some(StreamingBlob::wrap(bytes_stream(
-            stream::once(async move { Ok::<Bytes, std::io::Error>(Bytes::from(buf)) }),
+            MemoryTrackedBytesStream::new(bytes, guard),
             response_content_length as usize,
         )))
     }
@@ -1161,11 +1303,9 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::{record_memory_copy_saved, record_zero_copy_read};
+        use rustfs_io_metrics::record_zero_copy_read;
         let read_duration = read_start.elapsed();
-        let estimated_saved = (info.size * 2) as usize;
         record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
-        record_memory_copy_saved(estimated_saved);
 
         manager.record_disk_operation(info.size as u64, read_duration, true).await;
 
@@ -1422,7 +1562,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn build_get_object_body<R>(
         mut final_stream: R,
-        _info: &ObjectInfo,
+        info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
         part_number: Option<usize>,
@@ -1433,11 +1573,8 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         if encryption_applied {
-            let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
-            let should_buffer_encrypted_object = response_content_length > 0
-                && response_content_length <= seekable_object_size_threshold as i64
-                && part_number.is_none()
-                && !has_range;
+            let should_buffer_encrypted_object =
+                should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -1464,11 +1601,8 @@ impl DefaultObjectUsecase {
             return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
         }
 
-        let seekable_object_size_threshold = rustfs_config::DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD;
-        let should_provide_seek_support = response_content_length > 0
-            && response_content_length <= seekable_object_size_threshold as i64
-            && part_number.is_none()
-            && !has_range;
+        let should_provide_seek_support =
+            should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -1601,8 +1735,8 @@ impl DefaultObjectUsecase {
 
         if enable_zero_copy {
             // Record zero-copy write attempt
-            counter!("rustfs.zero_copy.write.attempts.total").increment(1);
-            histogram!("rustfs.zero_copy.write.size.bytes").record(size as f64);
+            counter!("rustfs_zero_copy_write_attempts_total").increment(1);
+            histogram!("rustfs_zero_copy_write_size_bytes").record(size as f64);
             debug!("Zero-copy write enabled for {} byte object (bucket={}, key={})", size, bucket, key);
         }
 
@@ -1787,7 +1921,6 @@ impl DefaultObjectUsecase {
 
         let repoptions =
             get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
-
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
@@ -2024,7 +2157,7 @@ impl DefaultObjectUsecase {
             last_modified,
             content_type,
             content_encoding: info.content_encoding.clone(),
-            accept_ranges: Some("bytes".to_string()),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
             metadata: filter_object_metadata(&info.user_defined),
@@ -2065,9 +2198,9 @@ impl DefaultObjectUsecase {
 
         let request_id = req
             .extensions
-            .get::<crate::storage::request_context::RequestContext>()
+            .get::<request_context::RequestContext>()
             .map(|ctx| ctx.request_id.clone())
-            .unwrap_or_else(|| crate::storage::request_context::RequestContext::fallback().request_id);
+            .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
         let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
@@ -2870,6 +3003,19 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
+            if bypass_governance {
+                let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
+                if let Err(e) = auth_res {
+                    delete_results[idx].error = Some(Error {
+                        code: Some("AccessDenied".to_string()),
+                        key: Some(obj_id.key.clone()),
+                        message: Some(e.to_string()),
+                        version_id: version_id.clone(),
+                    });
+                    continue;
+                }
+            }
+
             let mut object = ObjectToDelete {
                 object_name: obj_id.key.clone(),
                 version_id: version_uuid,
@@ -3034,6 +3180,7 @@ impl DefaultObjectUsecase {
                 && (dobj.delete_marker_replication_status() == ReplicationStatusType::Pending
                     || dobj.version_purge_status() == VersionPurgeStatusType::Pending)
             {
+                let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
                 let mut dobj = dobj.clone();
                 if is_dir_object(dobj.object_name.as_str()) && dobj.version_id.is_none() {
                     dobj.version_id = Some(Uuid::nil());
@@ -3055,7 +3202,9 @@ impl DefaultObjectUsecase {
             .as_ref()
             .map(|context| context.notify())
             .unwrap_or_else(default_notify_interface);
-        spawn_background(async move {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+        spawn_background_with_context(request_context, async move {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Notify);
             for res in delete_results {
                 if let Some(dobj) = res.delete_object {
                     let event_name = if dobj.delete_marker {
@@ -3242,34 +3391,47 @@ impl DefaultObjectUsecase {
             return result;
         }
 
-        let deleted_replication_info = existing_object_info.as_ref().filter(|_| opts.version_id.is_some());
-        let replication_source = deleted_replication_info.unwrap_or(&obj_info);
+        let deleted_replication_info = existing_object_info
+            .as_ref()
+            .filter(|_| should_use_existing_delete_replication_info(&opts));
+        let _delete_tail_guard = DeleteTailActivityGuard::new(DeleteTailStage::Tail);
+        let deleted_object_source = deleted_replication_info.unwrap_or(&obj_info);
+        let replication_state_source =
+            delete_replication_state_source(&opts, existing_object_info.as_ref(), deleted_object_source);
         let deleted_delete_marker_version = deleted_replication_info.is_some_and(|info| info.delete_marker);
 
-        if should_schedule_delete_replication(&opts, replication_source, deleted_delete_marker_version) {
+        let delete_replication_version_id = delete_replication_version_id(deleted_object_source, deleted_delete_marker_version);
+        let schedule_delete_replication = if opts.replication_request && replica {
+            should_schedule_replica_delete_replication(&bucket, replication_state_source, delete_replication_version_id).await
+        } else {
+            should_schedule_delete_replication(&opts, deleted_object_source, deleted_delete_marker_version)
+        };
+
+        if schedule_delete_replication {
+            let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
             let mut deleted_object = DeletedObjectReplicationInfo {
                 delete_object: rustfs_ecstore::store_api::DeletedObject {
-                    delete_marker: replication_source.delete_marker && !deleted_delete_marker_version,
-                    delete_marker_version_id: if replication_source.delete_marker {
-                        replication_source.version_id
+                    delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
+                    delete_marker_version_id: if deleted_object_source.delete_marker {
+                        deleted_object_source.version_id
                     } else {
                         None
                     },
                     object_name: key.clone(),
-                    version_id: if replication_source.delete_marker {
+                    version_id: if deleted_object_source.delete_marker {
                         None
                     } else {
-                        replication_source.version_id
+                        deleted_object_source.version_id
                     },
-                    delete_marker_mtime: replication_source.mod_time,
-                    replication_state: Some(replication_source.replication_state()),
+                    delete_marker_mtime: deleted_object_source.mod_time,
+                    replication_state: Some(replication_state_source.replication_state()),
                     ..Default::default()
                 },
                 bucket: bucket.clone(),
                 event_type: REPLICATE_INCOMING_DELETE.to_string(),
                 ..Default::default()
             };
-            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object.delete_object, replication_source).await;
+            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object.delete_object, replication_state_source).await;
             schedule_replication_delete(deleted_object).await;
         }
 
@@ -3516,6 +3678,7 @@ impl DefaultObjectUsecase {
             cache_control,
             content_disposition,
             content_language,
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             website_redirect_location,
             expires,
             last_modified,
@@ -4257,10 +4420,7 @@ impl DefaultObjectUsecase {
             };
 
             let notify = notify.clone();
-            let request_context = req
-                .extensions
-                .get::<crate::storage::request_context::RequestContext>()
-                .cloned();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
             spawn_background_with_context(request_context, async move {
                 notify.notify(event_args).await;
             });
@@ -4330,6 +4490,11 @@ mod tests {
         DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
         ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
     };
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
         S3Request {
@@ -4413,6 +4578,164 @@ mod tests {
         headers.insert(AMZ_SERVER_SIDE_ENCRYPTION, HeaderValue::from_static("AES256"));
 
         assert!(!should_use_zero_copy(2 * 1024 * 1024, &headers));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_hard_safety_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
+        let response_len = 80_i64 * 1024 * 1024;
+        let should_buffer =
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold);
+
+        assert!(
+            !should_buffer,
+            "64MiB hard cap must force streaming when response exceeds cap even if configured threshold is much higher"
+        );
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_allows_small_non_range_requests() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            Some(1),
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024 * 1024,
+            None,
+            true,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_respects_configured_threshold_below_cap() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold + 1,
+            None,
+            false,
+            configured_threshold
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_rejects_unknown_lengths_and_disabled_thresholds() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            0,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            -1,
+            None,
+            false,
+            configured_threshold
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0));
+    }
+
+    struct ReadProbeReader {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for ReadProbeReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            false,
+        )
+        .await
+        .expect("build_get_object_body should succeed for streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large-object response construction should not pre-read object data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_large_encrypted_objects_on_streaming_path_without_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 18_i64 * 1024 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            18_i64 * 1024 * 1024 * 1024,
+            128 * 1024,
+            None,
+            false,
+            true,
+        )
+        .await
+        .expect("build_get_object_body should succeed for encrypted streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "large encrypted object response construction should not pre-read object data"
+        );
     }
 
     #[test]
@@ -4690,6 +5013,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_get_object_rejects_range_with_part_number() {
+        let input = GetObjectInput::builder()
+            .bucket("test-bucket".to_string())
+            .key("test-key".to_string())
+            .part_number(Some(1))
+            .range(Some(Range::Int { first: 0, last: Some(1) }))
+            .build()
+            .unwrap();
+
+        let req = build_request(input, Method::GET);
+        let usecase = DefaultObjectUsecase::without_context();
+
+        let err = Box::pin(usecase.execute_get_object(req)).await.unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
     async fn execute_copy_object_rejects_self_copy_without_replace_directive() {
         let input = CopyObjectInput::builder()
             .copy_source(CopySource::Bucket {
@@ -4802,7 +5142,27 @@ mod tests {
         );
     }
 
+    #[test]
+    fn should_schedule_delete_replication_keeps_object_version_purge_from_completed_source() {
+        let opts = ObjectOptions {
+            replication_request: false,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let replication_source = ObjectInfo {
+            delete_marker: false,
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        assert!(
+            should_schedule_delete_replication(&opts, &replication_source, false),
+            "source-side object version purge must still enqueue delete replication after the original PUT completed"
+        );
+    }
+
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn execute_get_object_attributes_returns_internal_error_when_store_uninitialized() {
         let input = GetObjectAttributesInput::builder()
             .bucket("test-bucket".to_string())
@@ -4945,6 +5305,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires isolated global object layer state"]
     async fn execute_restore_object_returns_internal_error_when_store_uninitialized() {
         let restore_request = RestoreRequest {
             days: Some(1),
@@ -4990,7 +5351,12 @@ mod tests {
                 id: Some("rule-1".to_string()),
                 prefix: Some("test/".to_string()),
                 priority: Some(1),
-                source_selection_criteria: None,
+                source_selection_criteria: Some(SourceSelectionCriteria {
+                    replica_modifications: Some(ReplicaModifications {
+                        status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                    }),
+                    sse_kms_encrypted_objects: None,
+                }),
                 status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
             }],
         };
@@ -5009,6 +5375,45 @@ mod tests {
         assert_eq!(state.replication_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.targets.contains_key(&arn));
+    }
+
+    #[test]
+    fn delete_replication_state_from_config_skips_replica_delete_without_replica_modifications() {
+        let arn = "arn:aws:s3:::target-bucket".to_string();
+        let config = ReplicationConfiguration {
+            role: arn.clone(),
+            rules: vec![ReplicationRule {
+                delete_marker_replication: Some(DeleteMarkerReplication {
+                    status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+                }),
+                delete_replication: None,
+                destination: Destination {
+                    bucket: arn,
+                    ..Default::default()
+                },
+                existing_object_replication: Some(ExistingObjectReplication {
+                    status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+                }),
+                filter: None,
+                id: Some("rule-1".to_string()),
+                prefix: Some("test/".to_string()),
+                priority: Some(1),
+                source_selection_criteria: None,
+                status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+            }],
+        };
+        let obj_info = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "test/object.txt".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        assert!(
+            delete_replication_state_from_config(&config, &obj_info, None, true).is_none(),
+            "replica deletes must only fan out when ReplicaModifications are enabled"
+        );
     }
 
     #[test]
@@ -5052,5 +5457,140 @@ mod tests {
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.purge_targets.contains_key(&arn));
+    }
+
+    #[test]
+    fn delete_replication_state_source_prefers_existing_replica_for_replication_delete_marker_creation() {
+        let opts = ObjectOptions {
+            replication_request: true,
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+        let existing = ObjectInfo {
+            name: "test/object.txt".to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+        let deleted = ObjectInfo {
+            name: "test/object.txt".to_string(),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
+
+        assert_eq!(source.replication_status, ReplicationStatusType::Completed);
+        assert!(
+            !source.delete_marker,
+            "downstream fanout should inherit replica identity from the pre-delete object"
+        );
+    }
+
+    #[test]
+    fn delete_replication_state_source_keeps_deleted_marker_for_non_replication_requests() {
+        let opts = ObjectOptions::default();
+        let existing = ObjectInfo {
+            name: "test/object.txt".to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+        let deleted = ObjectInfo {
+            name: "test/object.txt".to_string(),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        let source = delete_replication_state_source(&opts, Some(&existing), &deleted);
+
+        assert!(
+            source.delete_marker,
+            "source-originated deletes should keep using the new delete marker state"
+        );
+    }
+
+    #[test]
+    fn replica_delete_enrichment_must_not_reuse_upstream_targets() {
+        let delete_object = rustfs_ecstore::store_api::DeletedObject {
+            replication_state: Some(ReplicationState {
+                replicate_decision_str: "arn:aws:s3:::upstream=true;false;arn:aws:s3:::upstream;".to_string(),
+                replication_status_internal: Some("arn:aws:s3:::upstream=COMPLETED;".to_string()),
+                targets: replication_statuses_map("arn:aws:s3:::upstream=COMPLETED;"),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let obj_info = ObjectInfo {
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let should_keep_existing = delete_object.replication_state.as_ref().is_some_and(|state| {
+            obj_info.replication_status != ReplicationStatusType::Replica
+                && !state.replicate_decision_str.is_empty()
+                && (!state.targets.is_empty() || !state.purge_targets.is_empty())
+        });
+
+        assert!(
+            !should_keep_existing,
+            "replica fanout deletes must recompute targets from the local bucket config instead of reusing upstream replication state"
+        );
+    }
+
+    #[test]
+    fn delete_replication_version_id_uses_none_for_delete_marker_creation() {
+        let source = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            delete_replication_version_id(&source, false),
+            None,
+            "delete-marker creation must stay on the delete-marker replication path"
+        );
+    }
+
+    #[test]
+    fn delete_replication_version_id_keeps_version_for_marker_purge() {
+        let version_id = Uuid::new_v4();
+        let source = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(version_id),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            delete_replication_version_id(&source, true),
+            Some(version_id),
+            "delete-marker version purge must preserve the concrete version id for downstream purge replication"
+        );
+    }
+
+    #[test]
+    fn should_use_existing_delete_replication_info_ignores_replication_delete_marker_creation() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert!(
+            !should_use_existing_delete_replication_info(&opts),
+            "replicated delete-marker creation carries a source version id header but must not be treated as a version purge"
+        );
+    }
+
+    #[test]
+    fn should_use_existing_delete_replication_info_keeps_version_delete_requests() {
+        let opts = ObjectOptions {
+            version_id: Some(Uuid::new_v4().to_string()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_use_existing_delete_replication_info(&opts),
+            "true version-delete requests should keep using the pre-delete object info"
+        );
     }
 }

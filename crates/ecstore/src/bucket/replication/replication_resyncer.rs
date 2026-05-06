@@ -35,7 +35,7 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::store_api::{DeletedObject, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete, WalkOptions};
 use crate::{StorageAPI, new_object_layer_fn};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
-use aws_sdk_s3::operation::head_object::HeadObjectOutput;
+use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use aws_smithy_types::body::SdkBody;
@@ -85,7 +85,7 @@ use tokio::task::JoinSet;
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
@@ -113,6 +113,41 @@ fn normalize_wire_time(value: Option<OffsetDateTime>) -> Option<OffsetDateTime> 
 
 fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
     state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
+fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
+    if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
+        return false;
+    }
+    !matches!(raw_status, Some(404 | 405))
+}
+
+fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
+    let (is_not_found, code) = err
+        .as_service_error()
+        .map(|service_err| (service_err.is_not_found(), service_err.code()))
+        .unwrap_or((false, None));
+    let raw_status = err.raw_response().map(|resp| resp.status().as_u16());
+    should_count_head_proxy_failure(is_not_found, code, raw_status)
+}
+
+async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
+    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+        stats.inc_proxy(bucket, api, is_err).await;
+    }
+}
+
+async fn head_object_with_proxy_stats(
+    source_bucket: &str,
+    target_client: &TargetClient,
+    target_bucket: &str,
+    object: &str,
+    version_id: Option<String>,
+) -> std::result::Result<HeadObjectOutput, SdkError<HeadObjectError>> {
+    let result = target_client.head_object(target_bucket, object, version_id).await;
+    let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
+    record_proxy_request(source_bucket, "HeadObject", is_err).await;
+    result
 }
 
 #[derive(Debug, Clone, Default)]
@@ -748,10 +783,15 @@ impl ReplicationResyncer {
 
                     let reset_id = target_client.reset_id.clone();
 
-                    let (size, err) = if let Err(err) = target_client
-                        .head_object(&target_client.bucket, &roi.name, roi.version_id.map(|v| v.to_string()))
-                        .await
-                    {
+                    let head_result = head_object_with_proxy_stats(
+                        &bucket_name,
+                        target_client.as_ref(),
+                        &target_client.bucket,
+                        &roi.name,
+                        roi.version_id.map(|v| v.to_string()),
+                    )
+                    .await;
+                    let (size, err) = if let Err(err) = head_result {
                         if roi.delete_marker {
                             st.replicated_count += 1;
                         } else {
@@ -1272,15 +1312,7 @@ pub async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
-    let opts = ObjectOpts {
-        name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
-        user_tags: oi.user_tags.clone(),
-        delete_marker: oi.delete_marker,
-        version_id: dobj.version_id,
-        op_type: ReplicationType::Delete,
-        ..Default::default()
-    };
+    let opts = delete_replication_object_opts(dobj, oi);
 
     let tgt_arns = rcfg.filter_target_arns(&opts);
     let mut dsc = ReplicateDecision::new();
@@ -1330,6 +1362,19 @@ pub async fn check_replicate_delete(
     }
 
     dsc
+}
+
+fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
+    ObjectOpts {
+        name: dobj.object_name.clone(),
+        ssec: is_ssec_encrypted(&oi.user_defined),
+        user_tags: oi.user_tags.clone(),
+        delete_marker: oi.delete_marker,
+        version_id: dobj.version_id,
+        op_type: ReplicationType::Delete,
+        replica: oi.replication_status == ReplicationStatusType::Replica,
+        ..Default::default()
+    }
 }
 
 /// Check if the user-defined metadata contains SSEC encryption headers
@@ -1703,7 +1748,7 @@ pub async fn replicate_delete<S: StorageAPI>(dobj: DeletedObjectReplicationInfo,
 
     let is_version_purge = is_version_delete_replication(&dobj.delete_object);
 
-    if !is_version_purge && dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
+    if should_retry_delete_marker_purge(&dobj.delete_object) {
         let bucket_clone = bucket.clone();
         let dobj_clone = dobj.clone();
         let dsc_clone = dsc.clone();
@@ -2061,6 +2106,10 @@ fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
     dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
 }
 
+fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker_version_id.is_some()
+}
+
 fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
     !is_not_found && !matches!(code, Some("MethodNotAllowed" | "405"))
 }
@@ -2111,9 +2160,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
     };
 
     if dobj.delete_object.delete_marker && dobj.delete_object.delete_marker_version_id.is_some() {
-        match tgt_client
-            .head_object(&tgt_client.bucket, &dobj.delete_object.object_name, version_id.clone())
-            .await
+        match head_object_with_proxy_stats(
+            &dobj.bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &dobj.delete_object.object_name,
+            version_id.clone(),
+        )
+        .await
         {
             Ok(_) => {}
             Err(e) => {
@@ -2152,6 +2206,14 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         .await
     {
         Ok(_) => {
+            debug!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                "replicate_delete_to_target succeeded"
+            );
             if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Completed;
             } else {
@@ -2159,6 +2221,15 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             }
         }
         Err(e) => {
+            warn!(
+                bucket = tgt_client.bucket,
+                object = dobj.delete_object.object_name,
+                version_id = ?version_id,
+                delete_marker = dobj.delete_object.delete_marker,
+                is_version_purge,
+                error = %e,
+                "replicate_delete_to_target failed"
+            );
             rinfo.error = Some(e.to_string());
             if !is_version_purge {
                 rinfo.replication_status = ReplicationStatusType::Failed;
@@ -2445,9 +2516,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         }
 
         let mut replication_action = replication_action;
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2502,9 +2578,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             }
         };
 
+        let has_tagging_replication = !put_opts.user_tags.is_empty();
         if let Some(err) = if is_multipart {
             drop(gr);
-            replicate_object_with_multipart(MultipartReplicationContext {
+            let result = replicate_object_with_multipart(MultipartReplicationContext {
                 storage: storage.clone(),
                 cli: tgt_client.clone(),
                 src_bucket: &bucket,
@@ -2515,16 +2592,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 arn: &rinfo.arn,
                 put_opts,
             })
-            .await
-            .err()
+            .await;
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } else {
             gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
             let byte_stream = async_read_to_bytestream(gr.stream);
-            tgt_client
+            let result = tgt_client
                 .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                 .await
-                .map_err(|e| std::io::Error::other(e.to_string()))
-                .err()
+                .map_err(|e| std::io::Error::other(e.to_string()));
+            record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+            if has_tagging_replication {
+                record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+            }
+            result.err()
         } {
             rinfo.replication_status = ReplicationStatusType::Failed;
             rinfo.error = Some(err.to_string());
@@ -2664,9 +2749,14 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             warn!("failed to set replication tagging directive header: {err}");
         }
 
-        match tgt_client
-            .head_object(&tgt_client.bucket, &object, self.version_id.map(|v| v.to_string()))
-            .await
+        match head_object_with_proxy_stats(
+            &bucket,
+            tgt_client.as_ref(),
+            &tgt_client.bucket,
+            &object,
+            self.version_id.map(|v| v.to_string()),
+        )
+        .await
         {
             Ok(oi) => {
                 replication_action = get_replication_action(&object_info, &oi, self.op_type);
@@ -2784,9 +2874,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 }
             };
 
+            let has_tagging_replication = !put_opts.user_tags.is_empty();
             if let Some(err) = if is_multipart {
                 drop(gr);
-                replicate_object_with_multipart(MultipartReplicationContext {
+                let result = replicate_object_with_multipart(MultipartReplicationContext {
                     storage: storage.clone(),
                     cli: tgt_client.clone(),
                     src_bucket: &bucket,
@@ -2797,16 +2888,24 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     arn: &rinfo.arn,
                     put_opts,
                 })
-                .await
-                .err()
+                .await;
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } else {
                 gr.stream = wrap_with_bandwidth_monitor(gr.stream, &put_opts, &bucket, &rinfo.arn);
                 let byte_stream = async_read_to_bytestream(gr.stream);
-                tgt_client
+                let result = tgt_client
                     .put_object(&tgt_client.bucket, &object, size, byte_stream, &put_opts)
                     .await
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .err()
+                    .map_err(|e| std::io::Error::other(e.to_string()));
+                record_proxy_request(&bucket, "PutObject", result.is_err()).await;
+                if has_tagging_replication {
+                    record_proxy_request(&bucket, "PutObjectTagging", result.is_err()).await;
+                }
+                result.err()
             } {
                 rinfo.replication_status = ReplicationStatusType::Failed;
                 rinfo.error = Some(err.to_string());
@@ -3604,6 +3703,49 @@ mod tests {
     }
 
     #[test]
+    fn test_delete_replication_object_opts_marks_replica_deletes() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(
+            opts.replica,
+            "replica deletes must preserve replica status for downstream ReplicaModifications rules"
+        );
+        assert_eq!(opts.version_id, dobj.version_id);
+        assert_eq!(opts.name, dobj.object_name);
+        assert_eq!(opts.op_type, ReplicationType::Delete);
+    }
+
+    #[test]
+    fn test_delete_replication_object_opts_keeps_non_replica_deletes_local() {
+        let dobj = ObjectToDelete {
+            object_name: "obj".to_string(),
+            ..Default::default()
+        };
+        let oi = ObjectInfo {
+            bucket: "b".to_string(),
+            name: "obj".to_string(),
+            replication_status: ReplicationStatusType::Completed,
+            ..Default::default()
+        };
+
+        let opts = delete_replication_object_opts(&dobj, &oi);
+
+        assert!(!opts.replica, "source-originated deletes should not be treated as replica modifications");
+    }
+
+    #[test]
     fn test_is_version_delete_replication_for_delete_marker_version_purge() {
         let dobj = DeletedObject {
             delete_marker: false,
@@ -3632,6 +3774,34 @@ mod tests {
     }
 
     #[test]
+    fn test_should_retry_delete_marker_purge_for_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker version purge should schedule delayed target cleanup in case the target marker arrives late"
+        );
+    }
+
+    #[test]
+    fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(
+            should_retry_delete_marker_purge(&dobj),
+            "delete-marker creation should keep the late-arrival cleanup path so downstream purges can catch up"
+        );
+    }
+
+    #[test]
     fn test_is_retryable_delete_replication_head_error_allows_delete_marker_head_responses() {
         assert!(
             !is_retryable_delete_replication_head_error(false, Some("405")),
@@ -3648,6 +3818,34 @@ mod tests {
         assert!(
             is_retryable_delete_replication_head_error(false, Some("AccessDenied")),
             "unexpected head errors should still fail fast"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_ignores_not_found_and_405() {
+        assert!(
+            !should_count_head_proxy_failure(true, Some("NoSuchKey"), Some(404)),
+            "not-found heads are expected when the object has not reached the target yet"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("MethodNotAllowed"), Some(405)),
+            "405 delete-marker probing responses should not be counted as proxy failures"
+        );
+        assert!(
+            !should_count_head_proxy_failure(false, Some("405"), Some(405)),
+            "numeric 405 codes must align with MethodNotAllowed semantics"
+        );
+    }
+
+    #[test]
+    fn test_should_count_head_proxy_failure_counts_unexpected_errors() {
+        assert!(
+            should_count_head_proxy_failure(false, Some("AccessDenied"), Some(403)),
+            "non-NotFound and non-405 service errors should be counted as failures"
+        );
+        assert!(
+            should_count_head_proxy_failure(false, None, Some(500)),
+            "raw 5xx head responses should be counted as proxy failures"
         );
     }
 

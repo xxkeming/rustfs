@@ -59,9 +59,31 @@ pub const DEFAULT_RUNTIME_DIAL9_ROTATION_COUNT: usize = 10;
 pub const DEFAULT_RUNTIME_DIAL9_SAMPLING_RATE: f64 = 1.0; // 100% sampling
 // Note: S3 bucket/prefix have no default; absence means upload is disabled (modeled as Option<String>)
 
-/// Threshold for small object seek support in megabytes.
+// Allocator reclaim configuration
+pub const ENV_ALLOCATOR_RECLAIM_ENABLED: &str = "RUSTFS_ALLOCATOR_RECLAIM_ENABLED";
+pub const ENV_ALLOCATOR_RECLAIM_INTERVAL_SECS: &str = "RUSTFS_ALLOCATOR_RECLAIM_INTERVAL_SECS";
+pub const ENV_ALLOCATOR_RECLAIM_FORCE: &str = "RUSTFS_ALLOCATOR_RECLAIM_FORCE";
+pub const ENV_ALLOCATOR_RECLAIM_IDLE_INTERVALS: &str = "RUSTFS_ALLOCATOR_RECLAIM_IDLE_INTERVALS";
+pub const DEFAULT_ALLOCATOR_RECLAIM_ENABLED: bool = false;
+pub const DEFAULT_ALLOCATOR_RECLAIM_INTERVAL_SECS: u64 = 30;
+pub const DEFAULT_ALLOCATOR_RECLAIM_FORCE: bool = true;
+pub const DEFAULT_ALLOCATOR_RECLAIM_IDLE_INTERVALS: u64 = 3;
+
+// File page-cache reclaim configuration
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE";
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE";
+pub const ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: &str = "RUSTFS_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD";
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_WRITE_ENABLE: bool = false;
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE: bool = false;
+pub const DEFAULT_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Threshold for small object seek support in bytes.
 ///
-/// When an object is smaller than this size, rustfs will provide seek support.
+/// When an object response is smaller than this size, rustfs may provide
+/// in-memory seek support. Runtime GET logic also enforces a hard safety cap
+/// (`64 MiB`) to prevent large-download memory spikes even if this threshold
+/// is configured higher.
 ///
-/// Default is set to 10MB.
+/// Default is set to 10 MiB.
+pub const ENV_OBJECT_SEEK_SUPPORT_THRESHOLD: &str = "RUSTFS_OBJECT_SEEK_SUPPORT_THRESHOLD";
 pub const DEFAULT_OBJECT_SEEK_SUPPORT_THRESHOLD: usize = 10 * 1024 * 1024;

@@ -15,12 +15,20 @@
 use crate::notification_system_subscriber::NotificationSystemSubscriberView;
 use crate::notifier::TargetList;
 use crate::{
-    Event, error::NotificationError, notifier::EventNotifier, registry::TargetRegistry, rules::BucketNotificationConfig, stream,
+    Event,
+    error::NotificationError,
+    notifier::EventNotifier,
+    registry::TargetRegistry,
+    rules::{BucketNotificationConfig, ParseConfigError},
+    stream,
 };
 use hashbrown::HashMap;
 use rustfs_config::notify::{
-    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
+    DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_WEBHOOK_ENABLE,
+    ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS,
+    NOTIFY_WEBHOOK_SUB_SYS,
 };
+use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
 use rustfs_s3_common::EventName;
 use rustfs_targets::arn::TargetID;
@@ -32,14 +40,25 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_RECENT_LIVE_EVENTS: usize = 1024;
+
+fn notify_configuration_hint() -> String {
+    let webhook_enable_primary = format!("{ENV_NOTIFY_WEBHOOK_ENABLE}_PRIMARY");
+    let webhook_endpoint_primary = format!("{ENV_NOTIFY_WEBHOOK_ENDPOINT}_PRIMARY");
+    format!(
+        "No notify targets configured. Check {ENV_NOTIFY_ENABLE}=true and instance-scoped target env vars (for example {webhook_enable_primary} + {webhook_endpoint_primary} for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure {EVENT_DEFAULT_DIR} is writable."
+    )
+}
 
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
         NOTIFY_WEBHOOK_SUB_SYS => "webhook",
+        NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
+        NOTIFY_NATS_SUB_SYS => "nats",
+        NOTIFY_PULSAR_SUB_SYS => "pulsar",
         _ => target_type,
     }
 }
@@ -306,13 +325,19 @@ impl NotificationSystem {
 
         let config = {
             let guard = self.config.read().await;
-            debug!("Initializing notification system with config: {:?}", *guard);
+            debug!(
+                subsystem_count = guard.0.len(),
+                "Initializing notification system with configuration summary"
+            );
             guard.clone()
         };
 
         let targets: Vec<Box<dyn Target<Event> + Send + Sync>> = self.registry.create_targets_from_config(&config).await?;
 
         info!("{} notification targets were created", targets.len());
+        if targets.is_empty() {
+            warn!("{}", notify_configuration_hint());
+        }
 
         // Initialize targets and start event streams
         let cancellers = self.init_targets_and_start_streams(&targets).await;
@@ -514,7 +539,10 @@ impl NotificationSystem {
                 if !changed {
                     info!("Target {} of type {} not found, no changes made.", target_name, target_type);
                 }
-                debug!("Config after remove: {:?}", config);
+                debug!(
+                    subsystem_count = config.0.len(),
+                    "Target config removal processed and configuration summary updated"
+                );
                 changed
             })
             .await;
@@ -571,6 +599,9 @@ impl NotificationSystem {
             .map_err(NotificationError::Target)?;
 
         info!("{} notification targets were created from the new configuration", targets.len());
+        if targets.is_empty() {
+            warn!("{}", notify_configuration_hint());
+        }
 
         // Initialize targets and start event streams using shared helper
         let new_cancellers = self.init_targets_and_start_streams(&targets).await;
@@ -590,22 +621,26 @@ impl NotificationSystem {
         bucket: &str,
         cfg: &BucketNotificationConfig,
     ) -> Result<(), NotificationError> {
-        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let arn_list = self.notifier.get_arn_list(&cfg.region).await;
         if arn_list.is_empty() {
-            return Err(NotificationError::Configuration("No targets configured".to_string()));
+            return Err(NotificationError::Configuration(notify_configuration_hint()));
         }
         info!("Available ARNs: {:?}", arn_list);
         // Validate the configuration against the available ARNs
         if let Err(e) = cfg.validate(&cfg.region, &arn_list) {
             debug!("Bucket notification config validation region:{} failed: {}", &cfg.region, e);
-            if !e.to_string().contains("ARN not found") {
+            if !matches!(e, ParseConfigError::ArnNotFound(_)) {
                 return Err(NotificationError::BucketNotification(e.to_string()));
-            } else {
-                error!("config validate failed, err: {}", e);
             }
+            warn!(
+                bucket = %bucket,
+                region = %cfg.region,
+                error = %e,
+                "Bucket notification config references missing target ARN; keeping compatibility and loading remaining rules"
+            );
         }
 
+        self.subscriber_view.apply_bucket_config(bucket, cfg);
         let rules_map = cfg.get_rules_map();
         self.notifier.add_rules_map(bucket, rules_map.clone()).await;
         info!("Loaded notification config for bucket: {}", bucket);
@@ -745,5 +780,26 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_MQTT_SUB_SYS, "Analytics");
         assert_eq!(target_id.id, "analytics");
         assert_eq!(target_id.name, "mqtt");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_kafka_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_KAFKA_SUB_SYS, "EventBus");
+        assert_eq!(target_id.id, "eventbus");
+        assert_eq!(target_id.name, "kafka");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_nats_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_NATS_SUB_SYS, "Bus");
+        assert_eq!(target_id.id, "bus");
+        assert_eq!(target_id.name, "nats");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_pulsar_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_PULSAR_SUB_SYS, "Ledger");
+        assert_eq!(target_id.id, "ledger");
+        assert_eq!(target_id.name, "pulsar");
     }
 }

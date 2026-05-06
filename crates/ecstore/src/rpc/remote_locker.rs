@@ -190,11 +190,6 @@ impl LockClient for RemoteClient {
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
         };
 
-        // Check for explicit error first
-        if let Some(error_info) = resp.error_info {
-            return Err(LockError::internal(error_info));
-        }
-
         // Check if the lock acquisition was successful
         if resp.success {
             Ok(LockResponse::success(
@@ -204,7 +199,8 @@ impl LockClient for RemoteClient {
         } else {
             // Lock acquisition failed
             Ok(LockResponse::failure(
-                "Lock acquisition failed on remote server".to_string(),
+                resp.error_info
+                    .unwrap_or_else(|| "Lock acquisition failed on remote server".to_string()),
                 std::time::Duration::ZERO,
             ))
         }
@@ -487,6 +483,10 @@ mod tests {
         GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
     }
 
+    fn ensure_test_rpc_secret() {
+        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+    }
+
     fn test_lock_request(timeout_duration: Duration) -> LockRequest {
         LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner-a")
             .with_acquire_timeout(timeout_duration)
@@ -495,6 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_client_acquire_lock_respects_request_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
@@ -521,6 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_client_acquire_locks_batch_respects_request_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
         let (addr, accept_task) = spawn_hanging_listener().await;
         cache_lazy_channel(&addr).await;
         assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));

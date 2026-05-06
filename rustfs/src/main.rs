@@ -138,6 +138,9 @@ fn is_using_default_credentials(config: &rustfs::config::Config) -> bool {
     rustfs_credentials::DEFAULT_ACCESS_KEY.eq(&config.access_key) && rustfs_credentials::DEFAULT_SECRET_KEY.eq(&config.secret_key)
 }
 
+const DEFAULT_CREDENTIALS_WARNING_MESSAGE: &str =
+    "Detected default root credentials; change them with the RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables";
+
 async fn async_main() -> Result<()> {
     // Parse command line arguments
     let args: Vec<String> = std::env::args().collect();
@@ -355,11 +358,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     };
 
     if is_using_default_credentials(&config) {
-        warn!(
-            "Detected default credentials '{}:{}', we recommend that you change these values with 'RUSTFS_ACCESS_KEY' and 'RUSTFS_SECRET_KEY' environment variables",
-            rustfs_credentials::DEFAULT_ACCESS_KEY,
-            rustfs_credentials::DEFAULT_SECRET_KEY
-        );
+        warn!("{}", DEFAULT_CREDENTIALS_WARNING_MESSAGE);
     }
 
     let ctx = CancellationToken::new();
@@ -457,6 +456,7 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
 
     // Initialize event notifier
     init_event_notifier().await;
+
     // Start the audit system
     match start_audit_system().await {
         Ok(_) => info!(target: "rustfs::main::run","Audit system started successfully."),
@@ -559,10 +559,12 @@ async fn run(config: rustfs::config::Config) -> Result<()> {
     print_server_info();
 
     init_update_check();
+    rustfs::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
     if rustfs_obs::observability_metric_enabled() {
         // Initialize metrics system
         init_metrics_runtime(ctx.clone());
+        rustfs::memory_observability::init_memory_observability(ctx.clone());
 
         // Initialize auto-tuner for performance optimization (optional)
         rustfs::init::init_auto_tuner(ctx.clone()).await;
@@ -776,5 +778,15 @@ mod tests {
         config.secret_key = "custom-secret-key".to_string();
 
         assert!(!is_using_default_credentials(&config));
+    }
+
+    #[test]
+    fn default_credentials_warning_message_does_not_expose_values() {
+        let message = DEFAULT_CREDENTIALS_WARNING_MESSAGE;
+
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_ACCESS_KEY));
+        assert!(message.contains(rustfs_config::ENV_RUSTFS_SECRET_KEY));
+        assert!(!message.contains(rustfs_credentials::DEFAULT_ACCESS_KEY));
+        assert!(!message.contains(rustfs_credentials::DEFAULT_SECRET_KEY));
     }
 }
