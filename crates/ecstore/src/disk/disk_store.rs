@@ -31,7 +31,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicI64, AtomicU32, Ordering},
+        atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -138,6 +138,14 @@ pub struct DiskHealthTracker {
     pub offline_since_unix_secs: AtomicI64,
     /// Last runtime state transition timestamp
     pub last_transition_unix_secs: AtomicI64,
+    /// Last successfully probed total space in bytes
+    pub last_capacity_total: AtomicU64,
+    /// Last successfully probed used space in bytes
+    pub last_capacity_used: AtomicU64,
+    /// Last successfully probed free space in bytes
+    pub last_capacity_free: AtomicU64,
+    /// Last successful capacity probe timestamp
+    pub last_capacity_probe_unix_secs: AtomicI64,
 }
 
 impl DiskHealthTracker {
@@ -158,6 +166,10 @@ impl DiskHealthTracker {
             consecutive_successes: AtomicU32::new(0),
             offline_since_unix_secs: AtomicI64::new(0),
             last_transition_unix_secs: AtomicI64::new(now / 1_000_000_000),
+            last_capacity_total: AtomicU64::new(0),
+            last_capacity_used: AtomicU64::new(0),
+            last_capacity_free: AtomicU64::new(0),
+            last_capacity_probe_unix_secs: AtomicI64::new(0),
         }
     }
 
@@ -168,6 +180,28 @@ impl DiskHealthTracker {
             .unwrap()
             .as_nanos() as i64;
         self.last_success.store(now, Ordering::Relaxed);
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.last_capacity_total.store(total, Ordering::Release);
+        self.last_capacity_used.store(used, Ordering::Release);
+        self.last_capacity_free.store(free, Ordering::Release);
+        self.last_capacity_probe_unix_secs
+            .store(current_unix_secs() as i64, Ordering::Release);
+    }
+
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        let ts = self.last_capacity_probe_unix_secs.load(Ordering::Acquire);
+        if ts <= 0 {
+            return None;
+        }
+
+        Some((
+            self.last_capacity_total.load(Ordering::Acquire),
+            self.last_capacity_used.load(Ordering::Acquire),
+            self.last_capacity_free.load(Ordering::Acquire),
+            ts as u64,
+        ))
     }
 
     /// Check if disk is faulty
@@ -263,6 +297,26 @@ impl DiskHealthTracker {
         self.status.store(DISK_HEALTH_FAULTY, Ordering::Release);
         self.transition_state(endpoint, current, RuntimeDriveHealthState::Offline, reason);
         true
+    }
+
+    /// Clear faulty/offline state so a store-init format load retry can issue RPC again.
+    ///
+    /// Remote disks are marked faulty on timeout/network errors; the init loop retries with the
+    /// same [`DiskStore`] handles, which would otherwise fail immediately at `is_faulty()`.
+    pub fn reset_for_store_init_retry(&self, endpoint: &Endpoint) {
+        self.status.store(DISK_HEALTH_OK, Ordering::Release);
+        self.runtime_state
+            .store(RuntimeDriveHealthState::Online as u32, Ordering::Release);
+        self.consecutive_failures.store(0, Ordering::Release);
+        self.consecutive_successes.store(0, Ordering::Release);
+        self.offline_since_unix_secs.store(0, Ordering::Release);
+        self.waiting.store(0, Ordering::Release);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let now_nanos = now.as_nanos() as i64;
+        self.last_success.store(now_nanos, Ordering::Relaxed);
+        self.last_started.store(now_nanos, Ordering::Relaxed);
+        self.last_transition_unix_secs.store(now.as_secs() as i64, Ordering::Release);
+        record_drive_runtime_state(endpoint, RuntimeDriveHealthState::Online);
     }
 
     pub fn mark_recovery_success(&self, endpoint: &Endpoint, reason: &'static str) -> bool {
@@ -443,9 +497,22 @@ impl LocalDiskWrapper {
         self.health.offline_duration().map(|duration| duration.as_secs())
     }
 
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        self.health.last_capacity_snapshot()
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.health.record_capacity_probe(total, used, free);
+    }
+
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health.reset_for_store_init_retry(&self.disk.endpoint());
     }
 
     /// Enable health monitoring after disk creation.
@@ -796,7 +863,7 @@ impl LocalDiskWrapper {
                     timeout_ms = timeout_duration.as_millis(),
                     "Local disk operation timed out"
                 );
-                Err(DiskError::other(format!("disk operation timeout after {timeout_duration:?}")))
+                Err(DiskError::Timeout)
             }
         }
     }
@@ -1254,5 +1321,22 @@ mod tests {
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
+    }
+
+    #[test]
+    fn reset_for_store_init_retry_clears_faulty_and_back_online() {
+        let endpoint = Endpoint::try_from("/tmp/reset-store-init-retry").expect("endpoint should parse");
+        let health = DiskHealthTracker::new();
+
+        assert!(health.mark_offline(&endpoint, "simulated_fault"));
+        assert!(health.is_faulty());
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
+
+        health.reset_for_store_init_retry(&endpoint);
+        assert!(!health.is_faulty());
+        assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
+
+        assert!(health.mark_offline(&endpoint, "again"));
+        assert!(health.is_faulty());
     }
 }

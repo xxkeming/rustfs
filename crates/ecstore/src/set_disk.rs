@@ -88,8 +88,9 @@ use rustfs_utils::http::headers::{
     CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, EXPIRES, HeaderExt as _,
 };
 use rustfs_utils::http::{
-    SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE, SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    contains_key_str, get_header_map, get_str, insert_str, remove_header_map,
+    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_ACTUAL_OBJECT_SIZE_CAP, SUFFIX_ACTUAL_SIZE,
+    SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_REPLICATION_SSEC_CRC, contains_key_str, get_header_map, get_str,
+    insert_str, is_encryption_metadata_key, remove_header_map,
 };
 use rustfs_utils::{
     HashAlgorithm,
@@ -101,7 +102,7 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
-use std::time::{Instant, SystemTime};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
     io::{Cursor, Write},
@@ -132,6 +133,13 @@ pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipar
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
     metadata.remove(RUSTFS_MULTIPART_BUCKET_KEY);
     metadata.remove(RUSTFS_MULTIPART_OBJECT_KEY);
+}
+
+fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
+    metadata.keys().any(|key| is_encryption_metadata_key(key))
+        || metadata.contains_key(SSEC_ALGORITHM_HEADER)
+        || metadata.contains_key(SSEC_KEY_HEADER)
+        || metadata.contains_key(SSEC_KEY_MD5_HEADER)
 }
 
 fn capacity_scope_from_disks(disks: &[Option<DiskStore>]) -> CapacityScope {
@@ -694,7 +702,7 @@ impl ObjectIO for SetDisks {
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 
-        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h)?;
+        let (reader, offset, length) = GetObjectReader::new(Box::new(rd), range, &object_info, opts, &h).await?;
 
         // let disks = disks.clone();
         let bucket = bucket.to_owned();
@@ -1446,7 +1454,6 @@ impl ObjectOperations for SetDisks {
             }
         };
 
-        let inline_data = fi.inline_data();
         fi.metadata = src_info.user_defined.clone();
 
         if let Some(etag) = &src_info.etag {
@@ -1454,27 +1461,50 @@ impl ObjectOperations for SetDisks {
         }
 
         let mod_time = OffsetDateTime::now_utc();
+        fi.mod_time = Some(mod_time);
+        fi.version_id = version_id;
+        fi.versioned = src_opts.versioned || src_opts.version_suspended;
 
-        for fi in metas.iter_mut() {
-            if fi.is_valid() {
-                fi.metadata = src_info.user_defined.clone();
-                fi.mod_time = Some(mod_time);
-                fi.version_id = version_id;
-                fi.versioned = src_opts.versioned || src_opts.version_suspended;
+        if src_info.version_only {
+            let inline_data = fi.inline_data();
 
-                if !fi.inline_data() {
-                    fi.data = None;
-                }
+            for fi in metas.iter_mut() {
+                if fi.is_valid() {
+                    fi.metadata = src_info.user_defined.clone();
+                    if let Some(etag) = &src_info.etag {
+                        fi.metadata.insert("etag".to_owned(), etag.clone());
+                    }
+                    fi.mod_time = Some(mod_time);
+                    fi.version_id = version_id;
+                    fi.versioned = src_opts.versioned || src_opts.version_suspended;
 
-                if inline_data {
-                    fi.set_inline_data();
+                    if !fi.inline_data() {
+                        fi.data = None;
+                    }
+
+                    if inline_data {
+                        fi.set_inline_data();
+                    }
                 }
             }
-        }
 
-        Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
+            Self::write_unique_file_info(&online_disks, "", src_bucket, src_object, &metas, write_quorum)
+                .await
+                .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+        } else {
+            self.update_object_meta_with_opts(
+                src_bucket,
+                src_object,
+                fi.clone(),
+                &online_disks,
+                &UpdateMetadataOpts {
+                    replace_user_metadata: true,
+                    ..Default::default()
+                },
+            )
             .await
             .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
+        }
 
         Ok(ObjectInfo::from_file_info(
             &fi,
@@ -1907,8 +1937,11 @@ impl ObjectOperations for SetDisks {
             None
         };
 
+        // Use the same full xl.meta read path as GetObject metadata resolution.
+        // This avoids HEAD/GetObject metadata visibility skew immediately after
+        // PutObject/CompleteMultipartUpload.
         let (fi, _, _) = self
-            .get_object_fileinfo(bucket, object, opts, false)
+            .get_object_fileinfo(bucket, object, opts, true)
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
 
@@ -3488,16 +3521,22 @@ impl MultipartOperations for SetDisks {
 
         fi.metadata.insert("etag".to_owned(), etag);
 
+        let persist_encryption_original_size = should_persist_encryption_original_size(&fi.metadata);
+
         if opts.replication_request {
             if let Some(actual_size) = get_str(&opts.user_defined, SUFFIX_ACTUAL_OBJECT_SIZE_CAP) {
                 insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, actual_size.clone());
-                fi.metadata
-                    .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
+                if persist_encryption_original_size {
+                    fi.metadata
+                        .insert("x-rustfs-encryption-original-size".to_string(), actual_size);
+                }
             }
         } else {
             insert_str(&mut fi.metadata, SUFFIX_ACTUAL_SIZE, object_actual_size.to_string());
-            fi.metadata
-                .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+            if persist_encryption_original_size {
+                fi.metadata
+                    .insert("x-rustfs-encryption-original-size".to_string(), object_actual_size.to_string());
+            }
         }
 
         if fi.is_compressed() {
@@ -4124,56 +4163,78 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
         if let Some(disk) = pool {
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
-            if runtime_state.should_probe_for_admin() {
+            let capacity_snapshot = disk.last_capacity_snapshot();
+            if runtime_state.should_probe_for_admin()
+                || runtime_state == crate::disk::health_state::RuntimeDriveHealthState::Suspect
+            {
                 match disk.disk_info(&DiskInfoOptions::default()).await {
-                    Ok(res) => ret.push(rustfs_madmin::Disk {
-                        endpoint: eps[i].to_string(),
-                        local: eps[i].is_local,
-                        pool_index: eps[i].pool_idx,
-                        set_index: eps[i].set_idx,
-                        disk_index: eps[i].disk_idx,
-                        state: "ok".to_owned(),
+                    Ok(res) => {
+                        disk.record_capacity_probe(res.total, res.used, res.free);
+                        ret.push(rustfs_madmin::Disk {
+                            endpoint: eps[i].to_string(),
+                            local: eps[i].is_local,
+                            pool_index: eps[i].pool_idx,
+                            set_index: eps[i].set_idx,
+                            disk_index: eps[i].disk_idx,
+                            state: "ok".to_owned(),
 
-                        root_disk: res.root_disk,
-                        drive_path: res.mount_path.clone(),
-                        healing: res.healing,
-                        scanning: res.scanning,
-                        runtime_state: Some(runtime_state.as_str().to_string()),
-                        offline_duration_seconds,
+                            root_disk: res.root_disk,
+                            drive_path: res.mount_path.clone(),
+                            healing: res.healing,
+                            scanning: res.scanning,
+                            runtime_state: Some(runtime_state.as_str().to_string()),
+                            offline_duration_seconds,
+                            capacity_observation_source: Some("live_probe".to_owned()),
+                            capacity_observation_age_seconds: Some(0),
 
-                        uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
-                        major: res.major as u32,
-                        minor: res.minor as u32,
-                        model: None,
-                        total_space: res.total,
-                        used_space: res.used,
-                        available_space: res.free,
-                        physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
-                        utilization: {
-                            if res.total > 0 {
-                                res.used as f64 / res.total as f64 * 100_f64
-                            } else {
-                                0_f64
-                            }
-                        },
-                        used_inodes: res.used_inodes,
-                        free_inodes: res.free_inodes,
-                        ..Default::default()
-                    }),
-                    Err(err) => ret.push(rustfs_madmin::Disk {
-                        state: err.to_string(),
-                        endpoint: eps[i].to_string(),
-                        local: eps[i].is_local,
-                        pool_index: eps[i].pool_idx,
-                        set_index: eps[i].set_idx,
-                        disk_index: eps[i].disk_idx,
-                        runtime_state: Some(runtime_state.as_str().to_string()),
-                        offline_duration_seconds,
-                        ..Default::default()
-                    }),
+                            uuid: res.id.map_or_else(|| "".to_string(), |id| id.to_string()),
+                            major: res.major as u32,
+                            minor: res.minor as u32,
+                            model: None,
+                            total_space: res.total,
+                            used_space: res.used,
+                            available_space: res.free,
+                            physical_device_ids: (!res.physical_device_ids.is_empty()).then_some(res.physical_device_ids.clone()),
+                            utilization: utilization_percent(res.total, res.used),
+                            used_inodes: res.used_inodes,
+                            free_inodes: res.free_inodes,
+                            ..Default::default()
+                        });
+                    }
+                    Err(err) => {
+                        let mut disk_info = rustfs_madmin::Disk {
+                            state: err.to_string(),
+                            endpoint: eps[i].to_string(),
+                            local: eps[i].is_local,
+                            pool_index: eps[i].pool_idx,
+                            set_index: eps[i].set_idx,
+                            disk_index: eps[i].disk_idx,
+                            runtime_state: Some(runtime_state.as_str().to_string()),
+                            offline_duration_seconds,
+                            ..Default::default()
+                        };
+                        if let Some((total, used, free, _)) = capacity_snapshot {
+                            disk_info.total_space = total;
+                            disk_info.used_space = used;
+                            disk_info.available_space = free;
+                            disk_info.utilization = utilization_percent(total, used);
+                            disk_info.capacity_observation_source = Some("snapshot".to_owned());
+                            disk_info.capacity_observation_age_seconds = capacity_snapshot
+                                .map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+                        } else {
+                            disk_info.capacity_observation_source = Some("missing".to_owned());
+                            disk_info.capacity_observation_age_seconds = Some(0);
+                        }
+                        ret.push(disk_info);
+                    }
                 }
             } else {
-                ret.push(build_runtime_snapshot_disk(&eps[i], runtime_state, offline_duration_seconds));
+                ret.push(build_runtime_snapshot_disk(
+                    &eps[i],
+                    runtime_state,
+                    offline_duration_seconds,
+                    capacity_snapshot,
+                ));
             }
         } else {
             ret.push(rustfs_madmin::Disk {
@@ -4185,6 +4246,8 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
                 runtime_state: None,
                 offline_duration_seconds: None,
                 state: DiskError::DiskNotFound.to_string(),
+                capacity_observation_source: Some("missing".to_owned()),
+                capacity_observation_age_seconds: Some(0),
                 ..Default::default()
             })
         }
@@ -4197,8 +4260,9 @@ fn build_runtime_snapshot_disk(
     endpoint: &Endpoint,
     runtime_state: crate::disk::health_state::RuntimeDriveHealthState,
     offline_duration_seconds: Option<u64>,
+    capacity_snapshot: Option<(u64, u64, u64, u64)>,
 ) -> rustfs_madmin::Disk {
-    rustfs_madmin::Disk {
+    let mut disk = rustfs_madmin::Disk {
         endpoint: endpoint.to_string(),
         local: endpoint.is_local,
         pool_index: endpoint.pool_idx,
@@ -4208,7 +4272,38 @@ fn build_runtime_snapshot_disk(
         runtime_state: Some(runtime_state.as_str().to_string()),
         offline_duration_seconds,
         ..Default::default()
+    };
+
+    if let Some((total, used, free, _)) = capacity_snapshot {
+        disk.total_space = total;
+        disk.used_space = used;
+        disk.available_space = free;
+        disk.utilization = utilization_percent(total, used);
+        disk.capacity_observation_source = Some("snapshot".to_owned());
+        disk.capacity_observation_age_seconds =
+            capacity_snapshot.map(|(_, _, _, probe_unix_secs)| capacity_snapshot_age_seconds(probe_unix_secs));
+    } else {
+        disk.capacity_observation_source = Some("missing".to_owned());
+        disk.capacity_observation_age_seconds = Some(0);
     }
+
+    disk
+}
+
+fn utilization_percent(total: u64, used: u64) -> f64 {
+    if total > 0 {
+        used as f64 / total as f64 * 100_f64
+    } else {
+        0_f64
+    }
+}
+
+fn capacity_snapshot_age_seconds(probe_unix_secs: u64) -> u64 {
+    let now_unix_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_secs())
+        .unwrap_or(probe_unix_secs);
+    now_unix_secs.saturating_sub(probe_unix_secs)
 }
 async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rustfs_madmin::StorageInfo {
     // let mut disks = get_disks_info(disks, eps).await;
@@ -5291,7 +5386,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_disks_info_uses_runtime_snapshot_for_suspect_and_offline_disks() {
+    async fn test_get_disks_info_preserves_runtime_state_for_suspect_and_offline_disks() {
         let format = FormatV3::new(1, 3);
         let mut temp_dirs = Vec::new();
         let mut endpoints = Vec::new();
@@ -5320,13 +5415,85 @@ mod tests {
         assert_eq!(info[0].runtime_state.as_deref(), Some("online"));
         assert!(!info[0].drive_path.is_empty(), "online disk should keep immediate disk_info probe");
 
-        assert_eq!(info[1].state, "suspect");
+        assert_eq!(info[1].state, "ok");
         assert_eq!(info[1].runtime_state.as_deref(), Some("suspect"));
-        assert!(info[1].drive_path.is_empty(), "suspect disk should use runtime snapshot fallback");
+        assert!(!info[1].drive_path.is_empty(), "suspect disk should still probe for fresher disk info");
 
         assert_eq!(info[2].state, "offline");
         assert_eq!(info[2].runtime_state.as_deref(), Some("offline"));
         assert!(info[2].drive_path.is_empty(), "offline disk should use runtime snapshot fallback");
+    }
+
+    #[tokio::test]
+    async fn test_get_disks_info_uses_capacity_snapshot_for_offline_disk() {
+        let format = FormatV3::new(1, 1);
+        let (temp_dir, endpoint, disk) = make_formatted_local_disk_for_info_test(0, &format).await;
+        disk.record_capacity_probe(100, 40, 60);
+        disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+
+        let info = get_disks_info(&[Some(disk)], &[endpoint]).await;
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].state, "offline");
+        assert_eq!(info[0].runtime_state.as_deref(), Some("offline"));
+        assert_eq!(info[0].capacity_observation_source.as_deref(), Some("snapshot"));
+        assert!(info[0].capacity_observation_age_seconds.unwrap_or(u64::MAX) <= 60);
+        assert_eq!(info[0].total_space, 100);
+        assert_eq!(info[0].used_space, 40);
+        assert_eq!(info[0].available_space, 60);
+        assert_eq!(info[0].utilization, 40.0);
+
+        drop(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn list_path_returns_read_quorum_when_runtime_candidates_are_empty() {
+        let disk_count = 4;
+        let format = FormatV3::new(1, disk_count);
+        let mut temp_dirs = Vec::with_capacity(disk_count);
+        let mut endpoints = Vec::with_capacity(disk_count);
+        let mut disks = Vec::with_capacity(disk_count);
+
+        for disk_idx in 0..disk_count {
+            let (dir, endpoint, disk) = make_formatted_local_disk_for_info_test(disk_idx, &format).await;
+            temp_dirs.push(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            disk_count,
+            disk_count / 2,
+            0,
+            0,
+            endpoints,
+            format,
+            Vec::new(),
+        )
+        .await;
+
+        for disk in set_disks.get_disks_internal().await.iter().flatten() {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        }
+
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let err = set_disks
+            .list_path(
+                CancellationToken::new(),
+                crate::store_list_objects::ListPathOptions {
+                    bucket: "bucket".to_string(),
+                    recursive: true,
+                    ..Default::default()
+                },
+                tx,
+            )
+            .await
+            .expect_err("empty runtime candidate set should fail before list_path_raw");
+
+        assert_eq!(err, StorageError::ErasureReadQuorum);
+
+        drop(temp_dirs);
     }
 
     #[test]
@@ -5390,6 +5557,36 @@ mod tests {
         let data_dirs = vec![Some(uuid1), Some(uuid2), None];
         let result = SetDisks::reduce_common_data_dir(&data_dirs, 2);
         assert_eq!(result, None); // No UUID meets quorum of 2
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_returns_not_found_when_all_metadata_is_missing() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("missing metadata should map to FileNotFound");
+
+        assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[test]
+    fn test_object_quorum_from_meta_preserves_read_quorum_for_mixed_failures() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::VolumeNotFound),
+            Some(DiskError::FileCorrupt),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&vec![FileInfo::default(); errs.len()], &errs, 2)
+            .expect_err("mixed metadata failures should keep quorum semantics");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]
@@ -5569,6 +5766,20 @@ mod tests {
 
         check_object_lock_retention_update("bucket", "object", &obj_info, &opts)
             .expect("GOVERNANCE shortening with bypass should remain allowed");
+    }
+
+    #[test]
+    fn test_should_persist_encryption_original_size_rejects_plain_metadata() {
+        let metadata = HashMap::from([("content-type".to_string(), "application/octet-stream".to_string())]);
+
+        assert!(!should_persist_encryption_original_size(&metadata));
+    }
+
+    #[test]
+    fn test_should_persist_encryption_original_size_accepts_sse_c_metadata() {
+        let metadata = HashMap::from([(SSEC_ALGORITHM_HEADER.to_string(), "AES256".to_string())]);
+
+        assert!(should_persist_encryption_original_size(&metadata));
     }
 
     #[test]

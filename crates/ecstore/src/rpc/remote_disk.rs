@@ -135,9 +135,22 @@ impl RemoteDisk {
         self.health.offline_duration().map(|duration| duration.as_secs())
     }
 
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        self.health.last_capacity_snapshot()
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        self.health.record_capacity_probe(total, used, free);
+    }
+
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         self.health.force_runtime_state_for_test(state);
+    }
+
+    /// Same as [`DiskHealthTracker::reset_for_store_init_retry`]: undo a transient faulty mark before another format load attempt.
+    pub fn reset_health_for_store_init_retry(&self) {
+        self.health.reset_for_store_init_retry(&self.endpoint);
     }
 
     fn spawn_recovery_monitor_if_needed(&self) {
@@ -372,7 +385,7 @@ impl RemoteDisk {
                     timeout_ms = timeout_duration.as_millis(),
                     "Remote disk operation timed out"
                 );
-                Err(Error::other(format!("Remote disk operation timeout after {timeout_duration:?}")))
+                Err(DiskError::Timeout)
             }
         }
     }

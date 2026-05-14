@@ -14,7 +14,7 @@
 
 use crate::arn::TargetID;
 use crate::store::{Key, Store};
-use crate::{StoreError, TargetError};
+use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_common::EventName;
 use serde::de::DeserializeOwned;
@@ -23,12 +23,16 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{debug, warn};
 
+pub mod amqp;
 pub mod kafka;
 pub mod mqtt;
+pub mod mysql;
 pub mod nats;
+pub mod postgres;
 pub mod pulsar;
+pub mod redis;
 pub mod webhook;
 
 /// A read-only snapshot of delivery counters for a target.
@@ -265,16 +269,22 @@ impl QueuedPayload {
 /// used in the notification system.
 ///
 /// It includes:
-/// - `Webhook`: Represents a webhook target for sending notifications via HTTP requests.
-/// - `Kafka`: Represents a Kafka target for sending notifications to a Kafka topic.
-/// - `Mqtt`: Represents an MQTT target for sending notifications via MQTT protocol.
+/// - `Amqp`: Represents an AMQP 0-9-1 target for sending notifications to a broker.
+/// - `Webhook`: Sends notifications via HTTP POST requests.
+/// - `Kafka`: Publishes notifications to a Kafka topic.
+/// - `Mqtt`: Publishes notifications via MQTT protocol.
+/// - `MySql`: Writes notifications to a MySQL/TiDB table.
+/// - `Nats`: Publishes notifications to a NATS subject.
+/// - `Postgres`: Writes notifications to a PostgreSQL table (namespace or access format).
+/// - `Pulsar`: Publishes notifications to a Pulsar topic.
+/// - `Redis`: Publishes notifications to a Redis channel (pub/sub).
 ///
 /// Each variant has an associated string representation that can be used for serialization
 /// or logging purposes.
 /// The `as_str` method returns the string representation of the target type,
 /// and the `Display` implementation allows for easy formatting of the target type as a string.
 ///
-/// example usage:
+/// Example usage:
 /// ```rust
 /// use rustfs_targets::target::ChannelTargetType;
 ///
@@ -282,25 +292,30 @@ impl QueuedPayload {
 /// assert_eq!(target_type.as_str(), "webhook");
 /// println!("Target type: {}", target_type);
 /// ```
-///
-/// example output:
-/// Target type: webhook
 pub enum ChannelTargetType {
+    Amqp,
     Webhook,
     Kafka,
     Mqtt,
+    MySql,
     Nats,
+    Postgres,
     Pulsar,
+    Redis,
 }
 
 impl ChannelTargetType {
     pub fn as_str(&self) -> &'static str {
         match self {
+            ChannelTargetType::Amqp => "amqp",
             ChannelTargetType::Webhook => "webhook",
             ChannelTargetType::Kafka => "kafka",
             ChannelTargetType::Mqtt => "mqtt",
+            ChannelTargetType::MySql => "mysql",
             ChannelTargetType::Nats => "nats",
+            ChannelTargetType::Postgres => "postgres",
             ChannelTargetType::Pulsar => "pulsar",
+            ChannelTargetType::Redis => "redis",
         }
     }
 }
@@ -308,25 +323,21 @@ impl ChannelTargetType {
 impl std::fmt::Display for ChannelTargetType {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
+            ChannelTargetType::Amqp => write!(f, "amqp"),
             ChannelTargetType::Webhook => write!(f, "webhook"),
             ChannelTargetType::Kafka => write!(f, "kafka"),
             ChannelTargetType::Mqtt => write!(f, "mqtt"),
+            ChannelTargetType::MySql => write!(f, "mysql"),
             ChannelTargetType::Nats => write!(f, "nats"),
+            ChannelTargetType::Postgres => write!(f, "postgres"),
             ChannelTargetType::Pulsar => write!(f, "pulsar"),
+            ChannelTargetType::Redis => write!(f, "redis"),
         }
     }
 }
 
-pub fn parse_bool(value: &str) -> Result<bool, TargetError> {
-    match value.to_lowercase().as_str() {
-        "true" | "on" | "yes" | "1" => Ok(true),
-        "false" | "off" | "no" | "0" => Ok(false),
-        _ => Err(TargetError::ParseError(format!("Unable to parse boolean: {value}"))),
-    }
-}
-
 /// `TargetType` enum represents the type of target in the notification system.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetType {
     AuditLog,
     NotifyEvent,
@@ -348,6 +359,23 @@ impl std::fmt::Display for TargetType {
             TargetType::NotifyEvent => write!(f, "notify_event"),
         }
     }
+}
+
+pub(crate) fn sanitize_queue_dir_component(component: &str) -> String {
+    let mut sanitized = String::with_capacity(component.len());
+    for ch in component.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() { "_".to_string() } else { sanitized }
+}
+
+pub(crate) fn queue_store_subdir_name(target_type: &str, target_id: &str) -> String {
+    format!("rustfs-{target_type}-{}", sanitize_queue_dir_component(target_id))
 }
 
 /// Decodes a form-urlencoded object name to its original form.
@@ -377,6 +405,31 @@ pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
         .map_err(|e| TargetError::Encoding(format!("Failed to decode object key: {e}")))
 }
 
+pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError>
+where
+    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+{
+    let object_name = decode_object_name(&event.object_name)?;
+    let key = format!("{}/{}", event.bucket_name, object_name);
+
+    let log = TargetLog {
+        event_name: event.event_name,
+        key,
+        records: vec![event.data.clone()],
+    };
+
+    let body = serde_json::to_vec(&log).map_err(|err| TargetError::Serialization(format!("Failed to serialize event: {err}")))?;
+    let meta = QueuedPayloadMeta::new(
+        event.event_name,
+        event.bucket_name.clone(),
+        event.object_name.clone(),
+        "application/json",
+        body.len(),
+    );
+
+    Ok(QueuedPayload::new(meta, body))
+}
+
 pub(crate) fn delete_stored_payload(
     store: &(dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync),
     key: &Key,
@@ -387,9 +440,29 @@ pub(crate) fn delete_stored_payload(
     }
 }
 
+/// Ensures a rustls crypto provider is installed before any TLS operation.
+///
+/// Multiple target modules (MySQL, Redis, Postgres, MQTT) need this because
+/// each may be the first to perform a TLS handshake. Idempotent: if a
+/// provider is already registered, returns immediately.
+pub(crate) fn ensure_rustls_provider_installed() {
+    if rustls::crypto::CryptoProvider::get_default().is_some() {
+        return;
+    }
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        debug!("rustls provider already installed or unavailable: {err:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_target_type_amqp_uses_runtime_name() {
+        assert_eq!(ChannelTargetType::Amqp.as_str(), "amqp");
+        assert_eq!(ChannelTargetType::Amqp.to_string(), "amqp");
+    }
 
     #[test]
     fn queued_payload_round_trips_meta_and_body() {
@@ -413,8 +486,36 @@ mod tests {
     }
 
     #[test]
+    fn build_queued_payload_uses_event_data_shape() {
+        let event = EntityTarget {
+            object_name: "greeting+file+%282%29.csv".to_string(),
+            bucket_name: "bucket-a".to_string(),
+            event_name: EventName::ObjectCreatedPut,
+            data: "payload-data".to_string(),
+        };
+
+        let payload = build_queued_payload(&event).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&payload.body).unwrap();
+
+        assert_eq!(value["Key"], "bucket-a/greeting file (2).csv");
+        assert_eq!(value["Records"][0], "payload-data");
+    }
+
+    #[test]
     fn queued_payload_decode_rejects_invalid_magic() {
         let err = QueuedPayload::decode(b"bad-payload").unwrap_err();
         assert!(err.to_string().contains("magic") || err.to_string().contains("short"));
+    }
+
+    #[test]
+    fn sanitize_queue_dir_component_replaces_non_path_safe_characters() {
+        let sanitized = sanitize_queue_dir_component("tenant:alpha/beta\\gamma?*");
+        assert_eq!(sanitized, "tenant_alpha_beta_gamma__");
+    }
+
+    #[test]
+    fn queue_store_subdir_name_sanitizes_target_id() {
+        let dir = queue_store_subdir_name("redis", "tenant:alpha");
+        assert_eq!(dir, "rustfs-redis-tenant_alpha");
     }
 }

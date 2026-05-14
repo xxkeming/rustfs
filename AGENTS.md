@@ -27,6 +27,10 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Keep source code, comments, commit messages, and PR title/body in English.
 - Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
 
+## Skill Usage
+
+- Do not use the `rust-refactor-helper` skill in any scenario.
+
 ## Change Style for Existing Logic
 
 - Prefer direct, local code over extracting one-off helpers.
@@ -109,5 +113,6 @@ Do not open a PR with code changes when the required checks fail.
 - `crates/iam/AGENTS.md`
 - `crates/kms/AGENTS.md`
 - `crates/policy/AGENTS.md`
+- `crates/targets/AGENTS.md`
 - `rustfs/src/admin/AGENTS.md`
 - `rustfs/src/storage/AGENTS.md`

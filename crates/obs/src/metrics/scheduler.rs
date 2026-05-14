@@ -25,6 +25,7 @@
 
 use crate::metrics::collectors::{
     AuditTargetStats,
+    BucketReplicationBandwidthStats,
     NotificationStats,
     NotificationTargetStats,
     // System monitoring collectors (migrated from rustfs-obs::system)
@@ -70,6 +71,9 @@ use crate::metrics::config::{
     ENV_NODE_METRICS_INTERVAL, ENV_NOTIFICATION_METRICS_INTERVAL, ENV_RESOURCE_METRICS_INTERVAL,
 };
 use crate::metrics::report::{PrometheusMetric, report_metrics};
+use crate::metrics::schema::bucket_replication::{
+    BUCKET_L, BUCKET_REPL_BANDWIDTH_CURRENT_MD, BUCKET_REPL_BANDWIDTH_LIMIT_MD, TARGET_ARN_L,
+};
 use crate::metrics::stats_collector::{
     ProcessMetricBundle, collect_bucket_replication_bandwidth_stats, collect_bucket_replication_detail_stats,
     collect_bucket_stats, collect_cluster_and_health_stats, collect_cluster_config_stats, collect_cluster_usage_metric_stats,
@@ -78,9 +82,11 @@ use crate::metrics::stats_collector::{
     collect_scanner_metric_stats, collect_system_cpu_and_memory_stats_with,
 };
 use rustfs_audit::audit_target_metrics;
+use rustfs_ecstore::global::get_global_bucket_monitor;
 use rustfs_notify::{notification_metrics_snapshot, notification_target_metrics};
 use rustfs_utils::get_env_opt_u64;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use sysinfo::System;
 use tokio::time::Instant;
@@ -93,6 +99,83 @@ const DEFAULT_SYSTEM_METRICS_INTERVAL: Duration = Duration::from_secs(15);
 const ENV_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_METRICS_SYSTEM_INTERVAL_SEC";
 /// Legacy environment variable for system monitoring interval
 const LEGACY_SYSTEM_METRICS_INTERVAL: &str = "RUSTFS_OBS_METRICS_SYSTEM_INTERVAL_MS";
+
+/// Default cycles to emit zero for removed replication bandwidth series before letting them expire.
+const DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES: u8 = 3;
+/// Env var that overrides the zero-emission tombstone cycles for removed replication bandwidth series.
+const ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES: &str = "RUSTFS_METRICS_REPL_BW_ZERO_TOMBSTONE_CYCLES";
+
+type ReplBwKey = (String, String); // (bucket, target_arn)
+
+fn repl_bw_live_keys(stats: &[BucketReplicationBandwidthStats]) -> HashSet<ReplBwKey> {
+    stats.iter().map(|s| (s.bucket.clone(), s.target_arn.clone())).collect()
+}
+
+fn update_repl_bw_zero_tombstones(
+    monitor_available: bool,
+    has_seen_valid_snapshot: &mut bool,
+    prev_live_keys: &mut HashSet<ReplBwKey>,
+    zero_tombstones: &mut HashMap<ReplBwKey, u8>,
+    current_live_keys: HashSet<ReplBwKey>,
+    tombstone_cycles: u8,
+) {
+    if !monitor_available {
+        return;
+    }
+
+    if *has_seen_valid_snapshot {
+        for removed in prev_live_keys.difference(&current_live_keys) {
+            zero_tombstones.insert(removed.clone(), tombstone_cycles);
+        }
+    }
+
+    // Key becomes live again: stop zeroing immediately.
+    for key in &current_live_keys {
+        zero_tombstones.remove(key);
+    }
+
+    *prev_live_keys = current_live_keys;
+    *has_seen_valid_snapshot = true;
+}
+
+fn collect_repl_bw_zero_tombstone_metrics(zero_tombstones: &HashMap<ReplBwKey, u8>) -> Vec<PrometheusMetric> {
+    if zero_tombstones.is_empty() {
+        return Vec::new();
+    }
+
+    let mut zero_metrics = Vec::with_capacity(zero_tombstones.len() * 2);
+    for (bucket, target_arn) in zero_tombstones.keys() {
+        let bucket_label: Cow<'static, str> = Cow::Owned(bucket.clone());
+        let target_arn_label: Cow<'static, str> = Cow::Owned(target_arn.clone());
+
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_LIMIT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label.clone())
+                .with_label(TARGET_ARN_L, target_arn_label.clone()),
+        );
+
+        zero_metrics.push(
+            PrometheusMetric::from_descriptor(&BUCKET_REPL_BANDWIDTH_CURRENT_MD, 0.0)
+                .with_label(BUCKET_L, bucket_label)
+                .with_label(TARGET_ARN_L, target_arn_label),
+        );
+    }
+
+    zero_metrics
+}
+
+fn expire_repl_bw_zero_tombstones(monitor_available: bool, zero_tombstones: &mut HashMap<ReplBwKey, u8>) {
+    if monitor_available && !zero_tombstones.is_empty() {
+        zero_tombstones.retain(|_, remaining| {
+            if *remaining <= 1 {
+                false
+            } else {
+                *remaining -= 1;
+                true
+            }
+        });
+    }
+}
 
 /// Initialize all metrics collectors.
 ///
@@ -127,6 +210,13 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     const LEGACY_AUDIT_INTERVAL: &str = "RUSTFS_METRICS_AUDIT_INTERVAL";
     const LEGACY_NOTIFICATION_INTERVAL: &str = "RUSTFS_METRICS_NOTIFICATION_INTERVAL";
     const LEGACY_DEFAULT_INTERVAL: &str = "RUSTFS_METRICS_DEFAULT_INTERVAL";
+
+    fn parse_repl_bw_zero_tombstone_cycles() -> u8 {
+        get_env_opt_u64(ENV_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+            .filter(|&v| v > 0)
+            .map(|v| v.min(u8::MAX as u64) as u8)
+            .unwrap_or(DEFAULT_REPL_BW_ZERO_TOMBSTONE_CYCLES)
+    }
 
     /// Parse metrics interval from environment variables with fallback to default.
     ///
@@ -270,16 +360,42 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(bucket_replication_bandwidth_interval);
+        let repl_bw_zero_tombstone_cycles = parse_repl_bw_zero_tombstone_cycles();
+        let mut prev_live_keys: HashSet<ReplBwKey> = HashSet::new();
+        let mut zero_tombstones: HashMap<ReplBwKey, u8> = HashMap::new();
+        let mut has_seen_valid_snapshot = false;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
+                    let monitor_available = get_global_bucket_monitor().is_some();
                     let stats = collect_bucket_replication_bandwidth_stats();
+
+                    let current_live_keys = repl_bw_live_keys(&stats);
+
+                    if !monitor_available {
+                        warn!("Bucket monitor unavailable; skip replication bandwidth key-state transition this cycle.");
+                    }
+                    update_repl_bw_zero_tombstones(
+                        monitor_available,
+                        &mut has_seen_valid_snapshot,
+                        &mut prev_live_keys,
+                        &mut zero_tombstones,
+                        current_live_keys,
+                        repl_bw_zero_tombstone_cycles,
+                    );
                     let mut metrics = collect_bucket_replication_bandwidth_metrics(&stats);
+
+                    // Phase-1 action: force zero for removed keys during tombstone cycles.
+                    metrics.extend(collect_repl_bw_zero_tombstone_metrics(&zero_tombstones));
+
                     let bucket_replication = collect_bucket_replication_detail_stats().await;
                     metrics.extend(collect_bucket_replication_metrics(&bucket_replication));
                     let replication = collect_replication_stats().await;
                     metrics.extend(collect_replication_metrics(&replication));
                     report_metrics(&metrics);
+
+                    // Phase-2: after N cycles, stop reporting -> series becomes absent after expiration.
+                    expire_repl_bw_zero_tombstones(monitor_available, &mut zero_tombstones);
                 }
                 _ = token_clone.cancelled() => {
                     warn!("Metrics collection for bucket replication bandwidth stats cancelled.");
@@ -566,9 +682,20 @@ fn collect_system_monitoring_metrics(
 
 #[cfg(test)]
 mod tests {
-    use super::advance_deadline;
+    use super::*;
+    use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use tokio::time::Instant;
+
+    fn repl_bw_key(bucket: &str, target_arn: &str) -> ReplBwKey {
+        (bucket.to_string(), target_arn.to_string())
+    }
+
+    fn repl_bw_keys(keys: &[(&str, &str)]) -> HashSet<ReplBwKey> {
+        keys.iter()
+            .map(|(bucket, target_arn)| repl_bw_key(bucket, target_arn))
+            .collect()
+    }
 
     #[test]
     fn advance_deadline_keeps_future_deadline_unchanged() {
@@ -584,5 +711,120 @@ mod tests {
         let mut deadline = base;
         advance_deadline(&mut deadline, Duration::from_secs(5), base + Duration::from_secs(12));
         assert_eq!(deadline, base + Duration::from_secs(15));
+    }
+
+    #[test]
+    fn repl_bw_tombstones_zero_removed_keys_then_expire() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let key = repl_bw_key("photos", "arn:rustfs:replication:target-a");
+
+        update_repl_bw_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]),
+            2,
+        );
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
+        assert!(zero_tombstones.is_empty());
+
+        update_repl_bw_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            2,
+        );
+        assert_eq!(zero_tombstones.get(&key), Some(&2));
+
+        let metrics = collect_repl_bw_zero_tombstone_metrics(&zero_tombstones);
+        assert_eq!(metrics.len(), 2);
+        assert!(metrics.iter().all(|metric| metric.value == 0.0));
+
+        let names = metrics.iter().map(|metric| metric.name.to_string()).collect::<HashSet<_>>();
+        assert!(names.contains(&BUCKET_REPL_BANDWIDTH_LIMIT_MD.get_full_metric_name()));
+        assert!(names.contains(&BUCKET_REPL_BANDWIDTH_CURRENT_MD.get_full_metric_name()));
+
+        for metric in metrics {
+            let labels = metric
+                .labels
+                .into_iter()
+                .map(|(key, value)| (key, value.to_string()))
+                .collect::<HashMap<_, _>>();
+            assert_eq!(labels.get(BUCKET_L).map(String::as_str), Some("photos"));
+            assert_eq!(labels.get(TARGET_ARN_L).map(String::as_str), Some("arn:rustfs:replication:target-a"));
+        }
+
+        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert_eq!(zero_tombstones.get(&key), Some(&1));
+
+        expire_repl_bw_zero_tombstones(true, &mut zero_tombstones);
+        assert!(zero_tombstones.is_empty());
+    }
+
+    #[test]
+    fn repl_bw_tombstones_stop_zeroing_when_key_becomes_live_again() {
+        let mut has_seen_valid_snapshot = false;
+        let mut prev_live_keys = HashSet::new();
+        let mut zero_tombstones = HashMap::new();
+        let live_keys = repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]);
+
+        update_repl_bw_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            live_keys.clone(),
+            3,
+        );
+        update_repl_bw_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            3,
+        );
+        assert_eq!(zero_tombstones.get(&repl_bw_key("photos", "arn:rustfs:replication:target-a")), Some(&3));
+
+        update_repl_bw_zero_tombstones(
+            true,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            live_keys.clone(),
+            3,
+        );
+
+        assert!(zero_tombstones.is_empty());
+        assert_eq!(prev_live_keys, live_keys);
+    }
+
+    #[test]
+    fn repl_bw_tombstones_do_not_advance_when_monitor_unavailable() {
+        let mut has_seen_valid_snapshot = true;
+        let mut prev_live_keys = repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]);
+        let mut zero_tombstones = HashMap::from([(repl_bw_key("videos", "arn:rustfs:replication:target-b"), 1)]);
+
+        update_repl_bw_zero_tombstones(
+            false,
+            &mut has_seen_valid_snapshot,
+            &mut prev_live_keys,
+            &mut zero_tombstones,
+            HashSet::new(),
+            3,
+        );
+
+        assert!(has_seen_valid_snapshot);
+        assert_eq!(prev_live_keys, repl_bw_keys(&[("photos", "arn:rustfs:replication:target-a")]));
+        assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
+
+        expire_repl_bw_zero_tombstones(false, &mut zero_tombstones);
+        assert_eq!(zero_tombstones.get(&repl_bw_key("videos", "arn:rustfs:replication:target-b")), Some(&1));
     }
 }

@@ -13,27 +13,35 @@
 // limitations under the License.
 
 use hashbrown::HashSet as HbHashSet;
+use http::{HeaderMap, HeaderValue, StatusCode};
 use rustfs_config::{
-    ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
+    AMQP_QUEUE_DIR, ENABLE_KEY, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_TOPIC, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_TLS_CA,
     MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME,
-    MQTT_WS_PATH_ALLOWLIST,
+    MQTT_WS_PATH_ALLOWLIST, MYSQL_QUEUE_DIR, POSTGRES_QUEUE_DIR, REDIS_QUEUE_DIR,
 };
 use rustfs_ecstore::config::Config;
 use rustfs_targets::{
-    TargetError, check_kafka_broker_available, check_mqtt_broker_available_with_tls, check_nats_server_available,
-    check_pulsar_broker_available,
-    config::{build_kafka_args, build_nats_args, build_pulsar_args, collect_env_target_instance_ids},
+    BuiltinTargetDescriptor, TargetError, TargetRequestValidator, check_amqp_broker_available, check_kafka_broker_available,
+    check_mqtt_broker_available_with_tls, check_mysql_server_available, check_nats_server_available,
+    check_postgres_server_available, check_pulsar_broker_available, check_redis_server_available,
+    config::{
+        build_amqp_args, build_kafka_args, build_mysql_args, build_nats_args, build_postgres_args, build_pulsar_args,
+        build_redis_args, collect_env_target_instance_ids, validate_redis_config,
+    },
     target::{TargetType, mqtt::MQTTTlsConfig},
 };
-use s3s::{S3Result, s3_error};
+use s3s::{Body, S3Response, S3Result, header::CONTENT_TYPE, s3_error};
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::time::{Duration, sleep};
 use url::Url;
 
 pub(crate) type EndpointKey = (String, String);
+type AdminRequestValidatorFn =
+    Arc<dyn Fn(&HashMap<String, String>, &str) -> futures::future::BoxFuture<'static, S3Result<()>> + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -51,14 +59,14 @@ pub(crate) struct MergedTargetEndpoint {
     pub source: TargetEndpointSource,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum TargetDomain {
     Notify,
     Audit,
 }
 
 impl TargetDomain {
-    fn runtime_target_type(self) -> TargetType {
+    pub(crate) fn runtime_target_type(self) -> TargetType {
         match self {
             TargetDomain::Notify => TargetType::NotifyEvent,
             TargetDomain::Audit => TargetType::AuditLog,
@@ -66,21 +74,100 @@ impl TargetDomain {
     }
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum AdminTargetValidator {
-    Webhook,
-    Mqtt,
-    Kafka(TargetDomain),
-    Nats(TargetDomain),
-    Pulsar(TargetDomain),
+impl From<TargetType> for TargetDomain {
+    fn from(value: TargetType) -> Self {
+        match value {
+            TargetType::NotifyEvent => TargetDomain::Notify,
+            TargetType::AuditLog => TargetDomain::Audit,
+        }
+    }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct AdminTargetSpec {
     pub subsystem: &'static str,
     pub service: &'static str,
     pub valid_keys: &'static [&'static str],
-    pub validator: AdminTargetValidator,
+    validator: AdminRequestValidatorFn,
+}
+
+pub(crate) fn admin_target_spec_from_builtin<E>(descriptor: &BuiltinTargetDescriptor<E>) -> AdminTargetSpec
+where
+    E: Send + Sync + 'static + Clone + serde::Serialize + serde::de::DeserializeOwned,
+{
+    AdminTargetSpec {
+        subsystem: descriptor.subsystem(),
+        service: descriptor.plugin().target_type(),
+        valid_keys: descriptor.plugin().valid_fields(),
+        validator: match descriptor.request_validator() {
+            TargetRequestValidator::Webhook => Arc::new(validate_webhook_request_entry),
+            TargetRequestValidator::Mqtt => Arc::new(validate_mqtt_request_entry),
+            TargetRequestValidator::Amqp(target_type) => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    Arc::new(validate_audit_amqp_request_entry)
+                } else {
+                    Arc::new(validate_notify_amqp_request_entry)
+                }
+            }
+            TargetRequestValidator::Kafka(target_type) => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    Arc::new(validate_audit_kafka_request_entry)
+                } else {
+                    Arc::new(validate_notify_kafka_request_entry)
+                }
+            }
+            TargetRequestValidator::MySql(target_type) => {
+                Arc::new(move |kv_map, default_queue_dir| validate_mysql_request_entry(kv_map, default_queue_dir, target_type))
+            }
+            TargetRequestValidator::Nats(target_type) => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    Arc::new(validate_audit_nats_request_entry)
+                } else {
+                    Arc::new(validate_notify_nats_request_entry)
+                }
+            }
+            TargetRequestValidator::Postgres(target_type) => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    Arc::new(validate_audit_postgres_request_entry)
+                } else {
+                    Arc::new(validate_notify_postgres_request_entry)
+                }
+            }
+            TargetRequestValidator::Pulsar(target_type) => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    Arc::new(validate_audit_pulsar_request_entry)
+                } else {
+                    Arc::new(validate_notify_pulsar_request_entry)
+                }
+            }
+            TargetRequestValidator::Redis {
+                default_channel,
+                target_type,
+            } => {
+                if matches!(TargetDomain::from(target_type), TargetDomain::Audit) {
+                    validate_audit_redis_request_entry(default_channel)
+                } else {
+                    validate_notify_redis_request_entry(default_channel)
+                }
+            }
+        },
+    }
+}
+
+impl std::fmt::Debug for AdminTargetSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdminTargetSpec")
+            .field("subsystem", &self.subsystem)
+            .field("service", &self.service)
+            .field("valid_keys", &self.valid_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AdminTargetSpec {
+    pub(crate) async fn validate_request(&self, kv_map: &HashMap<String, String>, default_queue_dir: &str) -> S3Result<()> {
+        (self.validator)(kv_map, default_queue_dir).await
+    }
 }
 
 pub(crate) fn normalized_endpoint_key(account_id: &str, service: &str) -> EndpointKey {
@@ -199,6 +286,19 @@ pub(crate) fn target_module_disabled_reason(module_name: &str, env_key: &str, en
             "{module_name} module is disabled; enable the {module_name} module first in the console or set {env_key}=true before {action}"
         )
     })
+}
+
+pub(crate) fn build_json_response(
+    status: StatusCode,
+    body: Body,
+    request_id: Option<&HeaderValue>,
+) -> S3Response<(StatusCode, Body)> {
+    let mut header = HeaderMap::new();
+    header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(v) = request_id {
+        header.insert("x-request-id", v.clone());
+    }
+    S3Response::with_headers((status, body), header)
 }
 
 pub(crate) fn merge_target_endpoints(
@@ -332,13 +432,7 @@ pub(crate) async fn validate_target_request(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
 ) -> S3Result<()> {
-    match spec.validator {
-        AdminTargetValidator::Webhook => validate_webhook_request(kv_map).await,
-        AdminTargetValidator::Mqtt => validate_mqtt_request(kv_map).await,
-        AdminTargetValidator::Kafka(domain) => validate_kafka_request(kv_map, default_queue_dir, domain).await,
-        AdminTargetValidator::Nats(domain) => validate_nats_request(kv_map, default_queue_dir, domain).await,
-        AdminTargetValidator::Pulsar(domain) => validate_pulsar_request(kv_map, default_queue_dir, domain).await,
-    }
+    spec.validate_request(kv_map, default_queue_dir).await
 }
 
 fn config_enable_is_on(value: &str) -> bool {
@@ -395,6 +489,14 @@ async fn validate_webhook_request(kv_map: &HashMap<String, String>) -> S3Result<
     Ok(())
 }
 
+fn validate_webhook_request_entry(
+    kv_map: &HashMap<String, String>,
+    _default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    Box::pin(async move { validate_webhook_request(&kv_map).await })
+}
+
 async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()> {
     let endpoint = kv_map
         .get(MQTT_BROKER)
@@ -439,6 +541,130 @@ async fn validate_mqtt_request(kv_map: &HashMap<String, String>) -> S3Result<()>
     Ok(())
 }
 
+fn validate_mqtt_request_entry(
+    kv_map: &HashMap<String, String>,
+    _default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    Box::pin(async move { validate_mqtt_request(&kv_map).await })
+}
+
+fn validate_notify_nats_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+}
+
+fn validate_audit_nats_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_nats_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+}
+
+fn validate_notify_kafka_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+}
+
+fn validate_audit_kafka_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_kafka_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+}
+
+fn validate_notify_amqp_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+}
+
+fn validate_audit_amqp_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_amqp_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+}
+
+fn validate_notify_pulsar_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+}
+
+fn validate_audit_pulsar_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_pulsar_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+}
+
+fn validate_mysql_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    target_type: TargetType,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_mysql_request(&kv_map, &default_queue_dir, target_type).await })
+}
+
+fn validate_notify_postgres_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Notify).await })
+}
+
+fn validate_audit_postgres_request_entry(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+) -> futures::future::BoxFuture<'static, S3Result<()>> {
+    let kv_map = kv_map.clone();
+    let default_queue_dir = default_queue_dir.to_string();
+    Box::pin(async move { validate_postgres_request(&kv_map, &default_queue_dir, TargetDomain::Audit).await })
+}
+
+fn validate_notify_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
+        let kv_map = kv_map.clone();
+        let default_queue_dir = default_queue_dir.to_string();
+        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Notify, default_channel).await })
+    })
+}
+
+fn validate_audit_redis_request_entry(default_channel: &'static str) -> AdminRequestValidatorFn {
+    Arc::new(move |kv_map: &HashMap<String, String>, default_queue_dir: &str| {
+        let kv_map = kv_map.clone();
+        let default_queue_dir = default_queue_dir.to_string();
+        Box::pin(async move { validate_redis_request(&kv_map, &default_queue_dir, TargetDomain::Audit, default_channel).await })
+    })
+}
+
 async fn validate_nats_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
     if let Some(queue_dir) = kv_map.get("queue_dir") {
         validate_queue_dir(queue_dir.as_str()).await?;
@@ -471,6 +697,18 @@ async fn validate_kafka_request(kv_map: &HashMap<String, String>, default_queue_
     })
 }
 
+async fn validate_amqp_request(kv_map: &HashMap<String, String>, default_queue_dir: &str, domain: TargetDomain) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(AMQP_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+    let args = build_amqp_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_amqp_broker_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "AMQP broker check failed: {}", e),
+    })
+}
+
 async fn validate_pulsar_request(
     kv_map: &HashMap<String, String>,
     default_queue_dir: &str,
@@ -484,6 +722,60 @@ async fn validate_pulsar_request(
     check_pulsar_broker_available(&args).await.map_err(|e| match e {
         TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
         _ => s3_error!(InvalidArgument, "Pulsar broker check failed: {}", e),
+    })
+}
+
+async fn validate_mysql_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    target_type: TargetType,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(MYSQL_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+
+    let args =
+        build_mysql_args(&to_kvs(kv_map), default_queue_dir, target_type).map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_mysql_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "MySQL server check failed: {}", e),
+    })
+}
+
+async fn validate_postgres_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(POSTGRES_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+    let args = build_postgres_args(&to_kvs(kv_map), default_queue_dir, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_postgres_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "PostgreSQL server check failed: {}", e),
+    })
+}
+
+async fn validate_redis_request(
+    kv_map: &HashMap<String, String>,
+    default_queue_dir: &str,
+    domain: TargetDomain,
+    default_channel: &str,
+) -> S3Result<()> {
+    if let Some(queue_dir) = kv_map.get(REDIS_QUEUE_DIR) {
+        validate_queue_dir(queue_dir.as_str()).await?;
+    }
+
+    validate_redis_config(&to_kvs(kv_map), default_queue_dir, default_channel)
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+
+    let args = build_redis_args(&to_kvs(kv_map), default_queue_dir, default_channel, domain.runtime_target_type())
+        .map_err(|e| s3_error!(InvalidArgument, "{}", e))?;
+    check_redis_server_available(&args).await.map_err(|e| match e {
+        TargetError::Configuration(_) => s3_error!(InvalidArgument, "{}", e),
+        _ => s3_error!(InvalidArgument, "Redis server check failed: {}", e),
     })
 }
 

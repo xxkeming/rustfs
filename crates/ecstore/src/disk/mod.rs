@@ -427,6 +427,20 @@ impl Disk {
         }
     }
 
+    pub fn last_capacity_snapshot(&self) -> Option<(u64, u64, u64, u64)> {
+        match self {
+            Disk::Local(local_disk) => local_disk.last_capacity_snapshot(),
+            Disk::Remote(remote_disk) => remote_disk.last_capacity_snapshot(),
+        }
+    }
+
+    pub fn record_capacity_probe(&self, total: u64, used: u64, free: u64) {
+        match self {
+            Disk::Local(local_disk) => local_disk.record_capacity_probe(total, used, free),
+            Disk::Remote(remote_disk) => remote_disk.record_capacity_probe(total, used, free),
+        }
+    }
+
     #[cfg(test)]
     pub fn force_runtime_state_for_test(&self, state: RuntimeDriveHealthState) {
         match self {
@@ -437,6 +451,15 @@ impl Disk {
 }
 
 impl Disk {
+    /// Reset drive health so `connect_load_init_formats` retries are not blocked by a prior
+    /// transient mark-faulty (same disk handles are reused across retries).
+    pub fn reset_health_for_store_init_retry(&self) {
+        match self {
+            Disk::Local(local_disk) => local_disk.reset_health_for_store_init_retry(),
+            Disk::Remote(remote_disk) => remote_disk.reset_health_for_store_init_retry(),
+        }
+    }
+
     /// Enable health monitoring on this disk.
     /// Called after startup format loading completes so that remote peers
     /// have time to come online before being marked as faulty.
@@ -559,6 +582,7 @@ pub struct CheckPartsResp {
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct UpdateMetadataOpts {
     pub no_persistence: bool,
+    pub replace_user_metadata: bool,
 }
 
 pub struct DiskLocation {
@@ -914,9 +938,13 @@ mod tests {
     /// Test UpdateMetadataOpts structure
     #[test]
     fn test_update_metadata_opts() {
-        let opts = UpdateMetadataOpts { no_persistence: true };
+        let opts = UpdateMetadataOpts {
+            no_persistence: true,
+            ..Default::default()
+        };
 
         assert!(opts.no_persistence);
+        assert!(!opts.replace_user_metadata);
     }
 
     /// Test DiskOption structure
@@ -1104,5 +1132,41 @@ mod tests {
 
         // Clean up the test directory
         let _ = fs::remove_dir_all(&test_dir).await;
+    }
+
+    #[tokio::test]
+    async fn reset_health_for_store_init_retry_delegates_to_disk_variants() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_path = local_dir.path().to_str().expect("tempdir path should be utf8");
+        let mut local_endpoint = Endpoint::try_from(local_path).expect("local endpoint should parse");
+        local_endpoint.set_pool_index(0);
+        local_endpoint.set_set_index(0);
+        local_endpoint.set_disk_index(0);
+        let local_disk = LocalDisk::new(&local_endpoint, false).await.unwrap();
+        let local_disk = Disk::Local(Box::new(LocalDiskWrapper::new(Arc::new(local_disk), false)));
+
+        let mut remote_endpoint = Endpoint::try_from("http://remote-server:9000/data").expect("remote endpoint should parse");
+        remote_endpoint.set_pool_index(0);
+        remote_endpoint.set_set_index(0);
+        remote_endpoint.set_disk_index(1);
+        let remote_disk = RemoteDisk::new(
+            &remote_endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .unwrap();
+        let remote_disk = Disk::Remote(Box::new(remote_disk));
+
+        for disk in [&local_disk, &remote_disk] {
+            disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Offline);
+
+            disk.reset_health_for_store_init_retry();
+
+            assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
+        }
     }
 }

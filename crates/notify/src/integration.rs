@@ -25,8 +25,8 @@ use crate::{
 use hashbrown::HashMap;
 use rustfs_config::notify::{
     DEFAULT_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_TARGET_STREAM_CONCURRENCY, ENV_NOTIFY_WEBHOOK_ENABLE,
-    ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_NATS_SUB_SYS, NOTIFY_PULSAR_SUB_SYS,
-    NOTIFY_WEBHOOK_SUB_SYS,
+    ENV_NOTIFY_WEBHOOK_ENDPOINT, NOTIFY_AMQP_SUB_SYS, NOTIFY_KAFKA_SUB_SYS, NOTIFY_MQTT_SUB_SYS, NOTIFY_MYSQL_SUB_SYS,
+    NOTIFY_NATS_SUB_SYS, NOTIFY_POSTGRES_SUB_SYS, NOTIFY_PULSAR_SUB_SYS, NOTIFY_REDIS_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS,
 };
 use rustfs_config::{ENV_NOTIFY_ENABLE, EVENT_DEFAULT_DIR};
 use rustfs_ecstore::config::{Config, KVS};
@@ -54,11 +54,15 @@ fn notify_configuration_hint() -> String {
 
 fn subsystem_target_type(target_type: &str) -> &str {
     match target_type {
+        NOTIFY_AMQP_SUB_SYS => "amqp",
         NOTIFY_WEBHOOK_SUB_SYS => "webhook",
         NOTIFY_KAFKA_SUB_SYS => "kafka",
         NOTIFY_MQTT_SUB_SYS => "mqtt",
+        NOTIFY_MYSQL_SUB_SYS => "mysql",
         NOTIFY_NATS_SUB_SYS => "nats",
+        NOTIFY_POSTGRES_SUB_SYS => "postgres",
         NOTIFY_PULSAR_SUB_SYS => "pulsar",
+        NOTIFY_REDIS_SUB_SYS => "redis",
         _ => target_type,
     }
 }
@@ -776,6 +780,13 @@ mod tests {
     }
 
     #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_amqp_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_AMQP_SUB_SYS, "Primary");
+        assert_eq!(target_id.id, "primary");
+        assert_eq!(target_id.name, "amqp");
+    }
+
+    #[test]
     fn runtime_target_id_for_subsystem_maps_notify_mqtt_to_runtime_type() {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_MQTT_SUB_SYS, "Analytics");
         assert_eq!(target_id.id, "analytics");
@@ -801,5 +812,18 @@ mod tests {
         let target_id = runtime_target_id_for_subsystem(NOTIFY_PULSAR_SUB_SYS, "Ledger");
         assert_eq!(target_id.id, "ledger");
         assert_eq!(target_id.name, "pulsar");
+    }
+
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_redis_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_REDIS_SUB_SYS, "Primary");
+        assert_eq!(target_id.id, "primary");
+        assert_eq!(target_id.name, "redis");
+    }
+    #[test]
+    fn runtime_target_id_for_subsystem_maps_notify_postgres_to_runtime_type() {
+        let target_id = runtime_target_id_for_subsystem(NOTIFY_POSTGRES_SUB_SYS, "AuditTrail");
+        assert_eq!(target_id.id, "audittrail");
+        assert_eq!(target_id.name, "postgres");
     }
 }

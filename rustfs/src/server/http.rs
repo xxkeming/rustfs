@@ -22,8 +22,8 @@ use crate::server::{
     compress::{CompressionConfig, PathAwareCompressionPredicate, PathCategoryInjectionLayer},
     hybrid::hybrid,
     layer::{
-        AdminChunkedContentLengthCompatLayer, BodylessStatusFixLayer, ConditionalCorsLayer, HeadRequestBodyFixLayer,
-        ObjectAttributesEtagFixLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
+        BodylessStatusFixLayer, ConditionalCorsLayer, EmptyBodyContentLengthCompatLayer, HeadRequestBodyFixLayer,
+        ObjectAttributesEtagFixLayer, PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, S3ErrorMessageCompatLayer,
     },
     tls_material::{TlsAcceptorHolder, TlsHandshakeFailureKind, TlsMaterialSnapshot, spawn_reload_loop},
 };
@@ -215,17 +215,24 @@ pub async fn start_http_server(
         TcpListener::from_std(socket.into())?
     };
 
-    let tls_path = config.tls_path.as_deref().unwrap_or_default();
+    let tls_path = config.tls_path.as_deref().map(str::trim).unwrap_or_default();
+    let tls_path_configured = !tls_path.is_empty();
     // Load TLS materials and build server acceptor.
     // Note: outbound material (root CAs, mTLS identity) is already applied in main.rs.
     let tls_snapshot = TlsMaterialSnapshot::load(tls_path)
         .await
         .map_err(|e| Error::other(e.to_string()))?;
 
-    let tls_acceptor = tls_snapshot
-        .build_tls_acceptor(tls_path)
-        .await
-        .map_err(|e| Error::other(e.to_string()))?;
+    let tls_acceptor = tls_snapshot.build_tls_acceptor(tls_path).await.map_err(|e| {
+        if tls_path_configured {
+            Error::other(format!(
+                "TLS is explicitly configured via RUSTFS_TLS_PATH/tls_path='{}' but TLS acceptor initialization failed: {}",
+                tls_path, e
+            ))
+        } else {
+            Error::other(e.to_string())
+        }
+    })?;
     let tls_enabled = tls_acceptor.is_some();
     let protocol = if tls_enabled { "https" } else { "http" };
 
@@ -673,14 +680,14 @@ fn process_connection(
         };
         // ── Canonical Middleware Stack Order (outermost → innermost) ──
         // This order MUST be preserved across refactorings.
-        // Only AddExtensionLayer (layers 1-2) are per-connection; layers 3-15 are stateless.
+        // Only AddExtensionLayer (layers 1-2) are per-connection; most remaining layers are stateless.
         //
         //  1. AddExtensionLayer<RemoteAddr>           — per-connection peer address
         //  2. AddExtensionLayer<SocketAddr>           — per-connection raw socket addr (TrustedProxy)
         //  3. TrustedProxyLayer                       — conditional, parses X-Forwarded-For
         //  4. SetRequestIdLayer                       — generates X-Request-ID
         //  5. RequestContextLayer                    — creates RequestContext in extensions
-        //  6. AdminChunkedContentLengthCompatLayer    — admin API compat
+        //  6. EmptyBodyContentLengthCompatLayer       — adds Content-Length: 0 for known empty-body API routes
         //  7. CatchPanicLayer                        — panic → 500
         //  8. ReadinessGateLayer                     — blocks until ready
         //  9. KeystoneAuthLayer                      — X-Auth-Token validation
@@ -694,6 +701,7 @@ fn process_connection(
         // 17. RedirectLayer                          — console redirect (conditional)
         // 18. BodylessStatusFixLayer                 — clears body for 1xx/204/205/304 responses
         // 19. HeadRequestBodyFixLayer                — strips actual body bytes from HEAD responses
+        // 20. PublicHealthEndpointLayer              — handles public health before s3s host parsing
         // ─────────────────────────────────────────────────────────────
         let hybrid_service = ServiceBuilder::new()
             // NOTE: Both extension types are intentionally inserted to maintain compatibility:
@@ -710,7 +718,7 @@ fn process_connection(
             .option_layer(trusted_proxy_layer)
             .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
             .layer(RequestContextLayer)
-            .layer(AdminChunkedContentLengthCompatLayer)
+            .layer(EmptyBodyContentLengthCompatLayer)
             .layer(CatchPanicLayer::new())
             // CRITICAL: Insert ReadinessGateLayer before business logic
             // This stops requests from hitting IAMAuth or Storage if they are not ready.
@@ -871,16 +879,19 @@ fn process_connection(
             // Bucket-level CORS takes precedence when configured (handled in router.rs for OPTIONS, and in ecfs.rs for actual requests)
             .layer(ConditionalCorsLayer::new())
             .option_layer(if is_console { Some(RedirectLayer) } else { None })
-            // Must run first on responses: clear the body and remove
+            // Must run before outer response-transforming layers: clear the body and remove
             // Content-Length, Content-Type, and Transfer-Encoding for statuses
-            // that MUST NOT carry a body (1xx/204/304). Kept innermost so all
-            // other response-transforming layers see the already-bodyless
+            // that MUST NOT carry a body (1xx/204/304). Placed inside those
+            // layers so they see the already-bodyless
             // response and so no layer (e.g. CORS) re-adds body headers afterward.
             .layer(BodylessStatusFixLayer)
             // HEAD responses must not send body bytes even when the inner S3 layer
-            // serializes an XML error payload. Keep this innermost so the final
-            // HTTP response written to hyper/h2 is bodyless.
+            // serializes an XML error payload.
             .layer(HeadRequestBodyFixLayer)
+            // Health probes are public admin routes, but s3s parses virtual-host
+            // buckets before custom routes. Handle them here so SERVER_DOMAINS
+            // cannot turn /health into an S3 bucket request.
+            .layer(PublicHealthEndpointLayer)
             .service(service);
 
         let hybrid_service = TowerToHyperService::new(hybrid_service);
@@ -1021,6 +1032,9 @@ fn get_listen_backlog() -> i32 {
 // For macOS and BSD variants use the syscall way of getting the connection queue length.
 // NetBSD has no somaxconn-like kernel state.
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd"))]
+// SAFETY: The only unsafe operation in this function is `libc::sysctl`, called
+// with kernel MIB arrays selected by target OS, a valid output buffer, and no
+// input buffer.
 #[allow(unsafe_code)]
 fn get_listen_backlog() -> i32 {
     const DEFAULT_BACKLOG: i32 = 1024;
@@ -1032,6 +1046,8 @@ fn get_listen_backlog() -> i32 {
     let mut buf = [0; 1];
     let mut buf_len = size_of_val(&buf);
 
+    // SAFETY: `name` points to the target OS MIB, `buf` is a valid writable
+    // output buffer, `buf_len` points to its size, and no input buffer is used.
     if unsafe {
         libc::sysctl(
             name.as_mut_ptr(),

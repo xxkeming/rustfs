@@ -838,6 +838,32 @@ impl<T: Store> IamSys<T> {
         !policy.is_empty() && policy.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     }
 
+    // JWT policy claims carry canned policy names only; policy documents are resolved by IAM store.
+    fn safe_claim_policy_names(claims: &HashMap<String, Value>, parent_user: &str) -> Vec<String> {
+        let Some(claim_policies) = claims.get(POLICYNAME).and_then(|v| v.as_str()) else {
+            return Vec::new();
+        };
+
+        claim_policies
+            .split(',')
+            .map(str::trim)
+            .filter(|policy_name| {
+                if policy_name.is_empty() {
+                    return false;
+                }
+                if !Self::is_safe_claim_policy_name(policy_name) {
+                    tracing::debug!(
+                        parent_user = %parent_user,
+                        "prepare_sts_auth: ignoring unsafe policy name in STS policy claim"
+                    );
+                    return false;
+                }
+                true
+            })
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
     /// Compatibility wrapper for service-account authorization entry points.
     /// The canonical evaluation path is `prepare_service_account_auth + eval_prepared`.
     pub async fn is_allowed_service_account(&self, args: &Args<'_>, parent_user: &str) -> bool {
@@ -998,45 +1024,14 @@ impl<T: Store> IamSys<T> {
             (effective_groups, groups_source, p)
         };
 
-        let mut combined_policy = Policy::default();
+        let mut policy_names = policies;
+        if !is_owner && policy_names.is_empty() {
+            policy_names = Self::safe_claim_policy_names(args.claims, parent_user);
+        }
 
-        if !is_owner && policies.is_empty() {
-            // For OIDC/STS users, policies may be specified in JWT claims rather than IAM DB.
-            if let Some(claim_policies) = args.claims.get("policy").and_then(|v| v.as_str()) {
-                use rustfs_policy::policy::default::DEFAULT_POLICIES;
-                let mut resolved = Vec::new();
-                for policy_name in claim_policies.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    if !Self::is_safe_claim_policy_name(policy_name) {
-                        continue;
-                    }
-                    for (name, p) in DEFAULT_POLICIES.iter() {
-                        if *name == policy_name {
-                            resolved.push(p.clone());
-                            break;
-                        }
-                    }
-                }
-                if !resolved.is_empty() {
-                    combined_policy = Policy::merge_policies(resolved);
-                } else if args.deny_only {
-                    combined_policy = Policy::default();
-                } else {
-                    return PreparedIamAuth {
-                        needs_existing_object_tag: false,
-                        mode: PreparedIamMode::Deny,
-                    };
-                }
-            } else if args.deny_only {
-                combined_policy = Policy::default();
-            } else {
-                return PreparedIamAuth {
-                    needs_existing_object_tag: false,
-                    mode: PreparedIamMode::Deny,
-                };
-            }
-        } else if !is_owner {
-            let (a, c) = self.store.merge_policies(&policies.join(",")).await;
-            if a.is_empty() {
+        let mut combined_policy = Policy::default();
+        if !is_owner {
+            if policy_names.is_empty() {
                 if args.deny_only {
                     combined_policy = Policy::default();
                 } else {
@@ -1046,7 +1041,37 @@ impl<T: Store> IamSys<T> {
                     };
                 }
             } else {
-                combined_policy = c;
+                let requested_policies = policy_names.join(",");
+                let (resolved_policies, c) = self.store.merge_policies(&requested_policies).await;
+                if resolved_policies.is_empty() {
+                    tracing::warn!(
+                        parent_user = %parent_user,
+                        requested_policies = %requested_policies,
+                        "prepare_sts_auth: no STS policy names resolved"
+                    );
+                    if args.deny_only {
+                        combined_policy = Policy::default();
+                    } else {
+                        return PreparedIamAuth {
+                            needs_existing_object_tag: false,
+                            mode: PreparedIamMode::Deny,
+                        };
+                    }
+                } else {
+                    let resolved_policy_names = MappedPolicy::new(&resolved_policies).to_slice();
+                    let has_unresolved_policy_names = policy_names
+                        .iter()
+                        .any(|policy_name| !resolved_policy_names.iter().any(|resolved| resolved == policy_name));
+                    if has_unresolved_policy_names {
+                        tracing::debug!(
+                            parent_user = %parent_user,
+                            requested_policies = %requested_policies,
+                            resolved_policies = %resolved_policies,
+                            "prepare_sts_auth: some STS policy names were not resolved"
+                        );
+                    }
+                    combined_policy = c;
+                }
             }
         }
 
@@ -1328,6 +1353,19 @@ mod tests {
         assert!(prepared.combined_policy_for_view().is_none());
     }
 
+    const CUSTOM_STS_CLAIM_POLICY: &str = "custom-sts-claim-getobject";
+    const CUSTOM_STS_CLAIM_BUCKET: &str = "claim-bucket";
+    const CUSTOM_STS_CLAIM_POLICY_JSON: &str = r#"{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject"],
+      "Resource": ["arn:aws:s3:::claim-bucket/allowed/*"]
+    }
+  ]
+}"#;
+
     /// Mock Store for STS tests: either group-attached policies via parent user, or no IAM policies.
     #[derive(Clone)]
     struct StsTestMockStore {
@@ -1470,7 +1508,10 @@ mod tests {
         }
 
         async fn load_all(&self, cache: &Cache) -> Result<()> {
-            let policy_docs = get_default_policyes();
+            let mut policy_docs = get_default_policyes();
+            let custom_claim_policy =
+                Policy::parse_config(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes()).expect("custom STS claim policy should parse");
+            policy_docs.insert(CUSTOM_STS_CLAIM_POLICY.to_string(), PolicyDoc::new(custom_claim_policy));
             cache
                 .policy_docs
                 .store(Arc::new(CacheEntity::new(policy_docs).update_load_time()));
@@ -1565,7 +1606,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let (cred, _) = iam_sys
@@ -1588,7 +1629,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let initial_expiration = OffsetDateTime::now_utc() + time::Duration::hours(2);
@@ -1641,7 +1682,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let (cred, _) = iam_sys
@@ -1682,7 +1723,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1763,7 +1804,7 @@ mod tests {
         ensure_test_global_credentials();
 
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1867,7 +1908,7 @@ mod tests {
     #[tokio::test]
     async fn test_sts_groups_fallback_temp_creds_receive_parent_group_policies() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -1893,12 +1934,198 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_sts_claim_policy_resolves_custom_canned_policy() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let sts_access_key = "sts-custom-claim-policy-test-user";
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent_user.to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let mut claims = HashMap::new();
+        claims.insert(POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Sts { .. }));
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "STS temp credentials should resolve custom canned policy names carried in JWT policy claims"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_claim_policy_ignores_unsafe_and_missing_policy_names() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let sts_access_key = "sts-mixed-claim-policy-test-user";
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent_user.to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let mut claims = HashMap::new();
+        claims.insert(
+            POLICYNAME.to_string(),
+            Value::String(format!("unsafe/policy, missing-sts-claim-policy, {CUSTOM_STS_CLAIM_POLICY}")),
+        );
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Sts { .. }));
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "STS policy claims should ignore unsafe or unresolved names without dropping a resolvable canned policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_claim_policy_custom_canned_policy_does_not_grant_other_actions() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let sts_access_key = "sts-custom-claim-policy-deny-test-user";
+        let sts_user = UserIdentity::from(Credentials {
+            access_key: sts_access_key.to_string(),
+            secret_key: "longenoughsecret".to_string(),
+            session_token: "sts-token".to_string(),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent_user.to_string(),
+            ..Default::default()
+        });
+        Cache::add_or_update(&iam_sys.store.cache.sts_accounts, sts_access_key, &sts_user, OffsetDateTime::now_utc());
+
+        let mut claims = HashMap::new();
+        claims.insert(POLICYNAME.to_string(), Value::String(CUSTOM_STS_CLAIM_POLICY.to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: sts_access_key,
+            groups: &groups,
+            action: Action::S3Action(S3Action::PutObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Sts { .. }));
+        assert!(
+            !iam_sys.eval_prepared(&prepared, &args).await,
+            "custom claim policy must not grant S3 actions outside the resolved canned policy"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_claim_policy_builtin_policy_remains_compatible() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let mut claims = HashMap::new();
+        claims.insert(POLICYNAME.to_string(), Value::String("readwrite".to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: "sts-builtin-claim-policy-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::ListBucketAction),
+            bucket: "mybucket",
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Sts { .. }));
+        assert!(
+            iam_sys.eval_prepared(&prepared, &args).await,
+            "built-in policy names in STS JWT claims must keep working through the unified policy store path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sts_claim_policy_missing_policy_denies() {
+        let store = StsTestMockStore { empty_policies: true };
+        let cache_manager = IamCache::new(store).await.unwrap();
+        let iam_sys = IamSys::new(cache_manager);
+
+        let parent_user = "sts-empty-parent-policy-test";
+        let mut claims = HashMap::new();
+        claims.insert(POLICYNAME.to_string(), Value::String("missing-sts-claim-policy".to_string()));
+        let groups: Option<Vec<String>> = None;
+        let args = Args {
+            account: "sts-missing-claim-policy-test-user",
+            groups: &groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: CUSTOM_STS_CLAIM_BUCKET,
+            conditions: &HashMap::new(),
+            is_owner: false,
+            object: "allowed/object.txt",
+            claims: &claims,
+            deny_only: false,
+        };
+
+        let prepared = iam_sys.prepare_sts_auth(&args, parent_user).await;
+        assert!(matches!(prepared.mode, PreparedIamMode::Deny));
+        assert!(
+            !iam_sys.eval_prepared(&prepared, &args).await,
+            "missing STS claim policy names must deny instead of silently allowing"
+        );
+    }
+
     /// Regression: `deny_only` with empty IAM policies must still evaluate `sessionPolicy-extracted`
     /// so session policy Deny cannot be bypassed (see PR #2250 review).
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_deny_blocks_when_iam_policies_empty() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-empty-parent-policy-test";
@@ -1938,7 +2165,7 @@ mod tests {
     #[tokio::test]
     async fn test_sts_deny_only_session_policy_allow_when_no_deny_on_action() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-empty-parent-policy-test";
@@ -1982,7 +2209,7 @@ mod tests {
     #[tokio::test]
     async fn test_load_user_notification_populates_user_and_policy_caches() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         iam_sys.load_user("notify-user", UserType::Reg).await.unwrap();
@@ -2003,7 +2230,7 @@ mod tests {
     #[tokio::test]
     async fn test_check_key_propagates_cache_miss_load_failure() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let result = iam_sys.check_key("load-failure-user").await;
@@ -2014,7 +2241,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_eval_matches_prepare_sts_auth_for_parent_policy_fallback() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
@@ -2042,7 +2269,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_session_policy() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-test-user";
 
@@ -2156,7 +2383,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_detects_existing_object_tag_in_encoded_session_policy() {
         let store = StsTestMockStore { empty_policies: true };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
         let sts_access_key = "sts-session-tag-encoded-test-user";
 
@@ -2203,7 +2430,7 @@ mod tests {
     #[tokio::test]
     async fn test_prepare_auth_service_account_inherited_ignores_session_policy_tag_hint() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let service_account_access_key = "svc-inherited-tag-hint-test-user";
@@ -2266,7 +2493,7 @@ mod tests {
     #[tokio::test]
     async fn test_policy_db_get_skips_nonexistent_groups() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         // "testgroup" exists with "readwrite" policy; "nonexistent-group" does not exist in IAM.
@@ -2287,7 +2514,7 @@ mod tests {
     #[tokio::test]
     async fn test_info_policy_returns_policy_as_json_object() {
         let store = StsTestMockStore { empty_policies: false };
-        let cache_manager = IamCache::new(store).await;
+        let cache_manager = IamCache::new(store).await.unwrap();
         let iam_sys = IamSys::new(cache_manager);
 
         let policy_info = iam_sys

@@ -38,10 +38,27 @@ fn is_sensitive_target_field(field_name: &str) -> bool {
         || field_name.contains("client_key")
         || field_name.contains("access_key")
         || field_name.contains("auth")
+        || field_name.contains(rustfs_config::BASE_DSN_STRING)
 }
 
 fn redact_target_field_value(field_name: &str, value: &str) -> String {
-    if is_sensitive_target_field(field_name) && !value.is_empty() {
+    if value.is_empty() {
+        return value.to_string();
+    }
+    // Shared DSN fields need target-specific partial redaction so connection
+    // details stay visible in debug logs while passwords remain hidden.
+    if field_name == rustfs_config::BASE_DSN_STRING {
+        let trimmed = value.trim_start();
+        if ["postgres://", "postgresql://"].iter().any(|prefix| {
+            trimmed
+                .get(..prefix.len())
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        }) {
+            return crate::target::postgres::redact_postgres_dsn(value);
+        }
+        return crate::target::mysql::redact_mysql_dsn(value);
+    }
+    if is_sensitive_target_field(field_name) {
         return "***redacted***".to_string();
     }
     value.to_string()
@@ -182,8 +199,13 @@ mod tests {
         collect_env_target_instance_ids_from_env, collect_target_configs_from_env, redact_target_field_value,
         redacted_target_config,
     };
-    use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-    use rustfs_config::{ENABLE_KEY, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT};
+    use rustfs_config::notify::{
+        ENV_NOTIFY_REDIS_ENABLE, ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS, ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE,
+        ENV_NOTIFY_REDIS_URL, NOTIFY_REDIS_KEYS, NOTIFY_ROUTE_PREFIX,
+    };
+    use rustfs_config::{
+        ENABLE_KEY, REDIS_RECONNECT_RETRY_ATTEMPTS, REDIS_TLS_ALLOW_INSECURE, REDIS_URL, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_LIMIT,
+    };
     use rustfs_ecstore::config::{Config, KVS};
     use std::collections::{HashMap, HashSet};
 
@@ -271,6 +293,33 @@ mod tests {
     }
 
     #[test]
+    fn collect_target_configs_accepts_redis_env_fields_with_internal_underscores() {
+        let cfg = Config(HashMap::new());
+        let valid_fields = NOTIFY_REDIS_KEYS.iter().map(|key| (*key).to_string()).collect();
+
+        let configs = collect_target_configs_from_env(
+            &cfg,
+            NOTIFY_ROUTE_PREFIX,
+            "redis",
+            &valid_fields,
+            vec![
+                (format!("{ENV_NOTIFY_REDIS_ENABLE}_PRIMARY"), "on".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_URL}_PRIMARY"), "redis://127.0.0.1:6379/0".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_RECONNECT_RETRY_ATTEMPTS}_PRIMARY"), "9".to_string()),
+                (format!("{ENV_NOTIFY_REDIS_TLS_ALLOW_INSECURE}_PRIMARY"), "off".to_string()),
+            ],
+        );
+
+        let configs: HashMap<String, KVS> = configs.into_iter().collect();
+        let redis_config = configs.get("primary").expect("redis env target should be discovered");
+
+        assert_eq!(configs.len(), 1);
+        assert_eq!(redis_config.lookup(REDIS_URL).as_deref(), Some("redis://127.0.0.1:6379/0"));
+        assert_eq!(redis_config.lookup(REDIS_RECONNECT_RETRY_ATTEMPTS).as_deref(), Some("9"));
+        assert_eq!(redis_config.lookup(REDIS_TLS_ALLOW_INSECURE).as_deref(), Some("off"));
+    }
+
+    #[test]
     fn redact_target_field_value_redacts_sensitive_fields() {
         assert_eq!(redact_target_field_value("password", "secret"), "***redacted***");
         assert_eq!(redact_target_field_value("auth_token", "token"), "***redacted***");
@@ -281,6 +330,31 @@ mod tests {
     fn redact_target_field_value_keeps_non_sensitive_fields() {
         assert_eq!(redact_target_field_value("endpoint", "https://example.com"), "https://example.com");
         assert_eq!(redact_target_field_value("queue_limit", "1000"), "1000");
+    }
+
+    #[test]
+    fn redact_dsn_string_partial_redaction() {
+        let dsn = "rustfs:secret123@tcp(mysql.example.com:3306)/rustfs_events";
+        let redacted = redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, dsn);
+        assert_eq!(redacted, "rustfs:***@tcp(mysql.example.com:3306)/rustfs_events");
+        // empty dsn_string value
+        assert_eq!(redact_target_field_value(rustfs_config::MYSQL_DSN_STRING, ""), "");
+    }
+
+    #[test]
+    fn redact_postgres_dsn_string_partial_redaction() {
+        let dsn = "postgres://rustfs:secret123@pg.example.com:5432/rustfs_events?search_path=public";
+        let redacted = redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, dsn);
+        assert_eq!(redacted, "postgres://rustfs:***@pg.example.com:5432/rustfs_events?search_path=public");
+        assert_eq!(redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, ""), "");
+    }
+
+    #[test]
+    fn redact_postgres_dsn_string_handles_case_insensitive_scheme() {
+        let dsn = "POSTGRES://rustfs:secret123@pg.example.com:5432/rustfs_events?search_path=public";
+        let redacted = redact_target_field_value(rustfs_config::POSTGRES_DSN_STRING, dsn);
+
+        assert_eq!(redacted, "postgres://rustfs:***@pg.example.com:5432/rustfs_events?search_path=public");
     }
 
     #[test]

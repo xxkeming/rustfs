@@ -74,6 +74,10 @@ mod compression_test;
 #[cfg(test)]
 mod delete_objects_versioning_test;
 
+// Regression test for signed DELETE Object?versionId requests without Content-Length.
+#[cfg(test)]
+mod delete_object_no_content_length_test;
+
 // Regression test for Issue #2252: ListObjectVersions misses newest version after put -> delete -> put
 #[cfg(test)]
 mod list_object_versions_regression_test;
@@ -106,6 +110,12 @@ mod group_delete_test;
 
 #[cfg(test)]
 mod head_object_range_test;
+
+#[cfg(test)]
+mod head_object_consistency_test;
+
+#[cfg(test)]
+mod copy_object_metadata_test;
 
 // S3 dummy-compat bucket API tests
 #[cfg(test)]

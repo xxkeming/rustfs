@@ -97,6 +97,10 @@ pub struct Disk {
     pub runtime_state: Option<String>,
     #[serde(rename = "offlineDurationSeconds", default, skip_serializing_if = "Option::is_none")]
     pub offline_duration_seconds: Option<u64>,
+    #[serde(rename = "capacityObservationSource", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_source: Option<String>,
+    #[serde(rename = "capacityObservationAgeSeconds", default, skip_serializing_if = "Option::is_none")]
+    pub capacity_observation_age_seconds: Option<u64>,
     /// Leaf physical block devices backing this disk path when the platform can resolve them.
     #[serde(rename = "physicalDeviceIds", default, skip_serializing_if = "Option::is_none")]
     pub physical_device_ids: Option<Vec<String>>,
@@ -515,6 +519,8 @@ mod tests {
             metrics: Some(DiskMetrics::default()),
             runtime_state: Some("online".to_string()),
             offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
             heal_info: None,
             used_inodes: 1000000,
             free_inodes: 9000000,
@@ -616,6 +622,8 @@ mod tests {
             physical_device_ids: Some(vec!["nvme0n1".to_string(), "nvme1n1".to_string()]),
             runtime_state: Some("online".to_string()),
             offline_duration_seconds: Some(0),
+            capacity_observation_source: None,
+            capacity_observation_age_seconds: None,
         };
 
         let mut encoded = Vec::new();
@@ -885,8 +893,8 @@ mod tests {
         network.insert("ip".to_string(), "192.168.1.100".to_string());
 
         let mut env_vars = HashMap::new();
-        env_vars.insert("RUSTFS_ROOT_USER".to_string(), "admin".to_string());
-        env_vars.insert("RUSTFS_ROOT_PASSWORD".to_string(), "password".to_string());
+        env_vars.insert("RUSTFS_ACCESS_KEY".to_string(), "admin".to_string());
+        env_vars.insert("RUSTFS_SECRET_KEY".to_string(), "password".to_string());
 
         let server_props = ServerProperties {
             state: "online".to_string(),
