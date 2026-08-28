@@ -12,30 +12,57 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
-use crate::{admin, config, version};
+use crate::runtime_sources::current_region;
+use crate::server::ShutdownHandle;
+use crate::server::runtime_sources::current_notify_interface;
+use crate::storage_api::startup::bucket_metadata::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage_api::startup::init::{
+    get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+};
+use crate::storage_api::startup::sse::log_sse_kms_key_policy_mode;
+use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_notify::notifier_global;
-use rustfs_targets::arn::{ARN, TargetIDError};
+use rustfs_notify::NotificationError;
+use rustfs_s3_types::EventName;
+use rustfs_targets::arn::{ARN, TargetID, TargetIDError};
 use rustfs_utils::get_env_usize;
 use s3s::s3_error;
 use std::env;
 use std::io::Error;
+use std::sync::Arc;
 use tracing::{debug, error, info, instrument, warn};
+
+const LOG_COMPONENT_INIT: &str = "init";
+const LOG_SUBSYSTEM_STARTUP: &str = "startup";
+const LOG_SUBSYSTEM_UPDATE: &str = "update_check";
+const LOG_SUBSYSTEM_NOTIFICATION: &str = "notification";
+const LOG_SUBSYSTEM_KMS: &str = "kms";
+const LOG_SUBSYSTEM_BUFFER: &str = "buffer_profile";
+const LOG_SUBSYSTEM_AUTOTUNER: &str = "autotuner";
+const LOG_SUBSYSTEM_PROTOCOL: &str = "protocol";
+const EVENT_PROTOCOL_RUNTIME_STATE: &str = "protocol_runtime_state";
+const EVENT_PROTOCOL_SERVER_STATE: &str = "protocol_server_state";
+
+type NotificationEventRule = (Vec<EventName>, String, String, Vec<TargetID>);
 
 #[instrument]
 pub fn print_server_info() {
     let current_year = jiff::Zoned::now().year();
-    // Use custom macros to print server information
-    info!("RustFS Object Storage Server");
-    info!("Copyright: 2024-{} RustFS, Inc", current_year);
-    info!("License: Apache-2.0 https://www.apache.org/licenses/LICENSE-2.0");
-    info!("Version: {}", version::get_version());
-    info!("Docs: https://rustfs.com/docs/");
+    info!(
+        target: "rustfs::init",
+        event = "server_identity",
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        product = "RustFS Object Storage Server",
+        version = %version::get_version(),
+        copyright_year = current_year,
+        license = "Apache-2.0",
+        docs_url = "https://rustfs.com/docs/",
+        "Server identity loaded"
+    );
 }
 
 /// Initialize the asynchronous update check system.
@@ -62,28 +89,62 @@ pub fn init_update_check() {
                 if result.update_available {
                     if let Some(latest) = &result.latest_version {
                         info!(
-                            "🚀 Version check: New version available: {} -> {} (current: {})",
-                            result.current_version, latest.version, result.current_version
+                            target: "rustfs::init",
+                            event = "update_check_result",
+                            component = LOG_COMPONENT_INIT,
+                            subsystem = LOG_SUBSYSTEM_UPDATE,
+                            result = "update_available",
+                            current_version = %result.current_version,
+                            latest_version = %latest.version,
+                            has_release_notes = latest.release_notes.is_some(),
+                            download_url = latest.download_url.as_deref().unwrap_or_default(),
+                            "Update check completed"
                         );
-                        if let Some(notes) = &latest.release_notes {
-                            info!("📝 Release notes: {}", notes);
-                        }
-                        if let Some(url) = &latest.download_url {
-                            info!("🔗 Download URL: {}", url);
-                        }
                     }
                 } else {
-                    debug!("✅ Version check: Current version is up to date: {}", result.current_version);
+                    debug!(
+                        target: "rustfs::init",
+                        event = "update_check_result",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_UPDATE,
+                        result = "up_to_date",
+                        current_version = %result.current_version,
+                        "Update check completed"
+                    );
                 }
             }
             Ok(Err(UpdateCheckError::HttpError(e))) => {
-                debug!("Version check: network error (this is normal): {}", e);
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "http_error",
+                    error = %e,
+                    "Update check skipped"
+                );
             }
             Ok(Err(e)) => {
-                debug!("Version check: failed (this is normal): {}", e);
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "failed",
+                    error = %e,
+                    "Update check failed"
+                );
             }
             Err(_) => {
-                debug!("Version check: timeout after 30 seconds (this is normal)");
+                debug!(
+                    target: "rustfs::init",
+                    event = "update_check_result",
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_UPDATE,
+                    result = "timeout",
+                    timeout_secs = 30,
+                    "Update check timed out"
+                );
             }
         }
     });
@@ -97,6 +158,57 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
         .map_err(|e| TargetIDError::InvalidFormat(e.to_string()))
 }
 
+fn notification_config_to_event_rules(
+    cfg: &s3s::dto::NotificationConfiguration,
+) -> Result<Vec<NotificationEventRule>, TargetIDError> {
+    let mut event_rules = Vec::new();
+    process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)?;
+    process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)?;
+    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)?;
+    Ok(event_rules)
+}
+
+async fn apply_bucket_notification_configuration(bucket: &str, region: &str) -> Result<bool, NotificationError> {
+    let has_notification_config = get_bucket_notification_config(bucket)
+        .await
+        .map_err(|err| NotificationError::StorageNotAvailable(format!("load bucket notification config for {bucket}: {err}")))?;
+
+    match has_notification_config {
+        Some(cfg) => {
+            info!(
+                target: "rustfs::init",
+                event = "notification_config_loaded",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                queue_configuration_count = cfg.queue_configurations.as_ref().map_or(0, Vec::len),
+                topic_configuration_count = cfg.topic_configurations.as_ref().map_or(0, Vec::len),
+                lambda_configuration_count = cfg.lambda_function_configurations.as_ref().map_or(0, Vec::len),
+                "Loaded bucket notification configuration"
+            );
+
+            let event_rules =
+                notification_config_to_event_rules(&cfg).map_err(|err| NotificationError::BucketNotification(err.to_string()))?;
+            current_notify_interface()
+                .add_event_specific_rules(bucket, region, &event_rules)
+                .await?;
+            Ok(true)
+        }
+        None => {
+            info!(
+                target: "rustfs::init",
+                event = "notification_config_missing",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                "Bucket notification configuration not found"
+            );
+            current_notify_interface().clear_bucket_notification_rules(bucket).await?;
+            Ok(false)
+        }
+    }
+}
+
 /// Add existing bucket notification configurations to the global notifier system.
 /// This function retrieves notification configurations for each bucket
 /// and registers the corresponding event rules with the notifier system.
@@ -105,61 +217,63 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let global_region = rustfs_ecstore::global::get_global_region();
-    let region = global_region
-        .as_ref()
-        .filter(|r| !r.as_str().is_empty())
-        .map(|r| r.as_str())
-        .unwrap_or_else(|| {
-            warn!(
-                "Global region is not set; attempting notification configuration for all buckets using default region '{}'.",
-                RUSTFS_REGION
-            );
-            RUSTFS_REGION
-        });
+    let region = notification_region();
     for bucket in buckets.iter() {
-        let has_notification_config = metadata_sys::get_notification_config(bucket).await.unwrap_or_else(|err| {
-            warn!("get_notification_config err {:?}", err);
-            None
-        });
-
-        match has_notification_config {
-            Some(cfg) => {
-                info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
-                    bucket = %bucket,
-                    "Bucket '{}' has existing notification configuration: {:?}", bucket, cfg);
-
-                let mut event_rules = Vec::new();
-                if let Err(e) = process_queue_configurations(&mut event_rules, cfg.queue_configurations.clone(), arn_to_target_id)
-                {
-                    error!("Failed to parse queue notification config for bucket '{}': {:?}", bucket, e);
-                }
-                if let Err(e) = process_topic_configurations(&mut event_rules, cfg.topic_configurations.clone(), arn_to_target_id)
-                {
-                    error!("Failed to parse topic notification config for bucket '{}': {:?}", bucket, e);
-                }
-                if let Err(e) =
-                    process_lambda_configurations(&mut event_rules, cfg.lambda_function_configurations.clone(), arn_to_target_id)
-                {
-                    error!("Failed to parse lambda notification config for bucket '{}': {:?}", bucket, e);
-                }
-
-                if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
-                    .await
-                    .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
-                {
-                    error!("Failed to add rules for bucket '{}': {:?}", bucket, e);
-                }
-            }
-            None => {
-                info!(
-                    target: "rustfs::main::add_bucket_notification_configuration",
-                    bucket = %bucket,
-                    "Bucket '{}' has no existing notification configuration.", bucket);
-            }
+        if let Err(err) = apply_bucket_notification_configuration(bucket, region.as_str()).await {
+            let err = s3_error!(InternalError, "Failed to add rules: {err}");
+            error!(
+                target: "rustfs::init",
+                event = "notification_rules_registration_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                bucket = %bucket,
+                region,
+                error = ?err,
+                "Failed to register bucket notification rules"
+            );
         }
     }
+}
+
+pub(crate) async fn reconcile_persisted_bucket_notification_configurations(
+    store: Arc<rustfs_notify::NotifyStore>,
+) -> Result<usize, NotificationError> {
+    let bucket_infos = store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+        .map_err(|err| NotificationError::StorageNotAvailable(format!("list buckets for notification reconciliation: {err}")))?;
+    let region = notification_region();
+    let mut configured_bucket_count = 0;
+
+    for bucket in bucket_infos {
+        if apply_bucket_notification_configuration(&bucket.name, region.as_str()).await? {
+            configured_bucket_count += 1;
+        }
+    }
+
+    Ok(configured_bucket_count)
+}
+
+fn notification_region() -> String {
+    let global_region = current_region();
+    global_region
+        .as_ref()
+        .filter(|r| !r.as_str().is_empty())
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| {
+            warn!(
+                target: "rustfs::init",
+                event = "notification_region_fallback",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_NOTIFICATION,
+                fallback_region = RUSTFS_REGION,
+                "Notification configuration falling back to default region"
+            );
+            RUSTFS_REGION.to_string()
+        })
 }
 
 /// Build KMS configuration for local backend
@@ -169,81 +283,175 @@ fn build_local_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::c
         .as_ref()
         .ok_or_else(|| Error::other("KMS key directory is required for local backend"))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::Local,
         backend_config: rustfs_kms::config::BackendConfig::Local(rustfs_kms::config::LocalConfig {
             key_dir: std::path::PathBuf::from(key_dir),
-            master_key: None,
+            master_key: cfg.kms_local_master_key.clone(),
             file_permissions: Some(0o600),
         }),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Local KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
+}
+
+/// Collect the Vault settings the command line owns.
+///
+/// Everything else — auth method, namespace, TLS, KV mount and metadata paths —
+/// is resolved from the environment by the KMS crate, so this path and
+/// [`rustfs_kms::config::KmsConfig::from_env`] cannot drift apart. The address
+/// stays required here so a missing one is still named instead of silently
+/// falling back to the crate's localhost default.
+fn vault_cli_overrides<'a>(
+    cfg: &'a config::Config,
+    backend_name: &str,
+) -> std::io::Result<rustfs_kms::config::VaultCliOverrides<'a>> {
+    let address = cfg
+        .kms_vault_address
+        .as_deref()
+        .ok_or_else(|| Error::other(format!("Vault address is required for {backend_name} backend")))?;
+
+    Ok(rustfs_kms::config::VaultCliOverrides {
+        address: Some(address),
+        token: cfg.kms_vault_token.as_deref(),
+        mount_path: cfg.kms_vault_mount_path.as_deref(),
     })
 }
 
 /// Build KMS configuration for Vault backend
 fn build_vault_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
-    let vault_address = cfg
-        .kms_vault_address
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault address is required for vault backend"))?;
-    let vault_token = cfg
-        .kms_vault_token
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault token is required for vault backend"))?;
+    let backend_config = rustfs_kms::config::vault_kv2_config_from_env(vault_cli_overrides(cfg, "vault")?)
+        .map_err(|e| Error::other(format!("Vault KMS configuration failed: {e}")))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultKv2,
-        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(rustfs_kms::config::VaultConfig {
-            address: vault_address.clone(),
-            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                token: vault_token.clone(),
-            },
-            namespace: None,
-            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
-            kv_mount: "secret".to_string(),
-            key_path_prefix: "rustfs/kms/keys".to_string(),
-            tls: None,
-        })),
+        backend_config: rustfs_kms::config::BackendConfig::VaultKv2(Box::new(backend_config)),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
-    })
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Vault KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
 }
 
 /// Build KMS configuration for Vault Transit backend
 fn build_vault_transit_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
-    let vault_address = cfg
-        .kms_vault_address
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault address is required for vault-transit backend"))?;
-    let vault_token = cfg
-        .kms_vault_token
-        .as_ref()
-        .ok_or_else(|| Error::other("Vault token is required for vault-transit backend"))?;
+    let backend_config = rustfs_kms::config::vault_transit_config_from_env(vault_cli_overrides(cfg, "vault-transit")?)
+        .map_err(|e| Error::other(format!("Vault Transit KMS configuration failed: {e}")))?;
 
-    Ok(rustfs_kms::config::KmsConfig {
+    let kms_config = rustfs_kms::config::KmsConfig {
         backend: rustfs_kms::config::KmsBackend::VaultTransit,
-        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(rustfs_kms::config::VaultTransitConfig {
-            address: vault_address.clone(),
-            auth_method: rustfs_kms::config::VaultAuthMethod::Token {
-                token: vault_token.clone(),
-            },
-            namespace: None,
-            mount_path: cfg.kms_vault_mount_path.clone().unwrap_or_else(|| "transit".to_string()),
-            tls: None,
-        })),
+        backend_config: rustfs_kms::config::BackendConfig::VaultTransit(Box::new(backend_config)),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
         default_key_id: cfg.kms_default_key_id.clone(),
         timeout: std::time::Duration::from_secs(30),
         retry_attempts: 3,
         enable_cache: true,
         cache_config: rustfs_kms::config::CacheConfig::default(),
-    })
+    };
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Vault Transit KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
+}
+
+/// Build KMS configuration for static single-key backend
+fn build_static_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    use rustfs_kms::config::{ENV_KMS_STATIC_SECRET_KEY, ENV_KMS_STATIC_SECRET_KEY_FILE, StaticConfig};
+
+    // Read secret from file first, then fall back to env var
+    let secret_str = if let Some(file_path) = rustfs_utils::get_env_opt_str(ENV_KMS_STATIC_SECRET_KEY_FILE) {
+        std::fs::read_to_string(&file_path)
+            .map_err(|e| Error::other(format!("Failed to read static KMS secret key file {file_path}: {e}")))?
+    } else {
+        rustfs_utils::get_env_str(ENV_KMS_STATIC_SECRET_KEY, "")
+    };
+
+    let secret_str = secret_str.trim();
+    if secret_str.is_empty() {
+        return Err(Error::other(format!(
+            "Static KMS requires {ENV_KMS_STATIC_SECRET_KEY} or {ENV_KMS_STATIC_SECRET_KEY_FILE} to be set"
+        )));
+    }
+
+    // Do not include the value in the error: a malformed value is likely the raw
+    // secret key itself, and this message ends up in startup logs.
+    let colon_pos = secret_str
+        .find(':')
+        .ok_or_else(|| Error::other("Static KMS secret key must be in format <key-name>:<base64-key>"))?;
+    let key_id = secret_str[..colon_pos].to_string();
+    let secret_key = secret_str[colon_pos + 1..].to_string();
+
+    if key_id.is_empty() || secret_key.is_empty() {
+        return Err(Error::other("Static KMS secret key must be in format <key-name>:<base64-key>"));
+    }
+
+    // Base64 decoding and 32-byte key length are validated by KmsConfig::validate() below
+    let static_config = StaticConfig {
+        key_id: key_id.clone(),
+        secret_key,
+    };
+
+    let kms_config = rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Static,
+        default_key_id: cfg.kms_default_key_id.clone().or(Some(key_id)),
+        backend_config: rustfs_kms::config::BackendConfig::Static(static_config),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
+        ..Default::default()
+    };
+
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("Static KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
+}
+
+/// Build KMS configuration for the AWS KMS backend
+///
+/// No credential material is read here: AWS credentials are resolved by the
+/// standard `aws-config` provider chain (environment, shared profile,
+/// container/IMDS role), so only the two non-credential settings are taken
+/// from the environment. An unresolvable region fails the backend closed when
+/// the service starts.
+fn build_aws_kms_config(cfg: &config::Config) -> std::io::Result<rustfs_kms::config::KmsConfig> {
+    use rustfs_kms::config::{AwsKmsConfig, ENV_KMS_AWS_ENDPOINT_URL, ENV_KMS_AWS_REGION};
+
+    let kms_config = rustfs_kms::config::KmsConfig {
+        backend: rustfs_kms::config::KmsBackend::Aws,
+        backend_config: rustfs_kms::config::BackendConfig::Aws(Box::new(AwsKmsConfig {
+            region: rustfs_utils::get_env_opt_str(ENV_KMS_AWS_REGION),
+            endpoint_url: rustfs_utils::get_env_opt_str(ENV_KMS_AWS_ENDPOINT_URL),
+        })),
+        allow_insecure_dev_defaults: cfg.kms_allow_insecure_dev_defaults,
+        allow_immediate_deletion: rustfs_kms::config::allow_immediate_deletion_from_env(),
+        // Keys are never auto-created on this backend: it refuses
+        // caller-named creation because AWS assigns identifiers, so the
+        // default key must already exist in AWS and be named by key id or ARN.
+        default_key_id: cfg.kms_default_key_id.clone(),
+        ..Default::default()
+    };
+
+    kms_config
+        .validate()
+        .map_err(|e| Error::other(format!("AWS KMS configuration validation failed: {e}")))?;
+    Ok(kms_config)
 }
 
 /// Configure and start KMS service
@@ -262,7 +470,15 @@ async fn configure_and_start_kms(
         .await
         .map_err(|e| Error::other(format!("Failed to start KMS: {e}")))?;
 
-    info!("KMS service configured and started successfully from {}", config_source);
+    info!(
+        target: "rustfs::init",
+        event = "kms_service_state",
+        component = LOG_COMPONENT_INIT,
+        subsystem = LOG_SUBSYSTEM_KMS,
+        state = "started",
+        config_source,
+        "KMS service state changed"
+    );
     Ok(())
 }
 
@@ -279,39 +495,91 @@ async fn configure_and_start_kms(
 #[instrument(skip(config))]
 pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
-    let service_manager = rustfs_kms::init_global_kms_service_manager();
+    let service_manager = startup_runtime_sources::init_kms_service_manager();
+
+    log_sse_kms_key_policy_mode();
+
+    // A key referenced by any bucket's encryption configuration must never be
+    // deleted. Register the gate before the service can start so every
+    // deletion-worker spawn observes it; the gate fails closed while the
+    // object store is not ready.
+    service_manager
+        .set_deletion_reference_checker(std::sync::Arc::new(crate::kms_deletion_gate::BucketEncryptionReferenceChecker));
+
+    // Route KMS management records into the server's audit pipeline. Installed
+    // before the service can start so every service version built afterwards
+    // carries it; with no audit target configured the records are dropped and
+    // KMS operations are unaffected.
+    service_manager.set_audit_sink(std::sync::Arc::new(crate::admin::handlers::kms_audit::KmsAdminAuditSink));
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
-        info!("KMS is enabled via command line, configuring and starting service...");
+        info!(
+            target: "rustfs::init",
+            event = "kms_service_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            state = "configuring",
+            config_source = "command_line",
+            "KMS service state changed"
+        );
 
         // Create KMS configuration from command line options
         let kms_config = match config.kms_backend.as_str() {
             "local" => build_local_kms_config(config)?,
             "vault" | "vault-kv2" | "vault_kv2" => build_vault_kms_config(config)?,
             "vault-transit" | "vault_transit" => build_vault_transit_kms_config(config)?,
+            "static" => build_static_kms_config(config)?,
+            "aws" | "aws-kms" | "aws_kms" => build_aws_kms_config(config)?,
             _ => return Err(Error::other(format!("Unsupported KMS backend: {}", config.kms_backend))),
         };
 
         configure_and_start_kms(&service_manager, kms_config, "command line options").await?;
     } else {
         // Try to load persisted KMS configuration from cluster storage
-        info!("Attempting to load persisted KMS configuration from cluster storage...");
+        info!(
+            target: "rustfs::init",
+            event = "kms_persisted_config_lookup",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_KMS,
+            state = "loading",
+            "Loading persisted KMS configuration"
+        );
 
         if let Some(persisted_config) = admin::handlers::kms_dynamic::load_kms_config().await {
-            info!("Found persisted KMS configuration, attempting to configure and start service...");
+            info!(
+                target: "rustfs::init",
+                event = "kms_persisted_config_lookup",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                state = "found",
+                "Loaded persisted KMS configuration"
+            );
 
             // Configure the KMS service with persisted config
             match configure_and_start_kms(&service_manager, persisted_config, "persisted configuration").await {
-                Ok(()) => {
-                    info!("KMS service configured and started successfully from persisted configuration");
-                }
+                Ok(()) => {}
                 Err(e) => {
-                    warn!("Failed to configure KMS with persisted configuration: {}", e);
+                    warn!(
+                        target: "rustfs::init",
+                        event = "kms_service_state",
+                        component = LOG_COMPONENT_INIT,
+                        subsystem = LOG_SUBSYSTEM_KMS,
+                        state = "persisted_config_failed",
+                        error = %e,
+                        "KMS service state changed"
+                    );
                 }
             }
         } else {
-            info!("No persisted KMS configuration found. KMS is ready for dynamic configuration via API.");
+            info!(
+                target: "rustfs::init",
+                event = "kms_persisted_config_lookup",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_KMS,
+                state = "not_found",
+                "No persisted KMS configuration found"
+            );
         }
     }
 
@@ -332,16 +600,33 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
 /// # Arguments
 /// * `config` - The application configuration options
 pub fn init_buffer_profile_system(config: &config::Config) {
-    use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
+    use crate::config::WorkloadProfile;
 
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
         // User explicitly disabled buffer profiling - use GeneralPurpose profile in disabled mode
-        info!("Buffer profiling disabled via --buffer-profile-disable, using GeneralPurpose profile");
-        set_buffer_profile_enabled(false);
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "disabled",
+            profile = "GeneralPurpose",
+            reason = "flag_override",
+            "Buffer profile state changed"
+        );
+        startup_runtime_sources::set_buffer_profile_enabled(false);
     } else {
         // Enabled by default: use configured workload profile
-        info!("Buffer profiling enabled with profile: {}", config.buffer_profile);
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "configuring",
+            profile = %config.buffer_profile,
+            "Buffer profile state changed"
+        );
 
         // Parse the workload profile from configuration string
         // Support a custom profile when buffer_profile is set to "custom";
@@ -354,8 +639,14 @@ pub fn init_buffer_profile_system(config: &config::Config) {
             let default_unknown = get_env_usize(ENV_RUSTFS_BUFFER_DEFAULT_SIZE, DEFAULT_BUFFER_UNKNOWN_SIZE);
 
             info!(
-                "Creating custom buffer profile: min={}, max={}, default={}",
-                min_size, max_size, default_unknown
+                target: "rustfs::init",
+                event = "buffer_profile_custom",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                min_size,
+                max_size,
+                default_size = default_unknown,
+                "Creating custom buffer profile"
             );
             WorkloadProfile::custom(
                 min_size,
@@ -372,42 +663,108 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         };
 
         // Log the selected profile for operational visibility
-        info!("Active buffer profile: {:?}", profile);
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_selected",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            profile = ?profile,
+            "Selected buffer profile"
+        );
 
-        // Create and validate buffer configuration
-        let mut buffer_config = RustFSBufferConfig::new(profile);
-        if let Err(e) = buffer_config.validate() {
-            warn!("Buffer configuration validation failed: {}. Falling back to GeneralPurpose profile.", e);
-            // Fall back to a known-good profile to avoid installing an invalid configuration
-            let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
-            info!("Using fallback buffer profile: {:?}", fallback_profile);
-            let fallback_config = RustFSBufferConfig::new(fallback_profile);
-            if let Err(e2) = fallback_config.validate() {
-                error!(
-                    "Fallback buffer configuration validation failed: {}. Aborting buffer profiling initialization.",
-                    e2
-                );
-                panic!("Failed to initialize a valid RustFS buffer configuration");
-            }
-            buffer_config = fallback_config;
-        }
+        let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
+        let Some(buffer_config) = resolve_buffer_profile_config(profile, fallback_profile) else {
+            warn!(
+                target: "rustfs::init",
+                event = "buffer_profile_validation_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                error = "all buffer profile configurations rejected",
+                fallback_profile = DEFAULT_BUFFER_PROFILE,
+                "Buffer profile initialization disabled after validation failures"
+            );
+            startup_runtime_sources::set_buffer_profile_enabled(false);
+            return;
+        };
 
         // Log the workload profile name
-        info!("Workload profile: {}", buffer_config.workload_name());
+        let workload_name = buffer_config.workload_name();
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_workload",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            workload = %workload_name,
+            "Buffer profile workload selected"
+        );
 
         // Initialize the global buffer configuration
-        init_global_buffer_config(buffer_config);
+        startup_runtime_sources::init_buffer_config(buffer_config);
 
         // Enable buffer profiling globally
-        set_buffer_profile_enabled(true);
+        startup_runtime_sources::set_buffer_profile_enabled(true);
 
-        info!("Buffer profiling system initialized successfully");
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            state = "initialized",
+            workload = %workload_name,
+            "Buffer profile state changed"
+        );
+    }
+}
+
+fn resolve_buffer_profile_config(
+    profile: crate::config::WorkloadProfile,
+    fallback_profile: crate::config::WorkloadProfile,
+) -> Option<crate::config::RustFSBufferConfig> {
+    use crate::config::RustFSBufferConfig;
+
+    let buffer_config = RustFSBufferConfig::new(profile);
+    if let Err(err) = buffer_config.validate() {
+        warn!(
+            target: "rustfs::init",
+            event = "buffer_profile_validation_failed",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            error = %err,
+            fallback_profile = DEFAULT_BUFFER_PROFILE,
+            "Buffer profile validation failed"
+        );
+
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_fallback",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            profile = ?fallback_profile,
+            "Using fallback buffer profile"
+        );
+
+        let fallback_config = RustFSBufferConfig::new(fallback_profile);
+        if let Err(fallback_err) = fallback_config.validate() {
+            error!(
+                target: "rustfs::init",
+                event = "buffer_profile_validation_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                error = %fallback_err,
+                fallback_profile = DEFAULT_BUFFER_PROFILE,
+                "Fallback buffer profile validation failed"
+            );
+            return None;
+        }
+
+        Some(fallback_config)
+    } else {
+        Some(buffer_config)
     }
 }
 
 /// Parse and normalize server address for FTP/FTPS
 /// Forces IPv4 binding to avoid libunftp IPv6 compatibility issues
-#[allow(dead_code)]
 async fn parse_and_normalize_server_address(
     address_str: &str,
 ) -> Result<std::net::SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -423,35 +780,13 @@ async fn parse_and_normalize_server_address(
 
     Ok(normalized_addr)
 }
-
-/// Start FTP/FTPS server in background with shutdown support
-/// # Arguments
-/// * `server` - The FTP/FTPS server instance
-/// * `protocol_name` - Name of the protocol (e.g., "FTP", "FTPS")
-#[allow(dead_code)]
-fn spawn_server<S>(server: S, protocol_name: &'static str) -> tokio::sync::broadcast::Sender<()>
-where
-    S: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>> + Send + 'static,
-{
-    let (shutdown_tx, _) = tokio::sync::broadcast::channel(1);
-
-    tokio::spawn(async move {
-        if let Err(e) = server.await {
-            error!("{} server error: {}", protocol_name, e);
-        }
-        info!("{} server shutdown completed", protocol_name);
-    });
-
-    shutdown_tx
-}
-
 /// Starts the auto-tuner for performance optimization if enabled via environment variable.
 ///
 /// The auto-tuner reads `RUSTFS_AUTOTUNER_ENABLED` to decide whether to run.
 /// When enabled, it spawns a background task that tunes concurrency settings
 /// every 60 seconds.
 pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
-    use crate::storage::concurrency::get_concurrency_manager;
+    use crate::storage_api::startup::init::concurrency::get_concurrency_manager;
     use rustfs_io_metrics::AutoTuner;
     use rustfs_io_metrics::TunerConfig;
     use tracing::{debug, error, info};
@@ -459,7 +794,14 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
     let autotuner_enabled = rustfs_utils::get_env_bool("RUSTFS_AUTOTUNER_ENABLED", false);
 
     if autotuner_enabled {
-        info!(target: "rustfs::main::run", "Starting auto-tuner for performance optimization");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "starting",
+            "Auto-tuner state changed"
+        );
 
         let config = TunerConfig::default();
         let manager = get_concurrency_manager();
@@ -471,23 +813,59 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
             loop {
                 tokio::select! {
                     _ = ctx.cancelled() => {
-                        info!(target: "rustfs::autotuner", "Auto-tuner shutting down");
+                        info!(
+                            target: "rustfs::init",
+                            event = "autotuner_state",
+                            component = LOG_COMPONENT_INIT,
+                            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                            state = "stopping",
+                            "Auto-tuner state changed"
+                        );
                         break;
                     }
                     _ = tokio::time::sleep(tokio::time::Duration::from_secs(60)) => {
                         if let Err(e) = tuner.tune().await {
-                            error!(target: "rustfs::autotuner", "Auto-tuner iteration failed: {}", e);
+                            error!(
+                                target: "rustfs::init",
+                                event = "autotuner_iteration",
+                                component = LOG_COMPONENT_INIT,
+                                subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                                result = "failed",
+                                error = %e,
+                                "Auto-tuner iteration completed"
+                            );
                         } else {
-                            debug!(target: "rustfs::autotuner", "Auto-tuner iteration completed");
+                            debug!(
+                                target: "rustfs::init",
+                                event = "autotuner_iteration",
+                                component = LOG_COMPONENT_INIT,
+                                subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+                                result = "ok",
+                                "Auto-tuner iteration completed"
+                            );
                         }
                     }
                 }
             }
         });
 
-        info!(target: "rustfs::main::run", "Auto-tuner started successfully");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "started",
+            "Auto-tuner state changed"
+        );
     } else {
-        info!(target: "rustfs::main::run", "Auto-tuner disabled (set RUSTFS_AUTOTUNER_ENABLED=true to enable)");
+        info!(
+            target: "rustfs::init",
+            event = "autotuner_state",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_AUTOTUNER,
+            state = "disabled",
+            "Auto-tuner state changed"
+        );
     }
 }
 
@@ -496,7 +874,7 @@ pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
 /// This function initializes the FTP server (non-encrypted) if enabled in the configuration.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{DEFAULT_FTP_ADDRESS, ENV_FTP_ADDRESS, ENV_FTP_ENABLE, ENV_FTP_EXTERNAL_IP, ENV_FTP_PASSIVE_PORTS};
@@ -505,7 +883,15 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         // Check if FTP is enabled
         let ftp_enable = rustfs_utils::get_env_bool(ENV_FTP_ENABLE, false);
         if !ftp_enable {
-            debug!("FTP system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftp",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -533,29 +919,65 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
         config.validate().await?;
 
         // Create FTP server with protocol storage client
-        let fs = crate::storage::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let passive_ports = server.config().passive_ports.clone();
 
         // Log server configuration
-        info!(
-            "FTP server configured on {} with passive ports {:?}",
-            server.config().bind_addr,
-            server.config().passive_ports
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftp",
+            state = "configured",
+            bind_addr = %bind_addr,
+            passive_ports = ?passive_ports,
+            tls_enabled = false,
+            "Protocol runtime configured"
         );
 
         // Start FTP server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("FTP server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "ftp",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("FTP server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftp",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("FTP system initialized successfully");
-        Ok(Some(shutdown_tx))
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftp",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled = false,
+            "Protocol runtime started"
+        );
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -566,7 +988,7 @@ pub async fn init_ftp_system() -> Result<Option<tokio::sync::broadcast::Sender<(
 /// the server in a background task.
 #[cfg(feature = "ftps")]
 #[instrument(skip_all)]
-pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -578,7 +1000,15 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // Check if FTPS is enabled
         let ftps_enable = rustfs_utils::get_env_bool(ENV_FTPS_ENABLE, false);
         if !ftps_enable {
-            debug!("FTPS system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftps",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -609,29 +1039,66 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
         config.validate().await?;
 
         // Create FTPS server with protocol storage client
-        let fs = crate::storage::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let passive_ports = server.config().passive_ports.clone();
+        let tls_enabled = server.config().tls_enabled;
 
         // Log server configuration
-        info!(
-            "FTPS server configured on {} with passive ports {:?}",
-            server.config().bind_addr,
-            server.config().passive_ports
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftps",
+            state = "configured",
+            bind_addr = %bind_addr,
+            passive_ports = ?passive_ports,
+            tls_enabled,
+            "Protocol runtime configured"
         );
 
         // Start FTPS server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("FTPS server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "ftps",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("FTPS server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "ftps",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("FTPS system initialized successfully");
-        Ok(Some(shutdown_tx))
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "ftps",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            "Protocol runtime started"
+        );
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -642,20 +1109,27 @@ pub async fn init_ftps_system() -> Result<Option<tokio::sync::broadcast::Sender<
 /// the server in a background task.
 #[cfg(feature = "webdav")]
 #[instrument(skip_all)]
-pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>>
-{
+pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
             DEFAULT_WEBDAV_ADDRESS, ENV_WEBDAV_ADDRESS, ENV_WEBDAV_CA_FILE, ENV_WEBDAV_CERTS_DIR, ENV_WEBDAV_ENABLE,
-            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
+            ENV_WEBDAV_MAX_BODY_SIZE, ENV_WEBDAV_MAX_CONNECTIONS, ENV_WEBDAV_REQUEST_TIMEOUT, ENV_WEBDAV_TLS_ENABLED,
         };
         use rustfs_protocols::{WebDavConfig, WebDavServer};
 
         // Check if WebDAV is enabled
         let webdav_enable = rustfs_utils::get_env_bool(ENV_WEBDAV_ENABLE, false);
         if !webdav_enable {
-            debug!("WebDAV system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "webdav",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -671,6 +1145,7 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
         let max_body_size = rustfs_utils::get_env_u64(ENV_WEBDAV_MAX_BODY_SIZE, WebDavConfig::DEFAULT_MAX_BODY_SIZE);
         let request_timeout_secs =
             rustfs_utils::get_env_u64(ENV_WEBDAV_REQUEST_TIMEOUT, WebDavConfig::DEFAULT_REQUEST_TIMEOUT_SECS);
+        let max_connections = rustfs_utils::get_env_usize(ENV_WEBDAV_MAX_CONNECTIONS, WebDavConfig::DEFAULT_MAX_CONNECTIONS);
 
         // Create WebDAV configuration
         let config = WebDavConfig {
@@ -680,28 +1155,74 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
             ca_file,
             max_body_size,
             request_timeout_secs,
+            max_connections,
         };
 
         // Create WebDAV server with protocol storage client
-        let fs = crate::storage::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
+        let bind_addr = server.config().bind_addr;
+        let tls_enabled = server.config().tls_enabled;
+        let max_body_size = server.config().max_body_size;
+        let request_timeout_secs = server.config().request_timeout_secs;
+        let max_connections = server.config().max_connections;
 
         // Log server configuration
-        info!("WebDAV server configured on {}", server.config().bind_addr);
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "webdav",
+            state = "configured",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            max_body_size,
+            request_timeout_secs,
+            max_connections,
+            "Protocol runtime configured"
+        );
 
         // Start WebDAV server in background task with proper shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("WebDAV server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "webdav",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("WebDAV server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "webdav",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("WebDAV system initialized successfully");
-        Ok(Some(shutdown_tx))
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "webdav",
+            state = "started",
+            bind_addr = %bind_addr,
+            tls_enabled,
+            "Protocol runtime started"
+        );
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
     }
 }
 
@@ -710,7 +1231,7 @@ pub async fn init_webdav_system() -> Result<Option<tokio::sync::broadcast::Sende
 /// and spawns the listener task.
 #[cfg(feature = "sftp")]
 #[instrument(skip_all)]
-pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<()>>, Box<dyn std::error::Error + Send + Sync>> {
+pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::error::Error + Send + Sync>> {
     {
         use crate::protocols::ProtocolStorageClient;
         use rustfs_config::{
@@ -723,7 +1244,15 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
 
         let enabled = rustfs_utils::get_env_bool(ENV_SFTP_ENABLE, false);
         if !enabled {
-            debug!("SFTP system is disabled");
+            debug!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_RUNTIME_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "sftp",
+                state = "disabled",
+                "Protocol runtime disabled"
+            );
             return Ok(None);
         }
 
@@ -766,25 +1295,361 @@ pub async fn init_sftp_system() -> Result<Option<tokio::sync::broadcast::Sender<
         // file has insecure permissions.
         let host_keys = SftpConfig::load_host_keys(&config.host_key_dir).await?;
 
-        let fs = crate::storage::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
 
         let server = SftpServer::new(config.clone(), storage_client, host_keys)?;
 
-        info!("SFTP server configured on {}", config.bind_addr);
+        debug!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "sftp",
+            state = "configured",
+            bind_addr = %config.bind_addr,
+            read_only = config.read_only,
+            host_key_dir = %config.host_key_dir.display(),
+            "Protocol runtime configured"
+        );
 
         // Hook into shutdown support
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
         // Start SFTP server in background task
-        tokio::spawn(async move {
+        let task_handle = tokio::spawn(async move {
             if let Err(e) = server.start(shutdown_rx).await {
-                error!("SFTP server error: {}", e);
+                error!(
+                    target: "rustfs::init",
+                    event = EVENT_PROTOCOL_SERVER_STATE,
+                    component = LOG_COMPONENT_INIT,
+                    subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                    protocol = "sftp",
+                    state = "runtime_failed",
+                    error = %e,
+                    "Protocol server failed"
+                );
             }
-            info!("SFTP server shutdown completed");
+            info!(
+                target: "rustfs::init",
+                event = EVENT_PROTOCOL_SERVER_STATE,
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_PROTOCOL,
+                protocol = "sftp",
+                state = "stopped",
+                "Protocol server stopped"
+            );
         });
 
-        info!("SFTP system initialized successfully");
-        Ok(Some(shutdown_tx))
+        info!(
+            target: "rustfs::init",
+            event = EVENT_PROTOCOL_RUNTIME_STATE,
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_PROTOCOL,
+            protocol = "sftp",
+            state = "started",
+            bind_addr = %config.bind_addr,
+            read_only = config.read_only,
+            "Protocol runtime started"
+        );
+        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_aws_kms_config, build_vault_kms_config, build_vault_transit_kms_config, notification_config_to_event_rules,
+        resolve_buffer_profile_config,
+    };
+    use crate::config::{BufferConfig, WorkloadProfile};
+    use rustfs_config::KI_B;
+    use rustfs_s3_types::EventName;
+    use s3s::dto::{
+        FilterRule, FilterRuleName, NotificationConfiguration, NotificationConfigurationFilter, QueueConfiguration, S3KeyFilter,
+    };
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
+        let invalid_primary = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid_primary, WorkloadProfile::GeneralPurpose)
+            .expect("fallback profile should be accepted");
+
+        assert_eq!(resolved.workload, WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_none_when_primary_and_fallback_are_invalid() {
+        let invalid = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn notification_config_to_event_rules_preserves_target_and_filters() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+                queue_arn: "arn:rustfs:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
+                filter: Some(NotificationConfigurationFilter {
+                    key: Some(S3KeyFilter {
+                        filter_rules: Some(vec![
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::PREFIX)),
+                                value: Some("uploads/".to_string()),
+                            },
+                            FilterRule {
+                                name: Some(FilterRuleName::from_static(FilterRuleName::SUFFIX)),
+                                value: Some(".json".to_string()),
+                            },
+                        ]),
+                    }),
+                }),
+                id: Some("primary".to_string()),
+            }]),
+            topic_configurations: None,
+            lambda_function_configurations: None,
+            event_bridge_configuration: None,
+        };
+
+        let rules = notification_config_to_event_rules(&cfg).expect("valid notification config should map to event rules");
+
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].0, vec![EventName::ObjectCreatedPut]);
+        assert_eq!(rules[0].1, "uploads/");
+        assert_eq!(rules[0].2, ".json");
+        assert_eq!(rules[0].3.len(), 1);
+        assert_eq!(rules[0].3[0].id, "rustfs_to_activemq");
+        assert_eq!(rules[0].3[0].name, "mqtt");
+    }
+
+    #[test]
+    fn notification_config_to_event_rules_rejects_invalid_arn() {
+        let cfg = NotificationConfiguration {
+            queue_configurations: Some(vec![QueueConfiguration {
+                events: vec!["s3:ObjectCreated:Put".to_string().into()],
+                queue_arn: "arn:aws:sqs:us-east-1:rustfs_to_activemq:mqtt".to_string(),
+                filter: None,
+                id: None,
+            }]),
+            topic_configurations: None,
+            lambda_function_configurations: None,
+            event_bridge_configuration: None,
+        };
+
+        let err = notification_config_to_event_rules(&cfg).expect_err("invalid ARN partition must fail");
+
+        assert!(err.to_string().contains("Invalid ARN"), "unexpected error: {err}");
+    }
+
+    fn vault_kms_test_config(backend: &str) -> crate::config::Config {
+        let mut config = crate::config::Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-vault-kms".to_string()]);
+        config.kms_enable = true;
+        config.kms_backend = backend.to_string();
+        config.kms_vault_address = Some("https://vault.example.com:8200".to_string());
+        config
+    }
+
+    /// The Vault auth method and the settings the CLI has no flag for come from
+    /// the environment, so startup and `KmsConfig::from_env` cannot disagree.
+    /// Regression: startup used to hardcode token auth and require a token,
+    /// which made every non-token method unreachable through `RUSTFS_KMS_ENABLE`.
+    #[test]
+    fn build_vault_transit_kms_config_resolves_auth_and_mounts_from_env() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", Some("env-role-id")),
+                ("RUSTFS_KMS_VAULT_APPROLE_SECRET_ID", Some("env-secret-id")),
+                ("RUSTFS_KMS_VAULT_APPROLE_SECRET_ID_FILE", None),
+                ("RUSTFS_KMS_VAULT_NAMESPACE", Some("team-a")),
+                ("RUSTFS_KMS_VAULT_TRANSIT_METADATA_KV_MOUNT", Some("rustfs-kv")),
+            ],
+            || {
+                build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                    .expect("vault transit KMS configuration should build")
+            },
+        );
+
+        let vault = config.vault_transit_config().expect("vault transit backend config");
+        let rustfs_kms::config::VaultAuthMethod::AppRole { role_id, secret_id, .. } = &vault.auth_method else {
+            panic!("approle in the environment must select AppRole auth, got {:?}", vault.auth_method);
+        };
+        assert_eq!(role_id, "env-role-id");
+        assert_eq!(secret_id, "env-secret-id");
+        assert_eq!(vault.namespace.as_deref(), Some("team-a"));
+        assert_eq!(vault.metadata_kv_mount, "rustfs-kv");
+    }
+
+    /// Kubernetes auth needs no credential in the environment at all: the role
+    /// selects it and the pod's projected ServiceAccount token supplies the rest.
+    #[test]
+    fn build_vault_transit_kms_config_selects_kubernetes_auth() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", Some("rustfs")),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_MOUNT", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_JWT_PATH", None),
+            ],
+            || {
+                build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                    .expect("vault transit KMS configuration should build")
+            },
+        );
+
+        let vault = config.vault_transit_config().expect("vault transit backend config");
+        let rustfs_kms::config::VaultAuthMethod::Kubernetes {
+            role, mount, jwt_path, ..
+        } = &vault.auth_method
+        else {
+            panic!(
+                "a kubernetes role in the environment must select Kubernetes auth, got {:?}",
+                vault.auth_method
+            );
+        };
+        assert_eq!(role, "rustfs");
+        assert_eq!(mount, rustfs_kms::config::DEFAULT_VAULT_KUBERNETES_MOUNT);
+        assert_eq!(jwt_path, std::path::Path::new(rustfs_kms::config::DEFAULT_VAULT_KUBERNETES_JWT_PATH));
+    }
+
+    /// Two credential sources leave the effective identity ambiguous, so
+    /// startup refuses rather than picking one.
+    #[test]
+    fn build_vault_kms_config_refuses_two_auth_methods() {
+        temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", None),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", Some("/run/vault-agent/token")),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", Some("rustfs")),
+            ],
+            || {
+                let error = build_vault_kms_config(&vault_kms_test_config("vault"))
+                    .expect_err("two Vault auth methods must not start the server");
+                assert!(error.to_string().contains("exactly one"), "unexpected error: {error}");
+            },
+        );
+    }
+
+    /// The KV2 backend has its own builder, so the key-location settings have
+    /// to be proven separately from the Transit one: pointing at the wrong KV
+    /// mount or prefix makes existing keys look absent.
+    #[test]
+    fn build_vault_kms_config_resolves_kv_mount_and_prefix_from_env() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_VAULT_TOKEN", Some("a-real-token")),
+                ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+                ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+                ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+                ("RUSTFS_KMS_VAULT_KV_MOUNT", Some("rustfs-kv")),
+                ("RUSTFS_KMS_VAULT_KEY_PREFIX", Some("tenant/keys")),
+            ],
+            || build_vault_kms_config(&vault_kms_test_config("vault")).expect("vault KV2 KMS configuration should build"),
+        );
+
+        let vault = config.vault_config().expect("vault kv2 backend config");
+        assert_eq!(vault.kv_mount, "rustfs-kv");
+        assert_eq!(vault.key_path_prefix, "tenant/keys");
+    }
+
+    /// Skipping TLS verification was silently dropped on this path before, so
+    /// an operator who asked for it still got a verified connection. Now that it
+    /// is honoured it must fail closed without the development opt-in, rather
+    /// than quietly downgrading the Vault connection.
+    #[test]
+    fn build_vault_transit_kms_config_refuses_skip_tls_verify_without_opt_in() {
+        let vars = [
+            ("RUSTFS_KMS_VAULT_TOKEN", Some("a-real-token")),
+            ("RUSTFS_KMS_VAULT_TOKEN_FILE", None),
+            ("RUSTFS_KMS_VAULT_APPROLE_ROLE_ID", None),
+            ("RUSTFS_KMS_VAULT_KUBERNETES_ROLE", None),
+            ("RUSTFS_KMS_VAULT_SKIP_TLS_VERIFY", Some("true")),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let error = build_vault_transit_kms_config(&vault_kms_test_config("vault-transit"))
+                .expect_err("skipping TLS verification must not start the server");
+            assert!(error.to_string().contains("TLS"), "unexpected error: {error}");
+        });
+
+        temp_env::with_vars(vars, || {
+            let mut cfg = vault_kms_test_config("vault-transit");
+            cfg.kms_allow_insecure_dev_defaults = true;
+            let config = build_vault_transit_kms_config(&cfg).expect("the development opt-in should accept skip-verify");
+            let vault = config.vault_transit_config().expect("vault transit backend config");
+            assert!(vault.tls.as_ref().is_some_and(|tls| tls.skip_verify));
+        });
+    }
+
+    fn aws_kms_test_config() -> crate::config::Config {
+        let mut config = crate::config::Config::new("127.0.0.1:9000", vec!["/tmp/rustfs-aws-kms".to_string()]);
+        config.kms_enable = true;
+        config.kms_backend = "aws".to_string();
+        config.kms_default_key_id = Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd".to_string());
+        config
+    }
+
+    /// Startup takes only the two non-credential AWS settings from the
+    /// environment; credentials stay with the `aws-config` provider chain.
+    #[test]
+    fn build_aws_kms_config_reads_only_non_credential_settings() {
+        let config = temp_env::with_vars(
+            [
+                ("RUSTFS_KMS_AWS_REGION", Some("eu-central-1")),
+                ("RUSTFS_KMS_AWS_ENDPOINT_URL", None),
+            ],
+            || build_aws_kms_config(&aws_kms_test_config()).expect("aws KMS configuration should build"),
+        );
+
+        assert_eq!(config.backend, rustfs_kms::config::KmsBackend::Aws);
+        let aws = config.aws_kms_config().expect("aws backend config");
+        assert_eq!(aws.region.as_deref(), Some("eu-central-1"));
+        assert_eq!(aws.endpoint_url, None);
+        assert_eq!(config.default_key_id.as_deref(), Some("arn:aws:kms:us-east-1:111122223333:key/1234abcd"));
+    }
+
+    /// A plaintext endpoint override exposes every KMS request, plaintext data
+    /// keys included, so startup refuses it without the development opt-in.
+    #[test]
+    fn build_aws_kms_config_refuses_a_plaintext_endpoint_without_opt_in() {
+        let vars = [
+            ("RUSTFS_KMS_AWS_REGION", Some("us-east-1")),
+            ("RUSTFS_KMS_AWS_ENDPOINT_URL", Some("http://localhost:4566")),
+        ];
+
+        temp_env::with_vars(vars, || {
+            let error =
+                build_aws_kms_config(&aws_kms_test_config()).expect_err("a plaintext AWS endpoint must not start the server");
+            assert!(error.to_string().contains("https"), "unexpected error: {error}");
+        });
+
+        temp_env::with_vars(vars, || {
+            let mut config = aws_kms_test_config();
+            config.kms_allow_insecure_dev_defaults = true;
+            let config = build_aws_kms_config(&config).expect("the development opt-in should accept a plaintext endpoint");
+            assert_eq!(
+                config.aws_kms_config().expect("aws backend config").endpoint_url.as_deref(),
+                Some("http://localhost:4566")
+            );
+        });
     }
 }

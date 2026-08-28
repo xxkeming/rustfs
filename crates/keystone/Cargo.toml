@@ -25,32 +25,63 @@ keywords = ["rustfs", "openstack", "keystone", "authentication", "s3"]
 categories = ["authentication", "web-programming"]
 authors.workspace = true
 
+[lints]
+workspace = true
+
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/reqwest-0-13",
+    "rustfs-credentials/hotpath",
+    "rustfs-policy/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
-tokio = { workspace = true, features = ["full"] }
-reqwest = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
+hotpath.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+reqwest = { workspace = true, features = ["json"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-time = { workspace = true }
-moka = { workspace = true }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+moka = { workspace = true, features = ["future"] }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
-rustfs-utils = { workspace = true }
+rustfs-utils = { workspace = true, features = ["egress"] }
+url = { workspace = true }
 # Middleware dependencies
-tower = { workspace = true }
+tower = { workspace = true, features = ["timeout"] }
 http = { workspace = true }
-hyper = { workspace = true, features = ["server"] }
+hyper = { workspace = true, features = ["server", "http2", "http1"] }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["serde"] }
 futures = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tower = { workspace = true, features = ["util"] }
-hyper = { workspace = true, features = ["server"] }
-serde_json = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "fs", "macros", "rt", "time"] }
+tower = { workspace = true, features = ["util", "timeout"] }
+hyper = { workspace = true, features = ["server", "http2", "http1"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 temp-env = { workspace = true }
 
 [[test]]

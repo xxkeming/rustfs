@@ -28,32 +28,58 @@ documentation = "https://docs.rs/rustfs-policy/latest/rustfs_policy/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-crypto/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-crypto/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-crypto/hotpath-cpu",
+]
+
 [dependencies]
 rustfs-credentials = { workspace = true }
-rustfs-config = { workspace = true, features = ["constants", "opa"] }
-tokio = { workspace = true, features = ["full"] }
+rustfs-config = { workspace = true, features = ["opa"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
 time = { workspace = true, features = ["serde", "parsing", "formatting", "macros"] }
 serde = { workspace = true, features = ["derive", "rc"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 strum = { workspace = true, features = ["derive"] }
 rustfs-crypto = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 base64-simd = { workspace = true }
-jsonwebtoken = { workspace = true }
+jsonwebtoken = { workspace = true, features = ["aws_lc_rs"] }
 regex = { workspace = true }
-reqwest.workspace = true
-chrono.workspace = true
+reqwest = { workspace = true, features = ["json"] }
+jiff = { workspace = true }
 tracing.workspace = true
-moka.workspace = true
+moka = { workspace = true, features = ["future"] }
 async-trait.workspace = true
 futures.workspace = true
 pollster.workspace = true
+hotpath.workspace = true
 
 [dev-dependencies]
 pollster.workspace = true
+proptest = "1"
 test-case.workspace = true
 temp-env = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 [lib]
 doctest = false

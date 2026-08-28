@@ -32,17 +32,58 @@ workspace = true
 name = "gproto"
 path = "src/main.rs"
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-common/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-tls-runtime/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-io-metrics/hotpath-alloc",
+    "rustfs-tls-runtime/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-io-metrics/hotpath-cpu",
+    "rustfs-tls-runtime/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-common.workspace = true
+rustfs-heal-contracts.workspace = true
+rustfs-io-metrics.workspace = true
 rustfs-config.workspace = true
+rustfs-tls-runtime.workspace = true
 rustfs-utils.workspace = true
 flatbuffers = { workspace = true }
 prost = { workspace = true }
-tonic = { workspace = true, features = ["transport"] }
+tonic = { workspace = true, features = ["transport", "tls-native-roots", "tls-aws-lc", "gzip", "deflate"] }
 tonic-prost = { workspace = true }
 tonic-prost-build = { workspace = true }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+uuid = { workspace = true }
 
 [lib]
-test = false
 doctest = false
+
+[dev-dependencies]
+serde_json = { workspace = true }
+temp-env = { workspace = true }

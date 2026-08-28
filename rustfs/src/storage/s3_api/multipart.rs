@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo};
+use crate::storage::storage_api::effective_storage_class;
+use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
+    ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
+};
+use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
@@ -36,6 +39,11 @@ pub(crate) struct ListMultipartUploadsParams {
 pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
     let owner = rustfs_owner();
     let initiator = rustfs_initiator();
+    let transformed_parts = rustfs_utils::http::contains_key_str(&res.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION)
+        || res
+            .user_defined
+            .keys()
+            .any(|key| rustfs_utils::http::is_object_encryption_marker(key));
 
     ListPartsOutput {
         bucket: Some(res.bucket),
@@ -48,7 +56,14 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
                     e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
                     part_number: p.part_num.try_into().ok(),
-                    size: p.size.try_into().ok(),
+                    // Compressed parts store fewer bytes than the client sent; S3
+                    // semantics report the uploaded (logical) size, matching
+                    // GetObjectAttributes ObjectParts.
+                    size: if p.actual_size > 0 || (transformed_parts && p.actual_size == 0) {
+                        Some(p.actual_size)
+                    } else {
+                        p.size.try_into().ok()
+                    },
                     ..Default::default()
                 })
                 .collect(),
@@ -59,11 +74,11 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
         next_part_number_marker: res.next_part_number_marker.try_into().ok(),
         max_parts: res.max_parts.try_into().ok(),
         part_number_marker: res.part_number_marker.try_into().ok(),
-        storage_class: if res.storage_class.is_empty() {
-            None
-        } else {
-            Some(res.storage_class.into())
-        },
+        storage_class: Some(
+            effective_storage_class((!res.storage_class.is_empty()).then_some(res.storage_class.as_str()), None)
+                .to_string()
+                .into(),
+        ),
         ..Default::default()
     }
 }
@@ -103,6 +118,17 @@ pub(crate) fn parse_list_parts_params(
     })
 }
 
+pub(crate) fn parse_upload_part_number(part_number: i32) -> Result<usize, S3Error> {
+    if !(1..=MAX_MULTIPART_PART_NUMBER).contains(&part_number) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            format!("partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
+        ));
+    }
+
+    Ok(part_number as usize)
+}
+
 pub(crate) fn parse_list_multipart_uploads_params(
     prefix: Option<String>,
     key_marker: Option<String>,
@@ -126,7 +152,7 @@ pub(crate) fn parse_list_multipart_uploads_params(
     if let Some(key_marker) = &key_marker
         && !key_marker.starts_with(prefix.as_str())
     {
-        return Err(S3Error::with_message(S3ErrorCode::NotImplemented, "Invalid key marker".to_string()));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid key marker".to_string()));
     }
 
     Ok(ListMultipartUploadsParams {
@@ -141,12 +167,17 @@ pub(crate) fn build_list_multipart_uploads_output(
     prefix: String,
     result: ListMultipartsInfo,
 ) -> ListMultipartUploadsOutput {
+    let owner = rustfs_owner();
+    let initiator = rustfs_initiator();
+
     ListMultipartUploadsOutput {
         bucket: Some(bucket),
         prefix: Some(prefix),
         delimiter: result.delimiter,
         key_marker: result.key_marker,
         upload_id_marker: result.upload_id_marker,
+        next_key_marker: result.next_key_marker,
+        next_upload_id_marker: result.next_upload_id_marker,
         max_uploads: Some(result.max_uploads as i32),
         is_truncated: Some(result.is_truncated),
         uploads: Some(
@@ -157,6 +188,8 @@ pub(crate) fn build_list_multipart_uploads_output(
                     key: Some(u.object),
                     upload_id: Some(u.upload_id),
                     initiated: u.initiated.map(Timestamp::from),
+                    owner: Some(owner.clone()),
+                    initiator: Some(initiator.clone()),
                     ..Default::default()
                 })
                 .collect(),
@@ -176,11 +209,13 @@ pub(crate) fn build_list_multipart_uploads_output(
 mod tests {
     use super::{
         MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
-        parse_list_multipart_uploads_params, parse_list_parts_params,
+        parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
     };
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use rustfs_ecstore::client::object_api_utils::to_s3s_etag;
-    use rustfs_ecstore::store_api::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
+        ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo,
+    };
+    use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
     use time::OffsetDateTime;
@@ -225,9 +260,119 @@ mod tests {
     }
 
     #[test]
-    fn test_list_parts_output_handles_empty_storage_class_and_overflow_markers() {
+    fn test_list_parts_output_reports_logical_size_for_compressed_parts() {
         let input = ListPartsInfo {
-            storage_class: String::new(),
+            bucket: "bucket-a".to_string(),
+            object: "obj-a".to_string(),
+            upload_id: "upload-a".to_string(),
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Stored (compressed) bytes on disk vs. the logical size the client uploaded.
+                size: 1_024,
+                actual_size: 8_388_608,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].size,
+            Some(8_388_608),
+            "compressed parts must report the uploaded logical size, not the stored size"
+        );
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_compressed_parts() {
+        let mut user_defined = std::collections::HashMap::new();
+        rustfs_utils::http::insert_str(&mut user_defined, rustfs_utils::http::SUFFIX_COMPRESSION, "S2".to_string());
+        let input = ListPartsInfo {
+            user_defined,
+            parts: vec![PartInfo {
+                part_num: 1,
+                // Legacy SSE writes an 8-byte end record for an empty part.
+                size: 8,
+                actual_size: 0,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+    }
+
+    #[test]
+    fn test_list_parts_output_reports_zero_logical_size_for_encrypted_parts() {
+        let input = ListPartsInfo {
+            user_defined: std::collections::HashMap::from([(
+                rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION.to_string(),
+                "AES256".to_string(),
+            )]),
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 8,
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 8,
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts[0].size, Some(0));
+        assert_eq!(parts[1].size, Some(8));
+    }
+
+    #[test]
+    fn test_list_parts_output_falls_back_to_stored_size_when_actual_size_unknown() {
+        let input = ListPartsInfo {
+            parts: vec![
+                PartInfo {
+                    part_num: 1,
+                    size: 1_024,
+                    // Uncompressed parts leave actual_size unset.
+                    actual_size: 0,
+                    ..Default::default()
+                },
+                PartInfo {
+                    part_num: 2,
+                    size: 1_024,
+                    // Legacy/unknown sentinel must not leak a negative size to clients.
+                    actual_size: -1,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let output = build_list_parts_output(input);
+        let parts = output.parts.as_ref().expect("parts should be present");
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].size, Some(1024));
+        assert_eq!(parts[1].size, Some(1024));
+    }
+
+    #[test]
+    fn test_list_parts_output_normalizes_legacy_storage_class_and_handles_overflow_markers() {
+        let input = ListPartsInfo {
+            storage_class: "STANDARD_IA".to_string(),
             part_number_marker: usize::MAX,
             next_part_number_marker: usize::MAX,
             max_parts: usize::MAX,
@@ -242,13 +387,20 @@ mod tests {
         let output = build_list_parts_output(input);
         let parts = output.parts.as_ref().expect("parts should be present");
 
-        assert_eq!(output.storage_class, None);
+        assert_eq!(output.storage_class.as_ref().map(|value| value.as_str()), Some("STANDARD"));
         assert_eq!(output.part_number_marker, None);
         assert_eq!(output.next_part_number_marker, None);
         assert_eq!(output.max_parts, None);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, None);
         assert_eq!(parts[0].size, None);
+
+        let output = build_list_parts_output(ListPartsInfo::default());
+        assert_eq!(
+            output.storage_class.as_ref().map(|value| value.as_str()),
+            Some("STANDARD"),
+            "legacy uploads without a stored class must report their effective STANDARD layout"
+        );
     }
 
     #[test]
@@ -257,6 +409,8 @@ mod tests {
             delimiter: Some("/".to_string()),
             key_marker: Some("key-marker".to_string()),
             upload_id_marker: Some("upload-id-marker".to_string()),
+            next_key_marker: Some("next-key-marker".to_string()),
+            next_upload_id_marker: Some("next-upload-id-marker".to_string()),
             max_uploads: 1000,
             is_truncated: true,
             uploads: vec![MultipartInfo {
@@ -279,6 +433,8 @@ mod tests {
         assert_eq!(output.delimiter.as_deref(), Some("/"));
         assert_eq!(output.key_marker.as_deref(), Some("key-marker"));
         assert_eq!(output.upload_id_marker.as_deref(), Some("upload-id-marker"));
+        assert_eq!(output.next_key_marker.as_deref(), Some("next-key-marker"));
+        assert_eq!(output.next_upload_id_marker.as_deref(), Some("next-upload-id-marker"));
         assert_eq!(output.max_uploads, Some(1000));
         assert_eq!(output.is_truncated, Some(true));
 
@@ -286,6 +442,8 @@ mod tests {
         assert_eq!(uploads[0].key.as_deref(), Some("obj-a"));
         assert_eq!(uploads[0].upload_id.as_deref(), Some("upload-a"));
         assert_eq!(uploads[0].initiated, Some(Timestamp::from(OffsetDateTime::UNIX_EPOCH)));
+        assert_eq!(uploads[0].owner, Some(rustfs_owner()));
+        assert_eq!(uploads[0].initiator, Some(rustfs_initiator()));
 
         assert_eq!(common_prefixes.len(), 2);
         assert_eq!(common_prefixes[0].prefix.as_deref(), Some("prefix-a/"));
@@ -320,6 +478,21 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_upload_part_number_accepts_s3_range() {
+        assert_eq!(parse_upload_part_number(1).expect("part 1 should be valid"), 1);
+        assert_eq!(parse_upload_part_number(10000).expect("part 10000 should be valid"), 10000);
+    }
+
+    #[test]
+    fn test_parse_upload_part_number_rejects_out_of_s3_range() {
+        for part_number in [-1, 0, 10001] {
+            let err = parse_upload_part_number(part_number).expect_err("expected invalid part number");
+            assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
+            assert_eq!(err.message(), Some("partNumber must be between 1 and 10000"));
+        }
+    }
+
+    #[test]
     fn test_parse_list_multipart_uploads_params_defaults_and_valid_values() {
         let parsed =
             parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("prefix/key-marker".to_string()), Some(100))
@@ -339,7 +512,7 @@ mod tests {
         let err = parse_list_multipart_uploads_params(Some("prefix/".to_string()), Some("other/key-marker".to_string()), None)
             .expect_err("expected invalid key marker");
 
-        assert_eq!(*err.code(), S3ErrorCode::NotImplemented);
+        assert_eq!(*err.code(), S3ErrorCode::InvalidArgument);
         assert_eq!(err.message(), Some("Invalid key marker"));
     }
 

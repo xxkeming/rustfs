@@ -1,0 +1,350 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(unused_mut)]
+#![allow(unused_assignments)]
+#![allow(unused_must_use)]
+#![allow(clippy::all)]
+
+use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
+use std::sync::Arc;
+
+use bytes::Bytes;
+use google_cloud_auth::credentials::Credentials;
+use google_cloud_auth::credentials::user_account::Builder;
+use google_cloud_storage as gcs;
+use google_cloud_storage::client::Storage;
+use google_cloud_storage::client::StorageControl;
+use std::convert::TryFrom;
+
+use crate::services::tier::{
+    tier_config::TierGCS,
+    warm_backend::{WarmBackend, WarmBackendGetOpts},
+};
+use rustfs_s3_client::{
+    admin_handler_utils::AdminError,
+    api_put_object::PutObjectOptions,
+    transition_api::{Options, ReadCloser, ReaderImpl},
+};
+use rustfs_utils::egress::validate_outbound_url;
+use tracing::warn;
+
+const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
+
+fn parse_generation(remote_version: &str) -> Result<Option<i64>, Error> {
+    if remote_version.is_empty() {
+        return Ok(None);
+    }
+    let generation = remote_version
+        .parse::<i64>()
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "GCS remote version is not a valid generation"))?;
+    if generation <= 0 {
+        return Err(Error::new(ErrorKind::InvalidData, "GCS remote version generation must be positive"));
+    }
+    Ok(Some(generation))
+}
+
+pub struct WarmBackendGCS {
+    pub client: Arc<Storage>,
+    pub control: Arc<StorageControl>,
+    pub bucket: String,
+    pub prefix: String,
+}
+
+impl WarmBackendGCS {
+    pub async fn new(conf: &TierGCS, tier: &str) -> Result<Self, std::io::Error> {
+        if conf.creds == "" {
+            return Err(std::io::Error::other("both access and secret keys are required"));
+        }
+
+        if conf.bucket == "" {
+            return Err(std::io::Error::other("no bucket name was provided"));
+        }
+
+        if !conf.endpoint.is_empty() {
+            let endpoint_url = url::Url::parse(&conf.endpoint).map_err(|e| std::io::Error::other(e.to_string()))?;
+            validate_outbound_url(&endpoint_url)
+                .map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
+        }
+
+        let authorized_user = serde_json::from_str(&conf.creds)?;
+        let credentials = Builder::new(authorized_user)
+            //.with_retry_policy(AlwaysRetry.with_attempt_limit(3))
+            //.with_backoff_policy(backoff)
+            .build()
+            .map_err(|e| std::io::Error::other(format!("Invalid credentials JSON: {}", e)))?;
+
+        let Ok(client) = Storage::builder()
+            .with_endpoint(conf.endpoint.clone())
+            .with_credentials(credentials.clone())
+            .build()
+            .await
+        else {
+            return Err(std::io::Error::other("Storage::builder error"));
+        };
+        let client = Arc::new(client);
+        // Control-plane client: the data-plane `Storage` client cannot delete or list objects;
+        // delete_object/list_objects live on StorageControl.
+        let Ok(control) = StorageControl::builder().with_credentials(credentials).build().await else {
+            return Err(std::io::Error::other("StorageControl::builder error"));
+        };
+        let control = Arc::new(control);
+        Ok(Self {
+            client,
+            control,
+            bucket: conf.bucket.clone(),
+            prefix: conf.prefix.strip_suffix("/").unwrap_or(&conf.prefix).to_owned(),
+        })
+    }
+
+    pub fn get_dest(&self, object: &str) -> String {
+        let mut dest_obj = object.to_string();
+        if self.prefix != "" {
+            dest_obj = format!("{}/{}", &self.prefix, object);
+        }
+        return dest_obj;
+    }
+}
+
+#[async_trait::async_trait]
+impl WarmBackend for WarmBackendGCS {
+    fn validate_remote_version_id(&self, remote_version_id: &str) -> Result<(), std::io::Error> {
+        parse_generation(remote_version_id).map(|_| ())
+    }
+
+    async fn put_with_meta(
+        &self,
+        object: &str,
+        r: ReaderImpl,
+        length: i64,
+        meta: HashMap<String, String>,
+    ) -> Result<String, std::io::Error> {
+        let d = match r {
+            ReaderImpl::Body(content_body) => content_body.to_vec(),
+            ReaderImpl::ObjectBody(mut content_body) => content_body.read_all().await?,
+        };
+        let Ok(res) = Box::pin(
+            self.client
+                .write_object(&self.bucket, &self.get_dest(object), Bytes::from(d))
+                .send_buffered(),
+        )
+        .await
+        else {
+            return Err(std::io::Error::other("write_object error"));
+        };
+        //self.ToObjectError(err, object)
+        Ok(res.generation.to_string())
+    }
+
+    async fn put(&self, object: &str, r: ReaderImpl, length: i64) -> Result<String, std::io::Error> {
+        self.put_with_meta(object, r, length, HashMap::new()).await
+    }
+
+    async fn get(&self, object: &str, rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
+        let mut req = self.client.read_object(&self.bucket, &self.get_dest(object));
+        if let Some(generation) = parse_generation(rv)? {
+            req = req.set_generation(generation);
+        }
+
+        // Honor the requested byte range so Range GETs on tiered objects return the exact
+        // interval instead of the whole object (matches the s3/s3sdk/rustfs warm backends).
+        if opts.start_offset >= 0 && opts.length > 0 {
+            let offset: u64 = opts
+                .start_offset
+                .try_into()
+                .map_err(|_| std::io::Error::other("invalid range: negative start_offset"))?;
+            let count: u64 = opts
+                .length
+                .try_into()
+                .map_err(|_| std::io::Error::other("invalid range: negative length"))?;
+            req = req.set_read_range(google_cloud_storage::model_ext::ReadRange::segment(offset, count));
+        }
+
+        let Ok(mut reader) = req.send().await else {
+            return Err(std::io::Error::other("read_object error"));
+        };
+        let mut contents = Vec::new();
+        while let Ok(Some(chunk)) = reader.next().await.transpose() {
+            contents.extend_from_slice(&chunk);
+        }
+        Ok(ReadCloser::new(std::io::Cursor::new(contents)))
+    }
+
+    async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {
+        // gRPC v2 DeleteObject requires the bucket in resource-name form. Without this the
+        // deleted tiered object was never removed from GCS (empty impl returned Ok), leaking
+        // remote data forever.
+        let mut req = self
+            .control
+            .delete_object()
+            .set_bucket(format!("projects/_/buckets/{}", self.bucket))
+            .set_object(self.get_dest(object));
+        if let Some(generation) = parse_generation(rv)? {
+            req = req.set_generation(generation);
+        }
+        req.send().await.map_err(|e| std::io::Error::other(e.to_string()))?;
+        Ok(())
+    }
+
+    async fn in_use(&self) -> Result<bool, std::io::Error> {
+        // Scope the listing to this tier's prefix (matching the other warm backends) and only
+        // need to know whether a single object exists.
+        let resp = self
+            .control
+            .list_objects()
+            .set_parent(format!("projects/_/buckets/{}", self.bucket))
+            .set_prefix(self.prefix.clone())
+            .set_page_size(1)
+            .send()
+            .await
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
+        Ok(!resp.objects.is_empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WarmBackendGCS;
+    use super::parse_generation;
+    use crate::services::tier::tier_config::TierGCS;
+    use std::io::ErrorKind;
+
+    #[test]
+    fn generation_parser_preserves_exact_numeric_versions() {
+        assert_eq!(parse_generation("").expect("empty generation means no version condition"), None);
+        assert_eq!(parse_generation("1").expect("minimum generation should parse"), Some(1));
+        assert_eq!(
+            parse_generation(&i64::MAX.to_string()).expect("maximum generation should parse"),
+            Some(i64::MAX)
+        );
+    }
+
+    #[test]
+    fn generation_parser_rejects_unknown_or_non_positive_versions() {
+        for value in ["unknown", "1.0", "-1", "0", "9223372036854775808"] {
+            let err = parse_generation(value).expect_err("unknown generation must fail closed");
+            assert_eq!(err.kind(), ErrorKind::InvalidData, "{value}");
+        }
+    }
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_credential_setup() {
+        let conf = TierGCS {
+            endpoint: "https://127.0.0.1:9000".to_string(),
+            creds: "not-json".to_string(),
+            bucket: "tier-bucket".to_string(),
+            ..Default::default()
+        };
+
+        match WarmBackendGCS::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed"), "unexpected error: {err}"),
+        }
+    }
+}
+
+/*fn gcs_to_object_error(err: Error, params: Vec<String>) -> Option<Error> {
+  if err == nil {
+    return nil
+  }
+
+  bucket := ""
+  object := ""
+  uploadID := ""
+  if len(params) >= 1 {
+    bucket = params[0]
+  }
+  if len(params) == 2 {
+    object = params[1]
+  }
+  if len(params) == 3 {
+    uploadID = params[2]
+  }
+
+  // in some cases just a plain error is being returned
+  switch err.Error() {
+  case "storage: bucket doesn't exist":
+    err = BucketNotFound{
+      Bucket: bucket,
+    }
+    return err
+  case "storage: object doesn't exist":
+    if uploadID != "" {
+      err = InvalidUploadID{
+        UploadID: uploadID,
+      }
+    } else {
+      err = ObjectNotFound{
+        Bucket: bucket,
+        Object: object,
+      }
+    }
+    return err
+  }
+
+  googleAPIErr, ok := err.(*googleapi.Error)
+  if !ok {
+    // We don't interpret non MinIO errors. As minio errors will
+    // have StatusCode to help to convert to object errors.
+    return err
+  }
+
+  if len(googleAPIErr.Errors) == 0 {
+    return err
+  }
+
+  reason := googleAPIErr.Errors[0].Reason
+  message := googleAPIErr.Errors[0].Message
+
+  switch reason {
+  case "required":
+    // Anonymous users does not have storage.xyz access to project 123.
+    fallthrough
+  case "keyInvalid":
+    fallthrough
+  case "forbidden":
+    err = PrefixAccessDenied{
+      Bucket: bucket,
+      Object: object,
+    }
+  case "invalid":
+    err = BucketNameInvalid{
+      Bucket: bucket,
+    }
+  case "notFound":
+    if object != "" {
+      err = ObjectNotFound{
+        Bucket: bucket,
+        Object: object,
+      }
+      break
+    }
+    err = BucketNotFound{Bucket: bucket}
+  case "conflict":
+    if message == "You already own this bucket. Please select another name." {
+      err = BucketAlreadyOwnedByYou{Bucket: bucket}
+      break
+    }
+    if message == "Sorry, that name is not available. Please try a different one." {
+      err = BucketAlreadyExists{Bucket: bucket}
+      break
+    }
+    err = BucketNotEmpty{Bucket: bucket}
+  }
+
+  return err
+}*/

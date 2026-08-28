@@ -12,10 +12,16 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::{AuditEntry, AuditResult, AuditSystem, system::AuditTargetMetricSnapshot};
-use rustfs_ecstore::config::Config;
+use crate::{AuditEntry, AuditError, AuditResult, AuditSystem, system::AuditTargetMetricSnapshot};
+use rustfs_config::server_config::Config;
 use std::sync::{Arc, OnceLock};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, trace};
+
+const LOG_COMPONENT_AUDIT: &str = "audit";
+const LOG_SUBSYSTEM_GLOBAL: &str = "global";
+const EVENT_AUDIT_GLOBAL_SKIPPED: &str = "audit_global_skipped";
+const EVENT_AUDIT_ENTRY_DROPPED: &str = "audit_entry_dropped";
+const EVENT_AUDIT_DISPATCH_FAILED: &str = "audit_dispatch_failed";
 
 /// Global audit system instance
 static AUDIT_SYSTEM: OnceLock<Arc<AuditSystem>> = OnceLock::new();
@@ -37,7 +43,13 @@ macro_rules! with_audit_system {
         if let Some(system) = audit_system() {
             (async move { $async_closure(system).await }).await
         } else {
-            warn!("Audit system not initialized, operation skipped.");
+            debug!(
+                event = EVENT_AUDIT_GLOBAL_SKIPPED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_GLOBAL,
+                reason = "system_not_initialized",
+                "Skipped audit system operation"
+            );
             Ok(())
         }
     };
@@ -66,21 +78,37 @@ pub async fn resume_audit_system() -> AuditResult<()> {
 
 /// Dispatch an audit log entry to all targets
 pub async fn dispatch_audit_log(entry: Arc<AuditEntry>) -> AuditResult<()> {
-    if let Some(system) = audit_system() {
-        if system.is_running().await {
-            system.dispatch(entry).await
-        } else {
-            // The system is initialized but not running (for example, it is suspended). Silently discard log entries based on original logic.
-            // For debugging purposes, it can be useful to add a trace log here.
-            trace!("Audit system is not running, dropping audit entry.");
+    let Some(system) = audit_system() else {
+        debug!(
+            event = EVENT_AUDIT_ENTRY_DROPPED,
+            component = LOG_COMPONENT_AUDIT,
+            subsystem = LOG_SUBSYSTEM_GLOBAL,
+            reason = "system_not_initialized",
+            "Dropped audit entry"
+        );
+        return Ok(());
+    };
+
+    // Single state read (backlog#984): the previous code checked `is_running()`
+    // and then called `dispatch()`, which re-read the state. Between the two
+    // reads the system could transition (e.g. Running -> Stopping) and
+    // `dispatch()` would return an error the caller never expected. Let
+    // `dispatch()` be the single authority on the current state and interpret
+    // its "not accepting" errors as a deliberate skip, while still surfacing
+    // real delivery failures (backlog#962).
+    match system.dispatch(entry).await {
+        Ok(()) => Ok(()),
+        Err(AuditError::NotInitialized(_)) | Err(AuditError::Paused) => {
+            trace!(
+                event = EVENT_AUDIT_ENTRY_DROPPED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_GLOBAL,
+                reason = "system_not_running",
+                "Dropped audit entry"
+            );
             Ok(())
         }
-    } else {
-        // The system is not initialized at all. This is a more important state.
-        // It might be better to return an error or log a warning.
-        debug!("Audit system not initialized, dropping audit entry.");
-        // If this should be a hard failure, you can return Err(AuditError::NotInitialized("..."))
-        Ok(())
+        Err(e) => Err(e),
     }
 }
 
@@ -114,7 +142,13 @@ impl AuditLogger {
     /// Log an audit entry
     pub async fn log(entry: AuditEntry) {
         if let Err(e) = dispatch_audit_log(Arc::new(entry)).await {
-            error!(error = %e, "Failed to dispatch audit log entry");
+            error!(
+                event = EVENT_AUDIT_DISPATCH_FAILED,
+                component = LOG_COMPONENT_AUDIT,
+                subsystem = LOG_SUBSYSTEM_GLOBAL,
+                error = %e,
+                "Failed to dispatch audit entry"
+            );
         }
     }
 

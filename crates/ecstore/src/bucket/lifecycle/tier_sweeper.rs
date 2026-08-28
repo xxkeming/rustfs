@@ -18,17 +18,23 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState, TransitionedObject};
+use super::runtime_boundary as runtime_sources;
+use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
-use crate::client::signer_error::error_chain_contains_signer_header_marker;
-use crate::global::GLOBAL_TierConfigMgr;
+use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
+use crate::object_api::ObjectInfo;
+use crate::services::tier::tier::{TierConfigMgr, TierDestinationId, TierOperationLease};
+use crate::storage_api_contracts::lifecycle::TransitionedObject;
+use crate::store::ECStore;
+use rustfs_s3_client::signer_error::error_chain_contains_signer_header_marker;
 use rustfs_utils::get_env_usize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::any::Any;
 use std::collections::VecDeque;
 use std::io::Write;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::warn;
@@ -45,6 +51,8 @@ const DEFAULT_REMOTE_DELETE_BREAKER_WINDOW_SECS: usize = 30;
 const METRIC_DELETE_REMOTE_FAILED_TOTAL: &str = "rustfs_delete_remote_failed_total";
 const METRIC_DELETE_REMOTE_BREAKER_TOTAL: &str = "rustfs_delete_remote_breaker_total";
 const METRIC_DELETE_REMOTE_INFLIGHT: &str = "rustfs_delete_remote_inflight";
+const ERR_REMOTE_DELETE_BREAKER_OPEN: &str = "remote tier delete breaker is open due to signer/header failures";
+const ERR_REMOTE_DELETE_LIMITER_CLOSED: &str = "remote tier delete limiter is closed";
 
 static REMOTE_DELETE_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
 
@@ -62,6 +70,11 @@ static REMOTE_DELETE_BREAKER: LazyLock<Mutex<RemoteDeleteBreaker>> = LazyLock::n
         ),
     ))
 });
+
+#[cfg(test)]
+static REMOTE_TIER_DELETE_TEST_HOOK: std::sync::LazyLock<
+    std::sync::Mutex<Option<Box<dyn Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
 #[derive(Debug)]
 struct RemoteDeleteBreaker {
@@ -158,10 +171,16 @@ async fn record_remote_delete_failure(err: &std::io::Error, now: Instant) {
     }
 }
 
+fn should_record_remote_delete_failure(err: &std::io::Error) -> bool {
+    let message = err.to_string();
+    message != ERR_REMOTE_DELETE_BREAKER_OPEN && message != ERR_REMOTE_DELETE_LIMITER_CLOSED
+}
+
 #[derive(Default)]
-#[allow(dead_code)]
 struct ObjSweeper {
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     object: String,
+    #[allow(dead_code, reason = "written but never read back (backlog#1823)")]
     bucket: String,
     version_id: Option<Uuid>,
     versioned: bool,
@@ -169,12 +188,13 @@ struct ObjSweeper {
     transition_status: String,
     transition_tier: String,
     transition_version_id: String,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
     remote_object: String,
 }
 
-#[allow(dead_code)]
 impl ObjSweeper {
     #[allow(clippy::new_ret_no_self)]
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub async fn new(bucket: &str, object: &str) -> Result<Self, std::io::Error> {
         Ok(Self {
             object: object.into(),
@@ -183,17 +203,20 @@ impl ObjSweeper {
         })
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_version(&mut self, vid: Option<Uuid>) -> &Self {
         self.version_id = vid.clone();
         self
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn with_versioning(&mut self, versioned: bool, suspended: bool) -> &Self {
         self.versioned = versioned;
         self.suspended = suspended;
         self
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn get_opts(&self) -> lifecycle::ObjectOpts {
         let mut opts = ObjectOpts {
             version_id: self.version_id.clone(),
@@ -207,6 +230,7 @@ impl ObjSweeper {
         opts
     }
 
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
     pub fn set_transition_state(&mut self, info: TransitionedObject) {
         self.transition_tier = info.tier;
         self.transition_status = info.status;
@@ -215,7 +239,9 @@ impl ObjSweeper {
     }
 
     pub fn should_remove_remote_object(&self) -> Option<Jentry> {
-        if self.transition_status != lifecycle::TRANSITION_COMPLETE {
+        if self.transition_status != lifecycle::TRANSITION_COMPLETE
+            || self.transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+        {
             return None;
         }
 
@@ -232,26 +258,84 @@ impl ObjSweeper {
                 obj_name: self.remote_object.clone(),
                 version_id: self.transition_version_id.clone(),
                 tier_name: self.transition_tier.clone(),
+                backend_identity: None,
+                version_id_exact: matches!(
+                    self.transition_version_state,
+                    rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
+                ),
+                version_state: self.transition_version_state,
+                state: TierDeleteJournalState::Committed,
+                source: None,
             });
         }
         None
     }
 
-    pub async fn sweep(&self) {
+    #[allow(dead_code, reason = "MinIO-parity surface with no caller in this port (backlog#1823)")]
+    pub async fn sweep(&self, api: Arc<ECStore>) {
         let Some(je) = self.should_remove_remote_object() else {
             return;
         };
+        let expiry_state = runtime_sources::expiry_state_handle();
+        if persist_tier_delete_journal_entry(api, &je).await.is_err() {
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
+            return;
+        }
         let hash = je.op_hash();
         // Grab the sender under a short read lock, then release the lock so we
         // don't hold it across the async send.
-        let wrkr = GLOBAL_ExpiryState.read().await.get_worker_ch(hash);
+        let wrkr = expiry_state.read().await.get_worker_ch(hash);
         let Some(wrkr) = wrkr else {
-            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
             return;
         };
         if wrkr.send(Some(Box::new(je))).await.is_err() {
-            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum TierDeleteJournalState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TierDeleteSourceIdentity {
+    pub(crate) bucket: String,
+    pub(crate) object: String,
+    pub(crate) version_id: Option<String>,
+    pub(crate) versioned: bool,
+    pub(crate) version_suspended: bool,
+    pub(crate) data_dir: Option<String>,
+    pub(crate) etag: Option<String>,
+    pub(crate) mod_time: Option<String>,
+}
+
+impl TierDeleteSourceIdentity {
+    pub(crate) fn from_object_info(
+        bucket: &str,
+        object: &str,
+        info: &ObjectInfo,
+        versioned: bool,
+        version_suspended: bool,
+    ) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: info.version_id.map(|id| id.to_string()),
+            versioned,
+            version_suspended,
+            data_dir: info.data_dir.map(|id| id.to_string()),
+            etag: info.etag.clone(),
+            mod_time: info.mod_time.map(|time| time.to_string()),
+        }
+    }
+
+    pub(crate) fn has_stable_identity(&self) -> bool {
+        self.version_id.is_some() || self.data_dir.is_some() || (self.etag.is_some() && self.mod_time.is_some())
     }
 }
 
@@ -261,6 +345,11 @@ pub struct Jentry {
     pub(crate) obj_name: String,
     pub(crate) version_id: String,
     pub(crate) tier_name: String,
+    pub(crate) backend_identity: Option<TierDestinationId>,
+    pub(crate) version_id_exact: bool,
+    pub(crate) version_state: rustfs_filemeta::TransitionVersionState,
+    pub(crate) state: TierDeleteJournalState,
+    pub(crate) source: Option<TierDeleteSourceIdentity>,
 }
 
 impl ExpiryOp for Jentry {
@@ -276,32 +365,223 @@ impl ExpiryOp for Jentry {
     }
 }
 
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
 pub async fn delete_object_from_remote_tier(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    let result = delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await;
+    if let Err(err) = &result
+        && should_record_remote_delete_failure(err)
+    {
+        record_remote_delete_failure(err, Instant::now()).await;
+    }
+    result
+}
+
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
+async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_name: &str) -> Result<(), std::io::Error> {
+    #[cfg(test)]
+    if let Some(result) = run_remote_tier_delete_test_hook(obj_name, rv_id, tier_name) {
+        return result;
+    }
+
+    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+    delete_object_from_remote_tier_raw_with_manager(obj_name, rv_id, tier_name, &tier_config_mgr).await
+}
+
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
+async fn delete_object_from_remote_tier_raw_with_manager(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<(), std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease(&tier_config_mgr, tier_name)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, &lease, false, true).await
+}
+
+async fn delete_object_from_remote_tier_raw_with_lease(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+    version_id_exact: bool,
+    validate_remote_version_id: bool,
+) -> Result<(), std::io::Error> {
+    if validate_remote_version_id {
+        lease.validate_remote_version_id(rv_id)?;
+    }
+
     if remote_delete_breaker_is_open(Instant::now()).await {
         metrics::counter!(METRIC_DELETE_REMOTE_BREAKER_TOTAL).increment(1);
-        return Err(std::io::Error::other("remote tier delete breaker is open due to signer/header failures"));
+        return Err(std::io::Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN));
     }
 
     let _permit = REMOTE_DELETE_LIMITER
         .acquire()
         .await
-        .map_err(|_| std::io::Error::other("remote tier delete limiter is closed"))?;
+        .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
-    let mut config_mgr = GLOBAL_TierConfigMgr.write().await;
-    let w = match config_mgr.get_driver(tier_name).await {
-        Ok(w) => w,
-        Err(e) => {
-            let err = std::io::Error::other(e);
-            record_remote_delete_failure(&err, Instant::now()).await;
-            return Err(err);
-        }
-    };
-    let result = w.remove(obj_name, rv_id).await;
-    if let Err(err) = &result {
-        record_remote_delete_failure(err, Instant::now()).await;
+    if version_id_exact {
+        lease.remove_exact(obj_name, rv_id).await
+    } else {
+        lease.remove(obj_name, rv_id).await
     }
-    result
+}
+
+#[cfg(test)]
+fn run_remote_tier_delete_test_hook(obj_name: &str, rv_id: &str, tier_name: &str) -> Option<std::io::Result<()>> {
+    REMOTE_TIER_DELETE_TEST_HOOK
+        .lock()
+        .expect("remote tier delete test hook lock should not poison")
+        .as_ref()
+        .map(|hook| hook(obj_name, rv_id, tier_name))
+}
+
+#[cfg(test)]
+pub(super) struct RemoteTierDeleteHookGuard;
+
+#[cfg(test)]
+impl Drop for RemoteTierDeleteHookGuard {
+    fn drop(&mut self) {
+        let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+            .lock()
+            .expect("remote tier delete test hook lock should not poison");
+        *hook = None;
+    }
+}
+
+#[cfg(test)]
+pub(super) fn set_remote_tier_delete_test_hook(
+    hook_fn: impl Fn(&str, &str, &str) -> std::io::Result<()> + Send + Sync + 'static,
+) -> RemoteTierDeleteHookGuard {
+    let mut hook = REMOTE_TIER_DELETE_TEST_HOOK
+        .lock()
+        .expect("remote tier delete test hook lock should not poison");
+    *hook = Some(Box::new(hook_fn));
+    RemoteTierDeleteHookGuard
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteTierDeleteOutcome {
+    Deleted,
+    AlreadyRemoved,
+}
+
+#[allow(
+    dead_code,
+    reason = "MinIO-parity tier/lifecycle entry point that this port never wired (backlog#1823)"
+)]
+pub async fn delete_object_from_remote_tier_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw(obj_name, rv_id, tier_name).await {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(crate) async fn delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    backend_identity: TierDestinationId,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+    version_id_exact: bool,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, tier_name, backend_identity)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_object_from_remote_tier_with_lease_idempotent(obj_name, rv_id, &lease, version_id_exact).await
+}
+
+pub(crate) async fn delete_object_from_remote_tier_with_lease_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+    version_id_exact: bool,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    delete_object_from_remote_tier_with_lease_idempotent_inner(obj_name, rv_id, lease, version_id_exact, true).await
+}
+
+pub(crate) async fn delete_confirmed_transition_candidate_exact_with_lease_idempotent(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    if rv_id.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "confirmed versioned transition candidate requires a non-empty remote version",
+        ));
+    }
+    #[cfg(test)]
+    if obj_name == "remote/empty-guard-probe" {
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    delete_object_from_remote_tier_with_lease_idempotent_inner(obj_name, rv_id, lease, true, false).await
+}
+
+#[cfg(test)]
+static CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) async fn delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+    obj_name: &str,
+    rv_id: &str,
+    tier_name: &str,
+    backend_identity: TierDestinationId,
+    tier_config_mgr: &Arc<tokio::sync::RwLock<TierConfigMgr>>,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    let lease = TierConfigMgr::acquire_operation_lease_for_backend_identity(tier_config_mgr, tier_name, backend_identity)
+        .await
+        .map_err(std::io::Error::other)?;
+    delete_confirmed_transition_candidate_exact_with_lease_idempotent(obj_name, rv_id, &lease).await
+}
+
+async fn delete_object_from_remote_tier_with_lease_idempotent_inner(
+    obj_name: &str,
+    rv_id: &str,
+    lease: &TierOperationLease,
+    version_id_exact: bool,
+    validate_remote_version_id: bool,
+) -> Result<RemoteTierDeleteOutcome, std::io::Error> {
+    match delete_object_from_remote_tier_raw_with_lease(obj_name, rv_id, lease, version_id_exact, validate_remote_version_id)
+        .await
+    {
+        Ok(()) => Ok(RemoteTierDeleteOutcome::Deleted),
+        Err(err) if is_remote_tier_not_found_error(&err) => Ok(RemoteTierDeleteOutcome::AlreadyRemoved),
+        Err(err) => {
+            if should_record_remote_delete_failure(&err) {
+                record_remote_delete_failure(&err, Instant::now()).await;
+            }
+            Err(err)
+        }
+    }
+}
+
+pub(crate) fn is_remote_tier_not_found_error(err: &std::io::Error) -> bool {
+    let message = err.to_string();
+    message.contains("NoSuchKey")
+        || message.contains("NoSuchVersion")
+        || message.contains("ObjectNotFound")
+        || message.contains("VersionNotFound")
 }
 
 pub fn transitioned_delete_journal_entry(
@@ -309,6 +589,7 @@ pub fn transitioned_delete_journal_entry(
     versioned: bool,
     suspended: bool,
     transitioned: &TransitionedObject,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
 ) -> Option<Jentry> {
     let sweeper = ObjSweeper {
         version_id,
@@ -317,6 +598,7 @@ pub fn transitioned_delete_journal_entry(
         transition_status: transitioned.status.clone(),
         transition_tier: transitioned.tier.clone(),
         transition_version_id: transitioned.version_id.clone(),
+        transition_version_state,
         remote_object: transitioned.name.clone(),
         ..Default::default()
     };
@@ -324,8 +606,13 @@ pub fn transitioned_delete_journal_entry(
     sweeper.should_remove_remote_object()
 }
 
-pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject) -> Option<Jentry> {
-    if transitioned.status != lifecycle::TRANSITION_COMPLETE {
+pub fn transitioned_force_delete_journal_entry(
+    transitioned: &TransitionedObject,
+    transition_version_state: rustfs_filemeta::TransitionVersionState,
+) -> Option<Jentry> {
+    if transitioned.status != lifecycle::TRANSITION_COMPLETE
+        || transition_version_state == rustfs_filemeta::TransitionVersionState::Unknown
+    {
         return None;
     }
 
@@ -333,14 +620,67 @@ pub fn transitioned_force_delete_journal_entry(transitioned: &TransitionedObject
         obj_name: transitioned.name.clone(),
         version_id: transitioned.version_id.clone(),
         tier_name: transitioned.tier.clone(),
+        backend_identity: None,
+        version_id_exact: matches!(
+            transition_version_state,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull | rustfs_filemeta::TransitionVersionState::Exact
+        ),
+        version_state: transition_version_state,
+        state: TierDeleteJournalState::Committed,
+        source: None,
     })
+}
+
+pub(crate) fn attach_tier_delete_source(
+    je: &mut Jentry,
+    bucket: &str,
+    object: &str,
+    info: &ObjectInfo,
+    versioned: bool,
+    version_suspended: bool,
+) {
+    je.state = TierDeleteJournalState::Prepared;
+    je.source = Some(TierDeleteSourceIdentity::from_object_info(
+        bucket,
+        object,
+        info,
+        versioned,
+        version_suspended,
+    ));
+}
+
+pub(crate) fn transitioned_delete_journal_entry_for_source(
+    version_id: Option<Uuid>,
+    versioned: bool,
+    suspended: bool,
+    bucket: &str,
+    object: &str,
+    source: &ObjectInfo,
+) -> Option<Jentry> {
+    let mut je = transitioned_delete_journal_entry(
+        version_id,
+        versioned,
+        suspended,
+        &source.transitioned_object,
+        source.transition_version_state,
+    )?;
+    attach_tier_delete_source(&mut je, bucket, object, source, versioned, suspended);
+    Some(je)
 }
 
 #[cfg(test)]
 mod test {
-    use crate::client::signer_error::invalid_utf8_header_error;
+    use rustfs_s3_client::signer_error::invalid_utf8_header_error;
 
-    use super::{RemoteDeleteBreaker, is_signer_header_error};
+    use super::{
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES, ERR_REMOTE_DELETE_BREAKER_OPEN, ERR_REMOTE_DELETE_LIMITER_CLOSED,
+        RemoteDeleteBreaker, RemoteTierDeleteOutcome, delete_confirmed_transition_candidate_exact_with_manager_and_identity,
+        delete_object_from_remote_tier_idempotent, delete_object_from_remote_tier_idempotent_with_manager_and_identity,
+        is_remote_tier_not_found_error, is_signer_header_error, lifecycle, set_remote_tier_delete_test_hook,
+        should_record_remote_delete_failure, transitioned_delete_journal_entry, transitioned_force_delete_journal_entry,
+    };
+    use crate::storage_api_contracts::lifecycle::TransitionedObject;
+    use rustfs_filemeta::TransitionVersionState;
     use std::io::{Error, ErrorKind};
     use std::time::{Duration, Instant};
 
@@ -363,6 +703,233 @@ mod test {
     fn signer_header_error_detection_matches_structured_marker() {
         let err = invalid_utf8_header_error("failed to sign v4 request", "x-amz-meta-invalid");
         assert!(is_signer_header_error(&err));
+    }
+
+    #[test]
+    fn remote_tier_not_found_errors_are_idempotent_success() {
+        assert!(is_remote_tier_not_found_error(&Error::other("NoSuchVersion")));
+        assert!(is_remote_tier_not_found_error(&Error::other("NoSuchKey")));
+        assert!(is_remote_tier_not_found_error(&Error::other("ObjectNotFound")));
+        assert!(is_remote_tier_not_found_error(&Error::other("VersionNotFound")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("timeout")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("tier config not found")));
+        assert!(!is_remote_tier_not_found_error(&Error::other("driver not found")));
+    }
+
+    #[test]
+    fn remote_tier_control_plane_short_circuit_errors_do_not_count_as_delete_failures() {
+        assert!(!should_record_remote_delete_failure(&Error::other(ERR_REMOTE_DELETE_BREAKER_OPEN)));
+        assert!(!should_record_remote_delete_failure(&Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED)));
+        assert!(should_record_remote_delete_failure(&Error::other("driver not found")));
+        assert!(should_record_remote_delete_failure(&Error::other("NoSuchVersion")));
+    }
+
+    #[test]
+    fn transitioned_delete_journal_preserves_remote_version_state() {
+        let cases = [
+            (TransitionVersionState::Unknown, "legacy-version", None),
+            (TransitionVersionState::KnownDisabled, "", Some(false)),
+            (TransitionVersionState::SuspendedNull, "null", Some(true)),
+            (TransitionVersionState::Exact, "opaque-version", Some(true)),
+        ];
+
+        for (state, version_id, expected_exact) in cases {
+            let transitioned = TransitionedObject {
+                name: "remote/object".to_string(),
+                version_id: version_id.to_string(),
+                tier: "WARM".to_string(),
+                status: lifecycle::TRANSITION_COMPLETE.to_string(),
+                ..Default::default()
+            };
+            let regular = transitioned_delete_journal_entry(None, false, false, &transitioned, state);
+            let forced = transitioned_force_delete_journal_entry(&transitioned, state);
+
+            match expected_exact {
+                Some(expected_exact) => {
+                    let regular = regular.expect("known version state should produce a regular delete journal entry");
+                    assert_eq!(regular.version_state, state);
+                    assert_eq!(regular.version_id_exact, expected_exact);
+                    let forced = forced.expect("known version state should produce a forced delete journal entry");
+                    assert_eq!(forced.version_state, state);
+                    assert_eq!(forced.version_id_exact, expected_exact);
+                }
+                None => {
+                    assert!(regular.is_none());
+                    assert!(forced.is_none());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn idempotent_remote_delete_treats_hooked_nosuchversion_as_already_removed() {
+        let _hook = set_remote_tier_delete_test_hook(|obj_name, rv_id, tier_name| {
+            assert_eq!(obj_name, "remote/object");
+            assert_eq!(rv_id, "remote-version");
+            assert_eq!(tier_name, "WARM");
+            Err(Error::other("NoSuchVersion"))
+        });
+
+        let outcome = delete_object_from_remote_tier_idempotent("remote/object", "remote-version", "WARM")
+            .await
+            .expect("remote not-found should be idempotent success");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::AlreadyRemoved);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn idempotent_remote_delete_preserves_driver_not_found_failures() {
+        let _hook = set_remote_tier_delete_test_hook(|_, _, _| Err(Error::other("driver not found")));
+
+        let err = delete_object_from_remote_tier_idempotent("remote/object", "remote-version", "WARM")
+            .await
+            .expect_err("driver lookup failure must not be idempotent success");
+
+        assert!(err.to_string().contains("driver not found"));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_rejects_backend_identity_mismatch() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let mut mismatched = lease.backend_identity();
+        mismatched[0] ^= 1;
+        drop(lease);
+
+        let err = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "remote-version",
+            "WARM",
+            mismatched,
+            &manager,
+            false,
+        )
+        .await
+        .expect_err("journal recovery must fail closed when the tier name was rebound");
+
+        assert!(err.to_string().contains("identity no longer matches"));
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_dispatches_an_exact_version_constraint() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+
+        let outcome = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "exact-version",
+            "WARM",
+            identity,
+            &manager,
+            true,
+        )
+        .await
+        .expect("an exact journal delete should reach the backend");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::Deleted);
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(backend.remove_count().await, 1);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    async fn journal_delete_rejects_nonempty_remote_version_before_backend_io() {
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+        backend.set_reject_non_empty_remote_versions(true);
+
+        let err = delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "remote-version",
+            "WARM",
+            identity,
+            &manager,
+            true,
+        )
+        .await
+        .expect_err("a provider that rejects a versioned delete must fail before remote IO");
+
+        assert!(err.to_string().contains("requires an unversioned remote object"));
+        assert_eq!(backend.remove_count().await, 0);
+
+        delete_object_from_remote_tier_idempotent_with_manager_and_identity(
+            "remote/object",
+            "",
+            "WARM",
+            identity,
+            &manager,
+            false,
+        )
+        .await
+        .expect("unversioned remote delete should continue without a version ID");
+
+        assert_eq!(backend.remove_versions().await, vec![("remote/object".to_string(), String::new())]);
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn confirmed_transition_cleanup_deletes_exact_provider_token() {
+        CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+        let manager = crate::services::tier::tier::TierConfigMgr::new();
+        let backend = crate::services::tier::test_util::register_mock_tier(&manager, "WARM").await;
+        let lease = crate::services::tier::tier::TierConfigMgr::acquire_operation_lease(&manager, "WARM")
+            .await
+            .expect("test tier lease should be available");
+        let identity = lease.backend_identity();
+        drop(lease);
+        backend.set_reject_non_empty_remote_versions(true);
+
+        let outcome = delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+            "remote/object",
+            "provider-version-token",
+            "WARM",
+            identity,
+            &manager,
+        )
+        .await
+        .expect("confirmed upload compensation should delete the exact provider token");
+
+        assert_eq!(outcome, RemoteTierDeleteOutcome::Deleted);
+        assert_eq!(backend.exact_remove_count(), 1);
+        assert_eq!(
+            backend.remove_versions().await,
+            vec![("remote/object".to_string(), "provider-version-token".to_string())]
+        );
+
+        let err = delete_confirmed_transition_candidate_exact_with_manager_and_identity(
+            "remote/empty-guard-probe",
+            "",
+            "WARM",
+            identity,
+            &manager,
+        )
+        .await
+        .expect_err("confirmed versioned cleanup must reject an empty token");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(backend.remove_count().await, 1);
+        assert_eq!(
+            CONFIRMED_TRANSITION_EMPTY_GUARD_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "empty remote versions must be rejected before exact cleanup dispatch"
+        );
     }
 
     #[test]

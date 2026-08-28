@@ -12,46 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::{
-    bucket::lifecycle::lifecycle::TransitionOptions,
-    bucket::metadata::BUCKET_LIFECYCLE_CONFIG,
-    bucket::{lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects, metadata_sys},
-    client::transition_api::{ReadCloser, ReaderImpl},
-    disk::endpoint::Endpoint,
-    disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, new_disk},
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    global::GLOBAL_TierConfigMgr,
-    pools::path2_bucket_object_with_base_path,
-    store::ECStore,
-    store_api::{
-        BucketOperations, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, ObjectOptions,
-        PutObjReader,
-    },
-    tier::{
-        tier_config::{TierConfig, TierMinIO, TierType},
-        warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
-    },
-};
-use rustfs_filemeta::FileMeta;
-use rustfs_scanner::scanner::init_data_scanner;
+#![recursion_limit = "256"]
+
+use futures::FutureExt;
+use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
-use rustfs_utils::path::path_join_buf;
+use rustfs_scanner::{
+    ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
+    scanner::init_data_scanner,
+};
 use s3s::dto::RestoreRequest;
 use serial_test::serial;
 use std::{
     collections::HashMap,
-    io::Cursor,
+    env,
     path::{Path, PathBuf},
     sync::{Arc, Once, OnceLock},
     time::Duration,
 };
 use tokio::fs;
 use tokio::io::AsyncReadExt;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
+
+mod storage_api;
+
+use storage_api::lifecycle::{
+    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskOption, ECStore,
+    EcstoreError, Endpoint, EndpointServerPools, Endpoints, IlmAction, LcEvent, LcEventSrc, ListOperations as _,
+    MakeBucketOptions, MockWarmBackend, MultipartOperations as _, ObjectIO as _, ObjectOperations as _, PoolEndpoints,
+    STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier, TransitionOptions, assert_transition_meta_consistent,
+    enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
+    get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
+    is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_tier_delete_journal_entries,
+    register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
+};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -112,10 +109,10 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // format disks (only first time)
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9002 if free
     let port = 9002; // for simplicity
@@ -126,17 +123,17 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     // Initialize background expiry workers
-    rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    init_background_expiry(ecstore.clone()).await;
 
     // Store in global once lock
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
@@ -183,8 +180,8 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -192,24 +189,23 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         .unwrap();
 
     let buckets_list = ecstore
-        .list_bucket(&rustfs_ecstore::store_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    rustfs_ecstore::bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     if init_expiry {
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
     }
 
     (disk_paths, ecstore)
 }
 
 /// Test helper: Create a test bucket
-#[allow(dead_code)]
 async fn create_test_bucket(ecstore: &Arc<ECStore>, bucket_name: &str) {
     (**ecstore)
         .make_bucket(bucket_name, &Default::default())
@@ -245,8 +241,15 @@ async fn upload_test_object(ecstore: &Arc<ECStore>, bucket: &str, object: &str, 
     info!("Uploaded test object: {}/{} ({} bytes)", bucket, object, object_info.size);
 }
 
+async fn modeled_versioned_delete_opts(bucket: &str, object: &str) -> ObjectOptions {
+    ObjectOptions {
+        versioned: BucketVersioningSys::prefix_enabled(bucket, object).await,
+        version_suspended: BucketVersioningSys::prefix_suspended(bucket, object).await,
+        ..Default::default()
+    }
+}
+
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
     // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -263,15 +266,15 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
 
 /// Test helper: Set bucket lifecycle configuration
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    // Create a simple lifecycle configuration XML with 0 days expiry for immediate testing
+    // Create lifecycle rule that targets delete-marker cleanup only.
+    // Keep Expiration.Days unset to avoid expiring live transitioned object versions.
     let lifecycle_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
 <LifecycleConfiguration>
     <Rule>
@@ -281,23 +284,38 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
             <Prefix>test/</Prefix>
         </Filter>
         <Expiration>
-            <Days>0</Days>
             <ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>
         </Expiration>
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
 
-#[allow(dead_code)]
-async fn set_bucket_lifecycle_transition(bucket_name: &str) -> Result<(), Box<dyn std::error::Error>> {
-    set_bucket_lifecycle_transition_with_tier(bucket_name, "COLDTIER44").await
+async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64) -> Result<(), Box<dyn std::error::Error>> {
+    let lifecycle_xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <DelMarkerExpiration>
+            <Days>{days}</Days>
+        </DelMarkerExpiration>
+    </Rule>
+</LifecycleConfiguration>"#
+    );
+
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+
+    Ok(())
 }
 
-#[allow(dead_code)]
 async fn set_bucket_lifecycle_transition_with_tier(
     bucket_name: &str,
     storage_class: &str,
@@ -331,69 +349,9 @@ async fn set_bucket_lifecycle_transition_with_tier(
 </LifecycleConfiguration>"#
     );
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
-}
-
-/// Test helper: Create a test tier
-#[allow(dead_code)]
-async fn create_test_tier(server: u32) {
-    let args = TierConfig {
-        version: "v1".to_string(),
-        tier_type: TierType::MinIO,
-        name: "COLDTIER44".to_string(),
-        s3: None,
-        aliyun: None,
-        tencent: None,
-        huaweicloud: None,
-        azure: None,
-        gcs: None,
-        r2: None,
-        rustfs: None,
-        minio: if server == 1 {
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "hello".to_string(),
-                endpoint: "http://127.0.0.1:9000".to_string(),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        } else if server == 2 {
-            let test_compatible_server = std::env::var("TEST_MINIO_SERVER").unwrap_or_else(|_| "localhost:9000".to_string());
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mblock2".to_string(),
-                endpoint: format!("http://{}", test_compatible_server),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        } else {
-            Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mblock2".to_string(),
-                endpoint: "http://127.0.0.1:9020".to_string(),
-                prefix: format!("mypre{}/", uuid::Uuid::new_v4()),
-                region: "".to_string(),
-                ..Default::default()
-            })
-        },
-    };
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
-    if let Err(err) = tier_config_mgr.add(args, false).await {
-        println!("tier_config_mgr add failed, e: {err:?}");
-        panic!("tier add failed. {err}");
-    }
-    if let Err(e) = tier_config_mgr.save().await {
-        println!("tier_config_mgr save failed, e: {e:?}");
-        panic!("tier save failed");
-    }
-    println!("Created test tier: COLDTIER44");
 }
 
 /// Test helper: Check if object exists
@@ -405,7 +363,6 @@ async fn object_exists(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bo
 }
 
 /// Test helper: Check if object exists
-#[allow(dead_code)]
 async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
     if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
         println!("oi: {oi:?}");
@@ -416,19 +373,6 @@ async fn object_is_delete_marker(ecstore: &Arc<ECStore>, bucket: &str, object: &
     }
 }
 
-/// Test helper: Check if object exists
-#[allow(dead_code)]
-async fn object_is_transitioned(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> bool {
-    if let Ok(oi) = (**ecstore).get_object_info(bucket, object, &ObjectOptions::default()).await {
-        println!("oi: {oi:?}");
-        !oi.transitioned_object.status.is_empty()
-    } else {
-        println!("object_is_transitioned is error");
-        panic!("object_is_transitioned is error");
-    }
-}
-
-#[allow(dead_code)]
 async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
 
@@ -443,49 +387,6 @@ async fn wait_for_object_absence(ecstore: &Arc<ECStore>, bucket: &str, object: &
 
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-}
-
-async fn wait_for_remote_absence(backend: &MockWarmBackend, object: &str, timeout: Duration) -> bool {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        if !backend.objects.lock().await.contains_key(object) {
-            return true;
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            return false;
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
-
-async fn free_version_count(disk_path: &Path, bucket: &str, object: &str) -> usize {
-    let mut endpoint = Endpoint::try_from(disk_path.to_str().unwrap()).unwrap();
-    endpoint.set_pool_index(0);
-    endpoint.set_set_index(0);
-    endpoint.set_disk_index(0);
-    let disk = new_disk(
-        &endpoint,
-        &DiskOption {
-            cleanup: false,
-            health_check: false,
-        },
-    )
-    .await
-    .expect("failed to open local disk");
-    let data = disk
-        .read_metadata(bucket, &path_join_buf(&[object, STORAGE_FORMAT_FILE]))
-        .await;
-    let Ok(data) = data else {
-        return 0;
-    };
-    let meta = FileMeta::load(&data).expect("failed to load file metadata");
-    meta.get_file_info_versions(bucket, object, false)
-        .expect("failed to decode file info versions")
-        .free_versions
-        .len()
 }
 
 async fn object_version_count(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> usize {
@@ -550,7 +451,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         .await
         .expect("failed to stat object metadata")
         .file_type();
-    let lifecycle = metadata_sys::get(bucket)
+    let lifecycle = get_bucket_metadata(bucket)
         .await
         .expect("failed to load bucket metadata")
         .lifecycle_config
@@ -563,6 +464,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         object_name: STORAGE_FORMAT_FILE.to_string(),
         file_type,
         lifecycle,
+        object_lock: None,
         replication: None,
         heal_enabled: false,
         heal_bitrot: false,
@@ -599,6 +501,7 @@ async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
         object_name: STORAGE_FORMAT_FILE.to_string(),
         file_type,
         lifecycle: None,
+        object_lock: None,
         replication: None,
         heal_enabled: false,
         heal_bitrot: false,
@@ -607,136 +510,14 @@ async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
     disk.get_size(item).await.expect("scanner get_size should succeed");
 }
 
-#[derive(Clone, Default)]
-struct MockStoredObject {
-    bytes: Vec<u8>,
-    metadata: HashMap<String, String>,
-}
-
-#[derive(Clone, Default)]
-struct MockWarmBackend {
-    objects: Arc<Mutex<HashMap<String, MockStoredObject>>>,
-}
-
-impl MockWarmBackend {
-    async fn put_bytes(&self, object: &str, bytes: Vec<u8>, metadata: HashMap<String, String>) -> String {
-        self.objects
-            .lock()
-            .await
-            .insert(object.to_string(), MockStoredObject { bytes, metadata });
-        Uuid::new_v4().to_string()
-    }
-
-    async fn read_bytes(&self, reader: ReaderImpl) -> Result<Vec<u8>, std::io::Error> {
-        match reader {
-            ReaderImpl::Body(bytes) => Ok(bytes.to_vec()),
-            ReaderImpl::ObjectBody(mut reader) => {
-                let mut buf = Vec::new();
-                reader.stream.read_to_end(&mut buf).await?;
-                Ok(buf)
-            }
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl WarmBackend for MockWarmBackend {
-    async fn put(&self, object: &str, r: ReaderImpl, _length: i64) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        Ok(self.put_bytes(object, bytes, HashMap::new()).await)
-    }
-
-    async fn put_with_meta(
-        &self,
-        object: &str,
-        r: ReaderImpl,
-        _length: i64,
-        meta: HashMap<String, String>,
-    ) -> Result<String, std::io::Error> {
-        let bytes = self.read_bytes(r).await?;
-        let opts = build_transition_put_options(String::new(), meta);
-        let mut metadata = opts.user_metadata.clone();
-        if !opts.content_type.is_empty() {
-            metadata.insert("content-type".to_string(), opts.content_type.clone());
-        }
-        if !opts.content_encoding.is_empty() {
-            metadata.insert("content-encoding".to_string(), opts.content_encoding.clone());
-        }
-        if !opts.cache_control.is_empty() {
-            metadata.insert("cache-control".to_string(), opts.cache_control.clone());
-        }
-        if !opts.internal.replication_status.as_str().is_empty() {
-            metadata.insert(
-                "x-amz-replication-status".to_string(),
-                opts.internal.replication_status.as_str().to_string(),
-            );
-        }
-        if !opts.legalhold.as_str().is_empty() {
-            metadata.insert("x-amz-object-lock-legal-hold".to_string(), opts.legalhold.as_str().to_string());
-        }
-        Ok(self.put_bytes(object, bytes, metadata).await)
-    }
-
-    async fn get(&self, object: &str, _rv: &str, opts: WarmBackendGetOpts) -> Result<ReadCloser, std::io::Error> {
-        let objects = self.objects.lock().await;
-        let Some(stored) = objects.get(object) else {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "mock object not found"));
-        };
-        let bytes = &stored.bytes;
-
-        let start = opts.start_offset.max(0) as usize;
-        let end = if opts.length > 0 {
-            start.saturating_add(opts.length as usize).min(bytes.len())
-        } else {
-            bytes.len()
-        };
-
-        Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
-    }
-
-    async fn remove(&self, object: &str, _rv: &str) -> Result<(), std::io::Error> {
-        self.objects.lock().await.remove(object);
-        Ok(())
-    }
-
-    async fn in_use(&self) -> Result<bool, std::io::Error> {
-        Ok(false)
-    }
-}
-
+/// Register the shared [`MockWarmBackend`] into the global tier config manager
+/// used by the scanner integration tests. Thin wrapper over the shared
+/// `register_mock_tier` helper (rustfs/backlog#1148 ilm-6).
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
-    let backend = MockWarmBackend::default();
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
-    tier_config_mgr.tiers.insert(
-        tier_name.to_string(),
-        TierConfig {
-            version: "v1".to_string(),
-            tier_type: TierType::MinIO,
-            name: tier_name.to_string(),
-            minio: Some(TierMinIO {
-                access_key: "minioadmin".to_string(),
-                secret_key: "minioadmin".to_string(),
-                bucket: "mock-tier".to_string(),
-                endpoint: "http://127.0.0.1:0".to_string(),
-                prefix: format!("mock/{}/", Uuid::new_v4()),
-                region: String::new(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        },
-    );
-    tier_config_mgr
-        .driver_cache
-        .insert(tier_name.to_string(), Box::new(backend.clone()));
-    backend
+    register_mock_tier_util(&get_global_tier_config_mgr(), tier_name).await
 }
 
-async fn wait_for_transition(
-    ecstore: &Arc<ECStore>,
-    bucket: &str,
-    object: &str,
-    timeout: Duration,
-) -> Option<rustfs_ecstore::store_api::ObjectInfo> {
+async fn wait_for_transition(ecstore: &Arc<ECStore>, bucket: &str, object: &str, timeout: Duration) -> Option<ObjectInfo> {
     let deadline = tokio::time::Instant::now() + timeout;
 
     loop {
@@ -754,105 +535,551 @@ async fn wait_for_transition(
     }
 }
 
+// SAFETY: this helper is used only by `#[serial]` tests and runs under the single-threaded Tokio
+// runtime (`worker_threads = 1`), so no concurrent test can mutate process environment during the
+// `env::set_var` / `env::remove_var` window.
+#[allow(unsafe_code)]
+async fn with_forced_immediate_enqueue_timeout<F, Fut>(test_fn: F)
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let original = env::var_os(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+    unsafe {
+        env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, "1");
+    }
+    let result = std::panic::AssertUnwindSafe(test_fn()).catch_unwind().await;
+    match original {
+        Some(value) => unsafe {
+            env::set_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT, value);
+        },
+        None => unsafe {
+            env::remove_var(ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT);
+        },
+    }
+    if let Err(err) = result {
+        std::panic::resume_unwind(err);
+    }
+}
+
 mod serial_tests {
     use super::*;
 
+    /// Regression for rustfs#3491 (backlog#1148 ilm-2): the expire/GET race on a
+    /// transitioned (tiered) object.
+    ///
+    /// Before #3491, `expire_transitioned_object` removed the remote tier
+    /// version **before** deleting local metadata. A GET that raced into the
+    /// window between those two steps read local metadata still pointing at a
+    /// remote version that was already gone, so the tier fetch failed and the
+    /// client saw a spurious, user-visible error (`NoSuchVersion`). #3491
+    /// flipped the ordering: local metadata is deleted **first** (the object
+    /// becomes atomically unreachable) and remote-tier cleanup is deferred to
+    /// persisted free-version recovery -- so no live local metadata ever points
+    /// at an already-removed remote version.
+    ///
+    /// This test pins the FIXED contract two complementary ways, both
+    /// revert-proof (reverting to remote-first ordering turns them red):
+    ///
+    ///  1. Ordering (deterministic): immediately after
+    ///     `expire_transitioned_object` returns, the remote tier object is still
+    ///     present and the mock recorded **zero** remote `remove` calls --
+    ///     proving the local delete happened with no synchronous remote removal
+    ///     (local-first). Remote-first ordering loses the object and records a
+    ///     `remove`.
+    ///  2. Concurrent GET (user-visible): a tight GET loop runs concurrently
+    ///     with the expiry; every observation must be either a full, correct
+    ///     body (GET won) or a clean object/version-not-found (expiry won). A
+    ///     tier-fetch failure -- the #3491 symptom -- is never tolerated.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore]
-    async fn test_lifecycle_transition_basic() {
-        let (_disk_paths, ecstore) = setup_test_env().await;
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-2)"]
+    async fn test_expire_transitioned_object_never_races_concurrent_get() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
-        create_test_tier(2).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_remote_version(Some(String::new())).await;
 
-        // Create test bucket and object
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let bucket_name = format!("test-lc-transition-{}", &suffix[..8]);
-        let object_name = "test/object.txt"; // Match the lifecycle rule prefix "test/"
-        let test_data = b"Hello, this is test data for lifecycle expiry!";
+        let bucket_name = format!("test-expire-get-race-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/race-object.bin";
+        // Multi-block payload so the transitioned GET streams from the remote
+        // tier rather than serving an inline fast-path.
+        let payload: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
 
-        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
-        upload_test_object(
-            &ecstore,
-            bucket_name.as_str(),
-            object_name,
-            b"Hello, this is test data for lifecycle expiry 1111-11111111-1111 !",
-        )
-        .await;
-        //create_test_bucket(&ecstore, bucket_name.as_str()).await;
-        upload_test_object(&ecstore, bucket_name.as_str(), object_name, test_data).await;
-
-        // Verify object exists initially
-        assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
-        println!("✅ Object exists before lifecycle processing");
-
-        // Set lifecycle configuration with very short expiry (0 days = immediate expiry)
-        set_bucket_lifecycle_transition(bucket_name.as_str())
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
             .await
             .expect("Failed to set lifecycle configuration");
-        println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
-        // Verify lifecycle configuration was set
-        match rustfs_ecstore::bucket::metadata_sys::get(bucket_name.as_str()).await {
-            Ok(bucket_meta) => {
-                assert!(bucket_meta.lifecycle_config.is_some());
-                println!("✅ Bucket metadata retrieved successfully");
-            }
-            Err(e) => {
-                println!("❌ Error retrieving bucket metadata: {e:?}");
-            }
-        }
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transition for existing objects");
 
-        let ctx = CancellationToken::new();
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition before expiry");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(
+            backend.contains(&remote_object).await,
+            "transitioned remote object should exist in the mock tier before expiry"
+        );
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "no remote-tier removal should have happened before expiry"
+        );
 
-        // Start scanner
-        init_data_scanner(ctx.clone(), ecstore.clone()).await;
-        println!("✅ Scanner started");
+        // The ObjectInfo the scanner would hand to the expiry action.
+        let oi = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load transitioned object info");
+        assert!(
+            oi.transitioned_object.version_id.is_empty(),
+            "the regression must exercise an unversioned remote tier"
+        );
 
-        // Wait for scanner to process lifecycle rules
-        tokio::time::sleep(Duration::from_secs(1200)).await;
-
-        // Check if object has been expired (deleted)
-        let check_result = object_is_transitioned(&ecstore, &bucket_name, object_name).await;
-        println!("Object exists after lifecycle processing: {check_result}");
-
-        if check_result {
-            println!("✅ Object was transitioned by lifecycle processing");
-            // Let's try to get object info to see its details
-            match ecstore
-                .get_object_info(bucket_name.as_str(), object_name, &rustfs_ecstore::store_api::ObjectOptions::default())
-                .await
-            {
-                Ok(obj_info) => {
-                    println!(
-                        "Object info: name={}, size={}, mod_time={:?}",
-                        obj_info.name, obj_info.size, obj_info.mod_time
-                    );
-                    println!("Object info: transitioned_object={:?}", obj_info.transitioned_object);
+        // Concurrent GET loop: hammer GET while the expiry runs. Every outcome
+        // must be a full correct body or a clean not-found -- never a tier-fetch
+        // failure.
+        let get_store = ecstore.clone();
+        let get_bucket = bucket_name.clone();
+        let get_object = object_name.to_string();
+        let expected = payload.clone();
+        let get_loop = tokio::spawn(async move {
+            let mut saw_full_body = 0usize;
+            let mut saw_not_found = 0usize;
+            for _ in 0..400 {
+                match get_store
+                    .get_object_reader(
+                        get_bucket.as_str(),
+                        get_object.as_str(),
+                        None,
+                        http::HeaderMap::new(),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                {
+                    Ok(mut reader) => {
+                        let mut data = Vec::new();
+                        match reader.stream.read_to_end(&mut data).await {
+                            Ok(_) => {
+                                assert_eq!(
+                                    data, expected,
+                                    "a successful GET during expiry must return the complete, correct body"
+                                );
+                                saw_full_body += 1;
+                            }
+                            Err(err) => {
+                                panic!("GET during expiry streamed a truncated/failed body (expire/GET race regression): {err:?}")
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        let ec: &EcstoreError = &err;
+                        assert!(
+                            is_err_object_not_found(ec) || is_err_version_not_found(ec),
+                            "GET during expiry may only fail with a clean object/version-not-found (expiry won \
+                             the race); a tier-fetch failure is the #3491 regression: {err:?}"
+                        );
+                        saw_not_found += 1;
+                    }
                 }
-                Err(e) => {
-                    println!("Error getting object info: {e:?}");
-                }
+                tokio::task::yield_now().await;
             }
-        } else {
-            println!("❌ Object was not transitioned by lifecycle processing");
-        }
+            (saw_full_body, saw_not_found)
+        });
 
-        assert!(check_result);
-        println!("✅ Object successfully transitioned");
+        // Run the exact expiry action the scanner drives for a transitioned
+        // current version.
+        let lc_event = LcEvent {
+            action: IlmAction::DeleteAction,
+            ..Default::default()
+        };
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &oi, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
+            .await
+            .expect("expire_transitioned_object should succeed");
 
-        // Stop scanner
-        ctx.cancel();
-        println!("✅ Scanner stopped");
+        // --- Ordering contract (deterministic revert-proof) ----------------
+        // #3491 defers remote cleanup to free-version recovery, so immediately
+        // after expiry the remote object is still present and NO synchronous
+        // remote `remove` was issued. Reverting to remote-first ordering makes
+        // both assertions fail.
+        assert_eq!(
+            backend.remove_count().await,
+            0,
+            "expire_transitioned_object must NOT issue a synchronous remote-tier removal (local-first \
+             ordering, #3491); remote cleanup is deferred to free-version recovery"
+        );
+        assert!(
+            backend.contains(&remote_object).await,
+            "remote tier object must still exist immediately after expiry (deferred cleanup, #3491)"
+        );
 
-        println!("Lifecycle transition basic test completed");
+        // Local metadata is gone: the object is atomically unreachable.
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await,
+            "local metadata for the expired transitioned object should be gone"
+        );
+
+        // Drain the concurrent GET loop; its internal asserts already guarantee
+        // no #3491-style tier-fetch failure was ever observed.
+        let (saw_full_body, saw_not_found) = get_loop.await.expect("concurrent GET loop task panicked");
+        assert!(
+            saw_full_body + saw_not_found > 0,
+            "the concurrent GET loop should have observed at least one GET outcome"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
-    async fn test_transition_and_restore_flows() {
-        let (_disk_paths, ecstore) = setup_test_env().await;
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn rejected_transition_candidate_is_recovered_from_persisted_delete_journal() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_read_limit(Some(4096)).await;
+        backend.set_put_remote_version(Some(String::new())).await;
+        backend.set_remove_failure(true);
+
+        let bucket_name = format!("test-transition-cleanup-journal-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/rejected-candidate.bin";
+        let payload = b"rejected remote candidate must not replace the local source".repeat(1024);
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+        let original = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("source object metadata should resolve before transition");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        ecstore
+            .transition_object(bucket_name.as_str(), object_name, &opts)
+            .await
+            .expect_err("a remotely accepted partial upload must not commit transition metadata");
+
+        let put_versions = backend.put_versions().await;
+        assert_eq!(put_versions.len(), 1, "transition should create exactly one remote candidate");
+        assert!(put_versions[0].1.is_empty());
+        assert_eq!(
+            backend.object_count().await,
+            1,
+            "failed cleanup must retain the remote candidate for recovery"
+        );
+        assert!(
+            backend.remove_versions().await.is_empty(),
+            "no cleanup path may delete the candidate while remove failures are enabled"
+        );
+
+        let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("tier delete journal recovery should scan the persisted candidate");
+        assert_eq!(retained.scanned, 1);
+        assert_eq!(retained.deleted, 0);
+        assert_eq!(retained.failed, 1);
+        assert_eq!(backend.object_count().await, 1, "failed recovery must retain the remote candidate");
+
+        backend.set_remove_failure(false);
+        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("tier delete journal recovery should delete the retained candidate");
+        assert_eq!(recovered.scanned, 1);
+        assert_eq!(recovered.deleted, 1);
+        assert_eq!(recovered.failed, 0);
+        let removed_versions = backend.remove_versions().await;
+        assert!(!removed_versions.is_empty(), "recovery must issue at least one successful delete");
+        assert!(
+            removed_versions.iter().all(|removed| removed == &put_versions[0]),
+            "every idempotent cleanup must delete the exact PUT object and version"
+        );
+        assert_eq!(backend.object_count().await, 0, "recovery should remove the rejected remote candidate");
+
+        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("a removed tier delete journal entry should no longer be listed");
+        assert_eq!(empty.scanned, 0, "successful recovery must remove the persisted journal entry");
+        assert_eq!(
+            read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+            payload,
+            "rejected transition cleanup must leave the source object readable"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn cancelled_before_cleanup_store_resolution_persists_journal() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+        backend.set_put_remote_version(Some(Uuid::new_v4().to_string())).await;
+        backend.reject_next_non_empty_remote_version_validation();
+        backend.set_remove_failure(true);
+        let cleanup_store_barrier = TransitionCleanupStoreBarrier::install();
+
+        let bucket_name = format!("test-transition-cancel-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/rejected-candidate.bin";
+        let payload = b"cancelled rejected cleanup must retain durable recovery evidence".repeat(1024);
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+        let original = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("source object metadata should resolve before transition");
+        let opts = ObjectOptions {
+            no_lock: true,
+            transition: TransitionOptions {
+                status: TRANSITION_PENDING.to_string(),
+                tier: tier_name,
+                etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                ..Default::default()
+            },
+            version_id: original.version_id.map(|version| version.to_string()),
+            mod_time: original.mod_time,
+            ..Default::default()
+        };
+
+        let transition_store = ecstore.clone();
+        let transition_bucket = bucket_name.clone();
+        let transition = tokio::spawn(async move {
+            transition_store
+                .transition_object(transition_bucket.as_str(), object_name, &opts)
+                .await
+        });
+        cleanup_store_barrier.wait_until_paused().await;
+        transition.abort();
+        assert!(
+            transition
+                .await
+                .expect_err("aborted transition task should be cancelled")
+                .is_cancelled()
+        );
+
+        let retained = tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                    .await
+                    .expect("the cancelled transition journal should be readable");
+                if recovery.scanned > 0 {
+                    break recovery;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop should persist the rejected candidate through the saved instance context");
+        assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend.exact_remove_count() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("Drop cleanup and failed journal recovery must both preserve the exact version constraint");
+        let failed_exact_attempts = backend.exact_remove_count();
+        assert_eq!(backend.object_count().await, 1);
+        assert!(backend.remove_versions().await.is_empty());
+
+        backend.set_remove_failure(false);
+        let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("recovery should delete the candidate retained by the cancelled transition");
+        assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+        assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+        assert_eq!(backend.exact_remove_count(), failed_exact_attempts + 1);
+        assert_eq!(backend.object_count().await, 0);
+        let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+            .await
+            .expect("successful recovery should remove the cancellation journal");
+        assert_eq!(empty.scanned, 0);
+        assert_eq!(
+            read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+            payload,
+            "cancelled transition cleanup must preserve the local source"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial"]
+    async fn rejected_transition_cleanup_durability_matrix() {
+        #[derive(Clone, Copy)]
+        enum CleanupCase {
+            Persisted,
+            DeleteFallback,
+            RetryPersisted,
+            FullyFailed,
+        }
+
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        for case in [
+            CleanupCase::Persisted,
+            CleanupCase::DeleteFallback,
+            CleanupCase::RetryPersisted,
+            CleanupCase::FullyFailed,
+        ] {
+            let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+            let backend = register_mock_tier(&tier_name).await;
+            let remote_version = Uuid::new_v4().to_string();
+            backend.set_put_remote_version(Some(remote_version.clone())).await;
+            backend.reject_next_non_empty_remote_version_validation();
+            backend.set_remove_failure(matches!(case, CleanupCase::FullyFailed));
+            let put_barrier = backend.arm_put_barrier().await;
+            let remove_barrier = if matches!(case, CleanupCase::RetryPersisted) {
+                Some(backend.arm_failing_remove_barrier().await)
+            } else {
+                None
+            };
+
+            let bucket_name = format!("test-transition-journal-failure-{}", &Uuid::new_v4().simple().to_string()[..8]);
+            let object_name = "test/rejected-candidate.bin";
+            let payload = b"journal failure must either delete the exact candidate or report both failures".repeat(1024);
+            create_test_bucket(&ecstore, bucket_name.as_str()).await;
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+            let original = ecstore
+                .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+                .await
+                .expect("source object metadata should resolve before transition");
+            let opts = ObjectOptions {
+                no_lock: true,
+                transition: TransitionOptions {
+                    status: TRANSITION_PENDING.to_string(),
+                    tier: tier_name,
+                    etag: original.etag.clone().expect("uploaded source object should have an ETag"),
+                    ..Default::default()
+                },
+                version_id: original.version_id.map(|version| version.to_string()),
+                mod_time: original.mod_time,
+                ..Default::default()
+            };
+
+            let transition_store = ecstore.clone();
+            let transition_bucket = bucket_name.clone();
+            let transition = tokio::spawn(async move {
+                transition_store
+                    .transition_object(transition_bucket.as_str(), object_name, &opts)
+                    .await
+            });
+            put_barrier.wait_until_paused().await;
+            let set = ecstore.pools[0].get_disks(0);
+            let mut saved_disks = if matches!(case, CleanupCase::Persisted) {
+                None
+            } else {
+                let mut disks = set.disks.write().await;
+                let saved = std::mem::take(&mut *disks);
+                *disks = vec![None; saved.len()];
+                Some(saved)
+            };
+            put_barrier.release();
+            if let Some(remove_barrier) = remove_barrier.as_ref() {
+                remove_barrier.wait_until_paused().await;
+                *set.disks.write().await = saved_disks.take().expect("offline disks should be restorable");
+                backend.set_remove_failure(true);
+                remove_barrier.release();
+            }
+            let transition_result = tokio::time::timeout(Duration::from_secs(30), transition).await;
+            if let Some(saved_disks) = saved_disks {
+                *set.disks.write().await = saved_disks;
+            }
+            let err = transition_result
+                .expect("transition should finish while validating cleanup durability")
+                .expect("transition task should not panic")
+                .expect_err("a versioned candidate must not commit to an unversioned tier");
+
+            match case {
+                CleanupCase::Persisted | CleanupCase::DeleteFallback => {
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0, "cleanup must remove the exact candidate");
+                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful cleanup must not retain a journal entry");
+                    assert_eq!(recovery.scanned, 0);
+                }
+                CleanupCase::RetryPersisted => {
+                    assert!(
+                        !err.to_string().contains("journal retry error"),
+                        "a successful journal retry must preserve the original version-constraint error"
+                    );
+                    assert_eq!(backend.object_count().await, 1);
+                    let retained = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("the retried journal should be recoverable");
+                    assert_eq!((retained.scanned, retained.deleted, retained.failed), (1, 0, 1));
+                    backend.set_remove_failure(false);
+                    let recovered = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("recovery should delete the exact retried candidate");
+                    assert_eq!((recovered.scanned, recovered.deleted, recovered.failed), (1, 1, 0));
+                    assert_eq!(backend.remove_versions().await, backend.put_versions().await);
+                    assert_eq!(backend.object_count().await, 0);
+                    let empty = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("successful recovery must remove the retried journal");
+                    assert_eq!(empty.scanned, 0);
+                }
+                CleanupCase::FullyFailed => {
+                    let message = err.to_string();
+                    assert!(message.contains("initial journal error"), "{message}");
+                    assert!(message.contains("cleanup error"), "{message}");
+                    assert!(message.contains("journal retry error"), "{message}");
+                    assert_eq!(backend.object_count().await, 1, "both failed safeguards must leave the candidate visible");
+                    assert!(backend.remove_versions().await.is_empty());
+                    let recovery = recover_tier_delete_journal_entries(ecstore.clone(), 100, None)
+                        .await
+                        .expect("failed journal writes must not create partial recovery entries");
+                    assert_eq!(recovery.scanned, 0);
+                }
+            }
+            assert_eq!(
+                read_object_fully(&ecstore, bucket_name.as_str(), object_name).await,
+                payload,
+                "rejected transition cleanup must preserve the local source"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+    fn test_transition_and_restore_flows() {
+        std::thread::Builder::new()
+            .name("scanner-transition-restore-flows".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("transition and restore test runtime should build");
+
+                runtime.block_on(test_transition_and_restore_flows_inner());
+            })
+            .expect("transition and restore test thread should spawn")
+            .join()
+            .expect("transition and restore test thread should finish");
+    }
+
+    async fn test_transition_and_restore_flows_inner() {
+        let (disk_paths, ecstore) = setup_test_env().await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&tier_name).await;
@@ -892,11 +1119,11 @@ mod serial_tests {
 
         assert_eq!(put_info.transitioned_object.status, "complete");
         assert_eq!(put_info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&put_info.transitioned_object.name));
+        assert!(backend.contains(&put_info.transitioned_object.name).await);
         {
-            let stored = backend.objects.lock().await;
-            let transitioned = stored
-                .get(&put_info.transitioned_object.name)
+            let transitioned = backend
+                .stored(&put_info.transitioned_object.name)
+                .await
                 .expect("transitioned object should be present in mock backend");
             assert_eq!(transitioned.metadata.get("content-type"), Some(&"text/plain".to_string()));
             assert!(
@@ -908,6 +1135,12 @@ mod serial_tests {
                 "transitioned objects must not invent object lock headers"
             );
         }
+
+        // Cross-shard xl.meta transition assertion helper (rustfs/backlog#1148 ilm-6):
+        // every disk must agree on the transition tuple for the object.
+        let put_meta = assert_transition_meta_consistent(&disk_paths, put_bucket.as_str(), put_object).await;
+        assert_eq!(put_meta.status, "complete");
+        assert_eq!(put_meta.tier, tier_name);
 
         let multipart_bucket = format!("test-immediate-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let multipart_object = "test/multipart.txt";
@@ -942,7 +1175,7 @@ mod serial_tests {
                 multipart_bucket.as_str(),
                 multipart_object,
                 &upload.upload_id,
-                vec![rustfs_ecstore::store_api::CompletePart {
+                vec![CompletePart {
                     part_num: 1,
                     etag: part.etag.clone(),
                     ..Default::default()
@@ -962,13 +1195,7 @@ mod serial_tests {
 
         assert_eq!(multipart_info.transitioned_object.status, "complete");
         assert_eq!(multipart_info.transitioned_object.tier, tier_name);
-        assert!(
-            backend
-                .objects
-                .lock()
-                .await
-                .contains_key(&multipart_info.transitioned_object.name)
-        );
+        assert!(backend.contains(&multipart_info.transitioned_object.name).await);
 
         let src_bucket = format!("test-immediate-copy-src-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let dst_bucket = format!("test-immediate-copy-dst-{}", &Uuid::new_v4().simple().to_string()[..8]);
@@ -1013,7 +1240,7 @@ mod serial_tests {
 
         assert_eq!(copy_info.transitioned_object.status, "complete");
         assert_eq!(copy_info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&copy_info.transitioned_object.name));
+        assert!(backend.contains(&copy_info.transitioned_object.name).await);
 
         let bucket_name = format!("test-lifecycle-update-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/existing.txt";
@@ -1036,7 +1263,7 @@ mod serial_tests {
 
         assert_eq!(info.transitioned_object.status, "complete");
         assert_eq!(info.transitioned_object.tier, tier_name);
-        assert!(backend.objects.lock().await.contains_key(&info.transitioned_object.name));
+        assert!(backend.contains(&info.transitioned_object.name).await);
 
         let bucket_name = format!("test-restore-mpu-{}", &Uuid::new_v4().simple().to_string()[..8]);
         let object_name = "test/restore.txt";
@@ -1087,12 +1314,12 @@ mod serial_tests {
                 object_name,
                 &upload.upload_id,
                 vec![
-                    rustfs_ecstore::store_api::CompletePart {
+                    CompletePart {
                         part_num: 1,
                         etag: uploaded_part1.etag.clone(),
                         ..Default::default()
                     },
-                    rustfs_ecstore::store_api::CompletePart {
+                    CompletePart {
                         part_num: 2,
                         etag: uploaded_part2.etag.clone(),
                         ..Default::default()
@@ -1159,7 +1386,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_enqueues_free_version_cleanup_for_stale_transitioned_object() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1183,7 +1410,7 @@ mod serial_tests {
             .await
             .expect("object should transition before overwrite");
         let stale_remote_object = transitioned.transitioned_object.name.clone();
-        assert!(backend.objects.lock().await.contains_key(&stale_remote_object));
+        assert!(backend.contains(&stale_remote_object).await);
 
         ecstore
             .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
@@ -1195,20 +1422,21 @@ mod serial_tests {
             "deleting a transitioned null version should leave a free version for async cleanup"
         );
         assert!(
-            backend.objects.lock().await.contains_key(&stale_remote_object),
+            backend.contains(&stale_remote_object).await,
             "stale transitioned remote object should still exist before scanner fallback runs"
         );
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
         scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
-            wait_for_remote_absence(&backend, &stale_remote_object, TRANSITION_WAIT_TIMEOUT).await,
+            backend
+                .wait_for_remote_absence(&stale_remote_object, TRANSITION_WAIT_TIMEOUT)
+                .await,
             "scanner should enqueue stale free-version cleanup for the transitioned remote object"
         );
-        assert_eq!(
-            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await,
-            0,
+        assert!(
+            wait_for_free_version_absence(&disk_paths[0], bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT).await,
             "free-version metadata should be removed after scanner-triggered cleanup"
         );
         assert!(
@@ -1219,7 +1447,400 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+    async fn test_scanner_cleanup_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-scanner-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"scanner cleanup should still work after immediate compensation";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after compensation backfill");
+        let stale_remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.contains(&stale_remote_object).await);
+
+        ecstore
+            .delete_object(bucket_name.as_str(), object_name, ObjectOptions::default())
+            .await
+            .expect("Failed to delete transitioned object after compensation-driven transition");
+
+        assert!(
+            free_version_count(&disk_paths[0], bucket_name.as_str(), object_name).await > 0,
+            "deleting a compensation-transitioned null version should leave a free version for async cleanup"
+        );
+        assert!(
+            backend.contains(&stale_remote_object).await,
+            "stale transitioned remote object should still exist before scanner cleanup runs"
+        );
+
+        init_background_expiry(ecstore.clone()).await;
+        scan_object_metadata(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            backend
+                .wait_for_remote_absence(&stale_remote_object, TRANSITION_WAIT_TIMEOUT)
+                .await,
+            "scanner should clean stale remote object even after immediate compensation transitioned it"
+        );
+        assert!(
+            wait_for_free_version_absence(&disk_paths[0], bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT).await,
+            "free-version metadata should be removed after scanner cleanup"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+    async fn test_existing_object_backfill_is_idempotent_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(false).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-backfill-after-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"existing-object backfill should be idempotent after compensation transition";
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition after immediate compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.contains(&remote_object).await);
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("existing-object backfill should succeed after compensation transition");
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should remain transitioned after existing-object backfill rerun");
+
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+        assert_eq!(info.transitioned_object.name, remote_object);
+        assert!(backend.contains(&remote_object).await);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
+    async fn test_noncurrent_expiry_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-versioned-compensation-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>{tier_name}</StorageClass>
+        </Transition>
+        <NoncurrentVersionExpiration>
+            <NoncurrentDays>0</NoncurrentDays>
+        </NoncurrentVersionExpiration>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+            ecstore
+                .put_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("failed to upload v2");
+        })
+        .await;
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+        assert!(backend.contains(&info.transitioned_object.name).await);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_version_count(&ecstore, bucket_name.as_str(), object_name, 1, Duration::from_secs(3)).await,
+            "noncurrent expiry should still remove the previous version after compensation transition"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "FAILING on main: excluded from the serial ILM lane pending a fix, see rustfs/backlog#1148 (ilm-1 partial)"]
+    async fn test_noncurrent_transition_still_works_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-noncurrent-transition-comp-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+
+        let lifecycle_xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<LifecycleConfiguration>
+    <Rule>
+        <ID>test-rule</ID>
+        <Status>Enabled</Status>
+        <Filter>
+            <Prefix>test/</Prefix>
+        </Filter>
+        <Transition>
+          <Days>0</Days>
+          <StorageClass>{tier_name}</StorageClass>
+        </Transition>
+        <NoncurrentVersionTransition>
+            <NoncurrentDays>0</NoncurrentDays>
+            <StorageClass>{tier_name}</StorageClass>
+        </NoncurrentVersionTransition>
+    </Rule>
+</LifecycleConfiguration>"#
+        );
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let mut reader = PutObjReader::from_vec(b"v1".to_vec());
+        ecstore
+            .put_object(
+                bucket_name.as_str(),
+                object_name,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("failed to upload v1");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            let mut reader = PutObjReader::from_vec(b"v2".to_vec());
+            ecstore
+                .put_object(
+                    bucket_name.as_str(),
+                    object_name,
+                    &mut reader,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("failed to upload v2");
+        })
+        .await;
+
+        let info = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        assert_eq!(info.transitioned_object.status, "complete");
+        assert_eq!(info.transitioned_object.tier, tier_name);
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            backend.wait_for_object_count(2, TRANSITION_WAIT_TIMEOUT).await,
+            "noncurrent transition should still move the previous version into the remote tier"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+    async fn test_modeled_versioned_delete_creates_delete_marker_after_immediate_compensation_transition() {
+        let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-versioned-delete-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled versioned delete should create delete marker after compensation";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.contains(&remote_object).await);
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "versioned delete modeled with versioned flags should create a delete marker"
+        );
+        assert!(
+            backend.contains(&remote_object).await,
+            "creating a delete marker should not remove the transitioned remote object version"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
+    async fn test_modeled_delete_marker_cleanup_after_immediate_compensation_transition() {
+        let (disk_paths, ecstore) = setup_isolated_test_env(true).await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-modeled-del-marker-cleanup-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        let object_name = "test/object.txt";
+        let payload = b"modeled delete-marker cleanup should converge after compensation transition";
+
+        create_test_lock_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set transition lifecycle configuration");
+
+        with_forced_immediate_enqueue_timeout(|| async {
+            upload_test_object(&ecstore, bucket_name.as_str(), object_name, payload).await;
+        })
+        .await;
+
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("current version should transition after compensation backfill");
+        let remote_object = transitioned.transitioned_object.name.clone();
+        assert!(backend.contains(&remote_object).await);
+
+        ecstore
+            .delete_object(
+                bucket_name.as_str(),
+                object_name,
+                modeled_versioned_delete_opts(bucket_name.as_str(), object_name).await,
+            )
+            .await
+            .expect("modeled versioned delete should succeed");
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "modeled versioned delete should create delete marker before cleanup"
+        );
+        assert!(
+            backend.contains(&remote_object).await,
+            "delete marker creation should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_delmarker_expiration(bucket_name.as_str(), 1)
+            .await
+            .expect("Failed to set delete marker expiration lifecycle configuration");
+
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            object_is_delete_marker(&ecstore, bucket_name.as_str(), object_name).await,
+            "delete marker should remain before DelMarkerExpiration due time"
+        );
+        assert!(
+            backend.contains(&remote_object).await,
+            "pre-due delete marker lifecycle scan should not remove transitioned remote object"
+        );
+
+        set_bucket_lifecycle_deletemarker(bucket_name.as_str())
+            .await
+            .expect("Failed to set expired object delete marker lifecycle configuration");
+        scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
+
+        assert!(
+            wait_for_object_absence(&ecstore, bucket_name.as_str(), object_name, Duration::from_secs(5)).await,
+            "expired object delete marker lifecycle should eventually clean up the delete marker"
+        );
+        assert!(
+            backend.contains(&remote_object).await,
+            "delete marker lifecycle cleanup should not remove transitioned remote object"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_current_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1235,7 +1856,7 @@ mod serial_tests {
 
         assert!(object_exists(&ecstore, bucket_name.as_str(), object_name).await);
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
         assert!(
@@ -1246,7 +1867,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_current_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1270,7 +1891,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1284,7 +1905,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_scanner_expires_zero_day_noncurrent_version() {
         let (disk_paths, ecstore) = setup_isolated_test_env(false).await;
 
@@ -1335,11 +1956,11 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
-        rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+        init_background_expiry(ecstore.clone()).await;
 
         scan_object_with_lifecycle(&disk_paths[0], bucket_name.as_str(), object_name).await;
 
@@ -1351,7 +1972,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_put_object_immediately_enqueues_zero_day_noncurrent_expiry() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1373,7 +1994,7 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
@@ -1436,7 +2057,7 @@ mod serial_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     #[serial]
-    #[ignore = "requires isolated global object layer state"]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
     async fn test_background_scanner_expires_zero_day_current_version_for_exact_key_prefix() {
         let (_disk_paths, ecstore) = setup_isolated_test_env(true).await;
 
@@ -1460,7 +2081,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
         upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;
@@ -1473,5 +2094,273 @@ mod serial_tests {
         ctx.cancel();
 
         assert!(deleted, "background scanner should delete zero-day exact-key lifecycle targets");
+    }
+
+    /// Read the full object body through the regular GET path.
+    async fn read_object_fully(ecstore: &Arc<ECStore>, bucket: &str, object: &str) -> Vec<u8> {
+        let mut reader = ecstore
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("Failed to open object reader");
+        let mut data = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut data)
+            .await
+            .expect("Failed to consume object stream");
+        data
+    }
+
+    /// backlog#1148 ilm-8: the full restore chain on a transitioned object.
+    ///
+    /// transition -> restore(days=1) -> the restored copy serves GET locally
+    /// (the mock tier records zero additional `get` calls) -> the scanner's
+    /// restore-expiry action (`DeleteRestoredAction`, driven directly like the
+    /// ilm-2 expiry test; the evaluator mapping from a past `restore_expires`
+    /// to this action is pinned by unit tests in crates/lifecycle) removes ONLY
+    /// the local restored copy -> the object is still transitioned, the remote
+    /// tier object is untouched (zero `remove` calls) -> GET streams from the
+    /// tier again -> a second restore succeeds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    async fn test_restore_chain_local_read_expiry_keeps_remote_and_allows_re_restore() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-restore-chain-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        // Must live under the `test/` prefix: `set_bucket_lifecycle_transition_with_tier`
+        // installs a transition rule filtered on `test/`, so any other key never
+        // transitions and `wait_for_transition` below times out.
+        let object_name = "test/restore/report.bin";
+        // Position-dependent payload so a misaligned read is caught.
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+        upload_test_object(&ecstore, bucket_name.as_str(), object_name, &payload).await;
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transition for existing objects");
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("object should transition before restore");
+        let remote_object = transitioned.transitioned_object.name.clone();
+
+        // Restore for one day.
+        let restore_opts = || ObjectOptions {
+            transition: TransitionOptions {
+                restore_request: RestoreRequest {
+                    days: Some(1),
+                    description: None,
+                    glacier_job_parameters: None,
+                    output_location: None,
+                    select_parameters: None,
+                    tier: None,
+                    type_: None,
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        ecstore
+            .clone()
+            .restore_transitioned_object(bucket_name.as_str(), object_name, &restore_opts())
+            .await
+            .expect("Failed to restore transitioned object");
+
+        let restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load restored object info");
+        assert!(restored.restore_expires.is_some(), "restore must record an expiry date");
+        assert!(!restored.restore_ongoing, "restore must be complete");
+        assert_eq!(
+            restored.transitioned_object.status, "complete",
+            "restore must not clear the transitioned state"
+        );
+
+        // GET is served from the LOCAL restored copy: the mock tier records no
+        // further `get` calls.
+        let tier_gets_after_restore = backend.get_count().await;
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data, payload, "restored GET must return the original bytes");
+        assert_eq!(
+            backend.get_count().await,
+            tier_gets_after_restore,
+            "GET of a restored object must be served locally, not from the tier"
+        );
+
+        // The scanner's restore-expiry action removes only the local restored
+        // copy (same direct-drive pattern as the ilm-2 expiry test).
+        let lc_event = LcEvent {
+            action: IlmAction::DeleteRestoredAction,
+            ..Default::default()
+        };
+        let bucket_incarnation_id = ecstore
+            .bucket_incarnation_id(bucket_name.as_str())
+            .await
+            .expect("read bucket incarnation");
+        expire_transitioned_object(ecstore.clone(), &restored, &lc_event, &LcEventSrc::Scanner, bucket_incarnation_id)
+            .await
+            .expect("restore-expiry cleanup should succeed");
+
+        let after = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("object must still exist after restored-copy cleanup");
+        assert!(
+            after.restore_expires.is_none(),
+            "restore headers must be stripped by DeleteRestoredAction"
+        );
+        assert_eq!(
+            after.transitioned_object.status, "complete",
+            "the object must remain transitioned after restored-copy cleanup"
+        );
+        assert_eq!(backend.remove_count().await, 0, "restore-expiry must never remove the remote tier object");
+        assert!(
+            backend.contains(&remote_object).await,
+            "remote tier object must survive restored-copy cleanup"
+        );
+
+        // GET now streams from the tier again...
+        let tier_gets_before_remote_read = backend.get_count().await;
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data, payload, "post-cleanup GET must stream the original bytes from the tier");
+        assert!(
+            backend.get_count().await > tier_gets_before_remote_read,
+            "post-cleanup GET must hit the remote tier"
+        );
+
+        // ...and the object is restorable again.
+        ecstore
+            .clone()
+            .restore_transitioned_object(bucket_name.as_str(), object_name, &restore_opts())
+            .await
+            .expect("object must be restorable again after restored-copy cleanup");
+        let re_restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load re-restored object info");
+        assert!(re_restored.restore_expires.is_some(), "second restore must record an expiry");
+    }
+
+    /// backlog#1148 ilm-8: restoring a transitioned MULTIPART object (>= 3
+    /// parts) must reassemble the exact part layout: part count and sizes,
+    /// the multipart ETag, and byte-identical content across part boundaries.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    #[serial]
+    #[ignore = "global-state ILM integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-8)"]
+    async fn test_multipart_restore_preserves_parts_and_etag() {
+        let (_disk_paths, ecstore) = setup_test_env().await;
+
+        let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
+        let _backend = register_mock_tier(&tier_name).await;
+
+        let bucket_name = format!("test-restore-mpu3-{}", &Uuid::new_v4().simple().to_string()[..8]);
+        // Must live under the `test/` prefix (see the transition rule filter in
+        // `set_bucket_lifecycle_transition_with_tier`) or the object never
+        // transitions and `wait_for_transition` below times out.
+        let object_name = "test/restore/multipart.bin";
+        // Three parts: 5 MiB + 5 MiB + small tail, with position-dependent
+        // bytes so any part-boundary mixup is caught.
+        let part_sizes = [5 * 1024 * 1024usize, 5 * 1024 * 1024, 4096];
+        let total: usize = part_sizes.iter().sum();
+        let expected: Vec<u8> = (0..total).map(|i| (i % 249) as u8).collect();
+
+        create_test_bucket(&ecstore, bucket_name.as_str()).await;
+        set_bucket_lifecycle_transition_with_tier(bucket_name.as_str(), &tier_name)
+            .await
+            .expect("Failed to set lifecycle configuration");
+
+        let upload = ecstore
+            .new_multipart_upload(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to create multipart upload");
+        let mut completed = Vec::new();
+        let mut offset = 0usize;
+        for (idx, part_size) in part_sizes.iter().enumerate() {
+            let mut reader = PutObjReader::from_vec(expected[offset..offset + part_size].to_vec());
+            let part = ecstore
+                .put_object_part(
+                    bucket_name.as_str(),
+                    object_name,
+                    &upload.upload_id,
+                    idx + 1,
+                    &mut reader,
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("Failed to upload multipart part");
+            completed.push(CompletePart {
+                part_num: idx + 1,
+                etag: part.etag.clone(),
+                ..Default::default()
+            });
+            offset += part_size;
+        }
+        ecstore
+            .clone()
+            .complete_multipart_upload(bucket_name.as_str(), object_name, &upload.upload_id, completed, &ObjectOptions::default())
+            .await
+            .expect("Failed to complete multipart upload");
+
+        enqueue_transition_for_existing_objects(ecstore.clone(), bucket_name.as_str())
+            .await
+            .expect("Failed to enqueue transition for existing objects");
+        let transitioned = wait_for_transition(&ecstore, bucket_name.as_str(), object_name, TRANSITION_WAIT_TIMEOUT)
+            .await
+            .expect("multipart object should transition before restore");
+        assert_eq!(transitioned.parts.len(), part_sizes.len());
+        let etag_before = transitioned.etag.clone();
+        assert!(
+            etag_before.as_deref().is_some_and(|etag| etag.ends_with("-3")),
+            "expected a 3-part multipart etag, got {etag_before:?}"
+        );
+
+        ecstore
+            .clone()
+            .restore_transitioned_object(
+                bucket_name.as_str(),
+                object_name,
+                &ObjectOptions {
+                    transition: TransitionOptions {
+                        restore_request: RestoreRequest {
+                            days: Some(1),
+                            description: None,
+                            glacier_job_parameters: None,
+                            output_location: None,
+                            select_parameters: None,
+                            tier: None,
+                            type_: None,
+                        },
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to restore transitioned multipart object");
+
+        let restored = ecstore
+            .get_object_info(bucket_name.as_str(), object_name, &ObjectOptions::default())
+            .await
+            .expect("Failed to load restored multipart object info");
+        assert!(restored.restore_expires.is_some());
+        assert!(!restored.restore_ongoing);
+        assert_eq!(restored.parts.len(), part_sizes.len(), "restore must preserve the part count");
+        for (idx, part_size) in part_sizes.iter().enumerate() {
+            assert_eq!(restored.parts[idx].size, *part_size, "restore must preserve the size of part {}", idx + 1);
+        }
+        assert_eq!(restored.etag, etag_before, "restore must preserve the multipart ETag");
+
+        let data = read_object_fully(&ecstore, bucket_name.as_str(), object_name).await;
+        assert_eq!(data.len(), expected.len(), "restored multipart read-back length mismatch");
+        assert_eq!(data, expected, "restored multipart read-back must be byte-identical");
     }
 }

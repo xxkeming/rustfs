@@ -12,30 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
-use crate::{MetricDescriptor, MetricName, new_gauge_md, subsystems};
+use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_gauge_md};
 use std::sync::LazyLock;
 
 const BUCKET_LABEL: &str = "bucket";
 
-/// Total bytes used by the bucket
+/// Cluster-wide logical bytes used by the bucket.
 pub static BUCKET_USAGE_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("usage_bytes".to_string()),
-        "Total bytes used by the bucket",
+        "Cluster-wide logical bytes used by the bucket",
         &[BUCKET_LABEL],
-        subsystems::BUCKET_API,
+        MetricSubsystem::new("/bucket/usage"),
     )
 });
 
-/// Total number of objects in the bucket
+/// Cluster-wide logical object count in the bucket.
 pub static BUCKET_OBJECTS_TOTAL_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| {
     new_gauge_md(
         MetricName::Custom("objects_total".to_string()),
-        "Total number of objects in the bucket",
+        "Cluster-wide logical object count in the bucket",
         &[BUCKET_LABEL],
-        subsystems::BUCKET_API,
+        MetricSubsystem::new("/bucket/usage"),
     )
 });
 
@@ -45,6 +43,20 @@ pub static BUCKET_QUOTA_BYTES_MD: LazyLock<MetricDescriptor> = LazyLock::new(|| 
         MetricName::Custom("quota_bytes".to_string()),
         "Quota limit in bytes for the bucket",
         &[BUCKET_LABEL],
-        subsystems::BUCKET_API,
+        MetricSubsystem::new("/bucket/usage"),
     )
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bucket_usage_descriptors_use_bucket_usage_subsystem() {
+        assert_eq!(BUCKET_USAGE_BYTES_MD.subsystem.path(), "/bucket/usage");
+        assert_eq!(BUCKET_OBJECTS_TOTAL_MD.subsystem.path(), "/bucket/usage");
+        assert_eq!(BUCKET_QUOTA_BYTES_MD.subsystem.path(), "/bucket/usage");
+        assert!(BUCKET_USAGE_BYTES_MD.help.contains("Cluster-wide logical"));
+        assert!(BUCKET_OBJECTS_TOTAL_MD.help.contains("Cluster-wide logical"));
+    }
+}

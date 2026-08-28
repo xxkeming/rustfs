@@ -13,7 +13,6 @@
 // limitations under the License.
 
 /// The metric name is the individual name of the metric
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MetricName {
     // The generic metric name
@@ -175,6 +174,7 @@ pub enum MetricName {
 
     // Audit metrics
     AuditFailedMessages,
+    AuditFailedStoreLength,
     AuditTargetQueueLength,
     AuditTotalMessages,
 
@@ -221,6 +221,7 @@ pub enum MetricName {
     NotificationEventsSentTotal,
     NotificationEventsSkippedTotal,
     NotificationTargetFailedMessages,
+    NotificationTargetFailedStoreLength,
     NotificationTargetQueueLength,
     NotificationTargetTotalMessages,
 
@@ -231,6 +232,7 @@ pub enum MetricName {
     UsageVersionsCount,
     UsageDeleteMarkersCount,
     UsageBucketsCount,
+    UsageSnapshotConverged,
     UsageSizeDistribution,
     UsageVersionCountDistribution,
 
@@ -248,6 +250,10 @@ pub enum MetricName {
     IlmTransitionActiveTasks,
     IlmTransitionPendingTasks,
     IlmTransitionMissedImmediateTasks,
+    IlmTransitionQueueFullTasks,
+    IlmTransitionQueueSendTimeoutTasks,
+    IlmTransitionCompensationScheduledTasks,
+    IlmTransitionCompensationRunningTasks,
     IlmVersionsScanned,
 
     // Copy the relevant metrics
@@ -274,6 +280,73 @@ pub enum MetricName {
     ScannerObjectsScanned,
     ScannerVersionsScanned,
     ScannerLastActivitySeconds,
+    ScannerActivePaths,
+    ScannerOldestActivePathAgeSeconds,
+    ScannerCurrentSetScanConcurrencyLimit,
+    ScannerCurrentSetScansQueued,
+    ScannerCurrentSetScansActive,
+    ScannerCurrentDiskScanConcurrencyLimit,
+    ScannerCurrentDiskBucketScansQueued,
+    ScannerCurrentDiskBucketScansActive,
+    ScannerBucketScansFailed,
+    ScannerThrottleIdleModeEnabled,
+    ScannerThrottleSleepFactor,
+    ScannerThrottleMaxSleepSeconds,
+    ScannerYieldEveryNObjects,
+    ScannerCycleIntervalSeconds,
+    ScannerCycleMaxDurationSeconds,
+    ScannerCycleMaxObjects,
+    ScannerCycleMaxDirectories,
+    ScannerBitrotCycleEnabled,
+    ScannerBitrotCycleSeconds,
+    ScannerCurrentCycle,
+    ScannerCompletedCycles,
+    ScannerCurrentCycleAgeSeconds,
+    ScannerCurrentCycleObjectsScanned,
+    ScannerCurrentCycleDirectoriesScanned,
+    ScannerCurrentCycleBucketDriveScans,
+    ScannerCurrentCycleBucketDriveFailures,
+    ScannerCurrentCycleObjectsPerSecond,
+    ScannerCurrentCycleDirectoriesPerSecond,
+    ScannerCurrentCycleBucketDriveScansPerSecond,
+    ScannerCurrentCycleYieldEvents,
+    ScannerCurrentCycleYieldDurationSeconds,
+    ScannerCurrentCycleThrottleSleepEvents,
+    ScannerCurrentCycleThrottleSleepDurationSeconds,
+    ScannerCurrentCycleIlmActions,
+    ScannerCurrentCycleHealObjects,
+    ScannerCurrentCycleReplicationChecks,
+    ScannerCurrentCycleUsageSaves,
+    ScannerCurrentScanMode,
+    ScannerLastCycleResult,
+    ScannerLastCyclePartialReason,
+    ScannerLastCycleDurationSeconds,
+    ScannerLastCycleObjectsScanned,
+    ScannerLastCycleDirectoriesScanned,
+    ScannerLastCycleBucketDriveScans,
+    ScannerLastCycleBucketDriveFailures,
+    ScannerLastCycleObjectsPerSecond,
+    ScannerLastCycleDirectoriesPerSecond,
+    ScannerLastCycleBucketDriveScansPerSecond,
+    ScannerLastCycleYieldEvents,
+    ScannerLastCycleYieldDurationSeconds,
+    ScannerLastCycleThrottleSleepEvents,
+    ScannerLastCycleThrottleSleepDurationSeconds,
+    ScannerLastCycleIlmActions,
+    ScannerLastCycleHealObjects,
+    ScannerLastCycleReplicationChecks,
+    ScannerLastCycleUsageSaves,
+    ScannerFailedCycles,
+    ScannerSupersededCycles,
+    ScannerPartialCycles,
+    ScannerPartialCyclesByReason,
+
+    // Compression-related metrics
+    CompressedBytesTotal,
+    OriginedBytesTotal,
+    SavedBytesTotal,
+    CompressionRatio,
+    CompressionOperationsTotal,
 
     // CPU system-related metrics
     SysCPUAvgIdle,
@@ -298,6 +371,8 @@ pub enum MetricName {
     DriveWaitingIO,
     DriveAPILatencyMicros,
     DriveHealth,
+    DriveWritesTotal,
+    DriveDeletesTotal,
 
     DriveOfflineCount,
     DriveOnlineCount,
@@ -369,7 +444,6 @@ pub enum MetricName {
 }
 
 impl MetricName {
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         match self {
             Self::AuthTotal => "auth_total".to_string(),
@@ -511,6 +585,7 @@ impl MetricName {
             Self::ApiTrafficRecvBytes => "traffic_received_bytes".to_string(),
 
             Self::AuditFailedMessages => "failed_messages".to_string(),
+            Self::AuditFailedStoreLength => "failed_store_length".to_string(),
             Self::AuditTargetQueueLength => "target_queue_length".to_string(),
             Self::AuditTotalMessages => "total_messages".to_string(),
 
@@ -557,6 +632,7 @@ impl MetricName {
             Self::NotificationEventsSentTotal => "events_sent_total".to_string(),
             Self::NotificationEventsSkippedTotal => "events_skipped_total".to_string(),
             Self::NotificationTargetFailedMessages => "failed_messages".to_string(),
+            Self::NotificationTargetFailedStoreLength => "failed_store_length".to_string(),
             Self::NotificationTargetQueueLength => "target_queue_length".to_string(),
             Self::NotificationTargetTotalMessages => "total_messages".to_string(),
 
@@ -567,6 +643,7 @@ impl MetricName {
             Self::UsageVersionsCount => "versions_count".to_string(),
             Self::UsageDeleteMarkersCount => "delete_markers_count".to_string(),
             Self::UsageBucketsCount => "buckets_count".to_string(),
+            Self::UsageSnapshotConverged => "snapshot_converged".to_string(),
             Self::UsageSizeDistribution => "size_distribution".to_string(),
             Self::UsageVersionCountDistribution => "version_count_distribution".to_string(),
 
@@ -584,6 +661,10 @@ impl MetricName {
             Self::IlmTransitionActiveTasks => "transition_active_tasks".to_string(),
             Self::IlmTransitionPendingTasks => "transition_pending_tasks".to_string(),
             Self::IlmTransitionMissedImmediateTasks => "transition_missed_immediate_tasks".to_string(),
+            Self::IlmTransitionQueueFullTasks => "transition_queue_full_tasks".to_string(),
+            Self::IlmTransitionQueueSendTimeoutTasks => "transition_queue_send_timeout_tasks".to_string(),
+            Self::IlmTransitionCompensationScheduledTasks => "transition_compensation_scheduled_tasks".to_string(),
+            Self::IlmTransitionCompensationRunningTasks => "transition_compensation_running_tasks".to_string(),
             Self::IlmVersionsScanned => "versions_scanned".to_string(),
 
             // Copy the relevant metrics
@@ -610,6 +691,73 @@ impl MetricName {
             Self::ScannerObjectsScanned => "objects_scanned".to_string(),
             Self::ScannerVersionsScanned => "versions_scanned".to_string(),
             Self::ScannerLastActivitySeconds => "last_activity_seconds".to_string(),
+            Self::ScannerActivePaths => "active_paths".to_string(),
+            Self::ScannerOldestActivePathAgeSeconds => "oldest_active_path_age_seconds".to_string(),
+            Self::ScannerCurrentSetScanConcurrencyLimit => "current_set_scan_concurrency_limit".to_string(),
+            Self::ScannerCurrentSetScansQueued => "current_set_scans_queued".to_string(),
+            Self::ScannerCurrentSetScansActive => "current_set_scans_active".to_string(),
+            Self::ScannerCurrentDiskScanConcurrencyLimit => "current_disk_scan_concurrency_limit".to_string(),
+            Self::ScannerCurrentDiskBucketScansQueued => "current_disk_bucket_scans_queued".to_string(),
+            Self::ScannerCurrentDiskBucketScansActive => "current_disk_bucket_scans_active".to_string(),
+            Self::ScannerBucketScansFailed => "bucket_scans_failed".to_string(),
+            Self::ScannerThrottleIdleModeEnabled => "throttle_idle_mode_enabled".to_string(),
+            Self::ScannerThrottleSleepFactor => "throttle_sleep_factor".to_string(),
+            Self::ScannerThrottleMaxSleepSeconds => "throttle_max_sleep_seconds".to_string(),
+            Self::ScannerYieldEveryNObjects => "yield_every_n_objects".to_string(),
+            Self::ScannerCycleIntervalSeconds => "cycle_interval_seconds".to_string(),
+            Self::ScannerCycleMaxDurationSeconds => "cycle_max_duration_seconds".to_string(),
+            Self::ScannerCycleMaxObjects => "cycle_max_objects".to_string(),
+            Self::ScannerCycleMaxDirectories => "cycle_max_directories".to_string(),
+            Self::ScannerBitrotCycleEnabled => "bitrot_cycle_enabled".to_string(),
+            Self::ScannerBitrotCycleSeconds => "bitrot_cycle_seconds".to_string(),
+            Self::ScannerCurrentCycle => "current_cycle".to_string(),
+            Self::ScannerCompletedCycles => "completed_cycles".to_string(),
+            Self::ScannerCurrentCycleAgeSeconds => "current_cycle_age_seconds".to_string(),
+            Self::ScannerCurrentCycleObjectsScanned => "current_cycle_objects_scanned".to_string(),
+            Self::ScannerCurrentCycleDirectoriesScanned => "current_cycle_directories_scanned".to_string(),
+            Self::ScannerCurrentCycleBucketDriveScans => "current_cycle_bucket_drive_scans".to_string(),
+            Self::ScannerCurrentCycleBucketDriveFailures => "current_cycle_bucket_drive_failures".to_string(),
+            Self::ScannerCurrentCycleObjectsPerSecond => "current_cycle_objects_per_second".to_string(),
+            Self::ScannerCurrentCycleDirectoriesPerSecond => "current_cycle_directories_per_second".to_string(),
+            Self::ScannerCurrentCycleBucketDriveScansPerSecond => "current_cycle_bucket_drive_scans_per_second".to_string(),
+            Self::ScannerCurrentCycleYieldEvents => "current_cycle_yield_events".to_string(),
+            Self::ScannerCurrentCycleYieldDurationSeconds => "current_cycle_yield_duration_seconds".to_string(),
+            Self::ScannerCurrentCycleThrottleSleepEvents => "current_cycle_throttle_sleep_events".to_string(),
+            Self::ScannerCurrentCycleThrottleSleepDurationSeconds => "current_cycle_throttle_sleep_duration_seconds".to_string(),
+            Self::ScannerCurrentCycleIlmActions => "current_cycle_ilm_actions".to_string(),
+            Self::ScannerCurrentCycleHealObjects => "current_cycle_heal_objects".to_string(),
+            Self::ScannerCurrentCycleReplicationChecks => "current_cycle_replication_checks".to_string(),
+            Self::ScannerCurrentCycleUsageSaves => "current_cycle_usage_saves".to_string(),
+            Self::ScannerCurrentScanMode => "current_scan_mode".to_string(),
+            Self::ScannerLastCycleResult => "last_cycle_result".to_string(),
+            Self::ScannerLastCyclePartialReason => "last_cycle_partial_reason".to_string(),
+            Self::ScannerLastCycleDurationSeconds => "last_cycle_duration_seconds".to_string(),
+            Self::ScannerLastCycleObjectsScanned => "last_cycle_objects_scanned".to_string(),
+            Self::ScannerLastCycleDirectoriesScanned => "last_cycle_directories_scanned".to_string(),
+            Self::ScannerLastCycleBucketDriveScans => "last_cycle_bucket_drive_scans".to_string(),
+            Self::ScannerLastCycleBucketDriveFailures => "last_cycle_bucket_drive_failures".to_string(),
+            Self::ScannerLastCycleObjectsPerSecond => "last_cycle_objects_per_second".to_string(),
+            Self::ScannerLastCycleDirectoriesPerSecond => "last_cycle_directories_per_second".to_string(),
+            Self::ScannerLastCycleBucketDriveScansPerSecond => "last_cycle_bucket_drive_scans_per_second".to_string(),
+            Self::ScannerLastCycleYieldEvents => "last_cycle_yield_events".to_string(),
+            Self::ScannerLastCycleYieldDurationSeconds => "last_cycle_yield_duration_seconds".to_string(),
+            Self::ScannerLastCycleThrottleSleepEvents => "last_cycle_throttle_sleep_events".to_string(),
+            Self::ScannerLastCycleThrottleSleepDurationSeconds => "last_cycle_throttle_sleep_duration_seconds".to_string(),
+            Self::ScannerLastCycleIlmActions => "last_cycle_ilm_actions".to_string(),
+            Self::ScannerLastCycleHealObjects => "last_cycle_heal_objects".to_string(),
+            Self::ScannerLastCycleReplicationChecks => "last_cycle_replication_checks".to_string(),
+            Self::ScannerLastCycleUsageSaves => "last_cycle_usage_saves".to_string(),
+            Self::ScannerFailedCycles => "failed_cycles".to_string(),
+            Self::ScannerSupersededCycles => "superseded_cycles".to_string(),
+            Self::ScannerPartialCycles => "partial_cycles".to_string(),
+            Self::ScannerPartialCyclesByReason => "partial_cycles_by_reason".to_string(),
+
+            // Compression-related metrics
+            Self::CompressedBytesTotal => "compressed_bytes".to_string(),
+            Self::OriginedBytesTotal => "original_bytes".to_string(),
+            Self::SavedBytesTotal => "saved_bytes".to_string(),
+            Self::CompressionRatio => "compression_ratio".to_string(),
+            Self::CompressionOperationsTotal => "compression_operation_total".to_string(),
 
             // CPU system-related metrics
             Self::SysCPUAvgIdle => "avg_idle".to_string(),
@@ -634,6 +782,8 @@ impl MetricName {
             Self::DriveWaitingIO => "waiting_io".to_string(),
             Self::DriveAPILatencyMicros => "api_latency_micros".to_string(),
             Self::DriveHealth => "health".to_string(),
+            Self::DriveWritesTotal => "writes_total".to_string(),
+            Self::DriveDeletesTotal => "deletes_total".to_string(),
 
             Self::DriveOfflineCount => "offline_count".to_string(),
             Self::DriveOnlineCount => "online_count".to_string(),

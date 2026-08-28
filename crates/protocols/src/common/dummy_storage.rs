@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #![cfg(test)]
+#![allow(dead_code)]
 
 //! Storage-backend double for protocol driver unit tests.
 //!
@@ -29,6 +30,8 @@
 //! SessionContext type in common::session.
 
 use crate::common::client::s3::StorageBackend;
+#[cfg(feature = "webdav")]
+use crate::common::session::SessionContext;
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_util::stream::{self, StreamExt};
@@ -36,8 +39,8 @@ use s3s::dto::{
     AbortMultipartUploadInput, AbortMultipartUploadOutput, CompleteMultipartUploadInput, CompleteMultipartUploadOutput,
     CopyObjectInput, CopyObjectOutput, CopyPartResult, CreateBucketOutput, CreateMultipartUploadInput,
     CreateMultipartUploadOutput, DeleteBucketOutput, DeleteObjectOutput, ETag, GetObjectOutput, HeadBucketOutput,
-    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, PutObjectInput, PutObjectOutput, StreamingBlob,
-    Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
+    HeadObjectOutput, ListBucketsOutput, ListObjectsV2Input, ListObjectsV2Output, Object, ObjectKey, PutObjectInput,
+    PutObjectOutput, StreamingBlob, Timestamp, UploadPartCopyInput, UploadPartCopyOutput, UploadPartInput, UploadPartOutput,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -120,6 +123,14 @@ pub struct HeadObjectCall {
     pub key: String,
 }
 
+/// Recorded invocation of delete_object. Tests assert on these to observe
+/// which objects a recursive delete path actually removed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteObjectCall {
+    pub bucket: String,
+    pub key: String,
+}
+
 struct Inner {
     // Response queues. Each method pops from its own queue. Empty queue
     // plus no default means a configured-miss error.
@@ -131,6 +142,8 @@ struct Inner {
     head_bucket: VecDeque<Result<HeadBucketOutput, DummyError>>,
     list_objects_v2: VecDeque<Result<ListObjectsV2Output, DummyError>>,
     list_buckets: VecDeque<Result<ListBucketsOutput, DummyError>>,
+    session_list_buckets: VecDeque<s3s::S3Result<ListBucketsOutput>>,
+    last_session_list_context: Option<(http::HeaderMap, bool)>,
     create_bucket: VecDeque<Result<CreateBucketOutput, DummyError>>,
     delete_bucket: VecDeque<Result<DeleteBucketOutput, DummyError>>,
     copy_object: VecDeque<Result<CopyObjectOutput, DummyError>>,
@@ -147,6 +160,8 @@ struct Inner {
     upload_part_calls: Vec<UploadPartCall>,
     complete_multipart_calls: Vec<CompleteCall>,
     head_object_calls: Vec<HeadObjectCall>,
+    delete_object_calls: Vec<DeleteObjectCall>,
+    delete_bucket_calls: Vec<String>,
 
     // Cancellation-test support. When stall_upload_part is true every
     // upload_part invocation signals upload_part_entered and then awaits
@@ -182,6 +197,8 @@ impl Inner {
             head_bucket: VecDeque::new(),
             list_objects_v2: VecDeque::new(),
             list_buckets: VecDeque::new(),
+            session_list_buckets: VecDeque::new(),
+            last_session_list_context: None,
             create_bucket: VecDeque::new(),
             delete_bucket: VecDeque::new(),
             copy_object: VecDeque::new(),
@@ -196,6 +213,8 @@ impl Inner {
             upload_part_calls: Vec::new(),
             complete_multipart_calls: Vec::new(),
             head_object_calls: Vec::new(),
+            delete_object_calls: Vec::new(),
+            delete_bucket_calls: Vec::new(),
             stall_upload_part: false,
             upload_part_entered: None,
             stall_put_object: false,
@@ -212,8 +231,22 @@ impl Inner {
 /// tested, and keep another clone for observation. Method calls are
 /// fire-and-forget from the driver's perspective and synchronous on the
 /// test side.
+///
+/// Cloning shares the same queues and observation logs, so a test can hand
+/// one clone to a driver that takes its backend by value and keep another
+/// for assertions.
+#[derive(Clone)]
 pub struct DummyBackend {
-    inner: Mutex<Inner>,
+    inner: Arc<Mutex<Inner>>,
+}
+
+// Drivers whose trait bounds require `Debug` (for example FtpsDriver) cannot be
+// instantiated with this double otherwise. The queues themselves are not worth
+// rendering, and locking to print them would risk deadlocking a failing test.
+impl std::fmt::Debug for DummyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DummyBackend").finish_non_exhaustive()
+    }
 }
 
 impl Default for DummyBackend {
@@ -227,7 +260,7 @@ impl DummyBackend {
     /// configured-miss error until a queue is populated.
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(Inner::new()),
+            inner: Arc::new(Mutex::new(Inner::new())),
         }
     }
 
@@ -260,6 +293,43 @@ impl DummyBackend {
             .expect("lock")
             .put_object
             .push_back(Ok(PutObjectOutput::default()));
+    }
+
+    /// Queue a successful create_bucket. Authorization tests use this to tell
+    /// "denied before the backend" apart from "backend refused": an unqueued
+    /// create_bucket returns `Unconfigured`, so only a queued success proves the
+    /// driver reached the backend.
+    pub fn queue_create_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .create_bucket
+            .push_back(Ok(CreateBucketOutput::default()));
+    }
+
+    /// Queue a legacy list_buckets response.
+    pub fn queue_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a legacy list_buckets error.
+    pub fn queue_list_buckets_err(&self, error: DummyError) {
+        self.inner.lock().expect("lock").list_buckets.push_back(Err(error));
+    }
+
+    /// Queue a session-aware list_buckets response.
+    pub fn queue_session_list_buckets_ok(&self, output: ListBucketsOutput) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Ok(output));
+    }
+
+    /// Queue a session-aware list_buckets error.
+    pub fn queue_session_list_buckets_err(&self, error: s3s::S3Error) {
+        self.inner.lock().expect("lock").session_list_buckets.push_back(Err(error));
+    }
+
+    /// Return the context from the last session-aware list_buckets request.
+    pub fn last_session_list_context(&self) -> Option<(http::HeaderMap, bool)> {
+        self.inner.lock().expect("lock").last_session_list_context.clone()
     }
 
     /// Queue a put_object error. Used by the commit_write retry tests
@@ -353,6 +423,43 @@ impl DummyBackend {
             .expect("lock")
             .list_objects_v2
             .push_back(Ok(ListObjectsV2Output::default()));
+    }
+
+    /// Queue a list_objects_v2 Ok response listing the given keys as a
+    /// single, non-truncated page. Recursive-delete tests use this to give
+    /// the delete loop something to iterate over.
+    pub fn queue_list_objects_v2_ok_with_keys(&self, keys: &[&str]) {
+        let contents = keys
+            .iter()
+            .map(|key| Object {
+                key: Some(ObjectKey::from((*key).to_string())),
+                ..Default::default()
+            })
+            .collect();
+        let out = ListObjectsV2Output {
+            contents: Some(contents),
+            is_truncated: Some(false),
+            ..Default::default()
+        };
+        self.inner.lock().expect("lock").list_objects_v2.push_back(Ok(out));
+    }
+
+    /// Queue a delete_object Ok response.
+    pub fn queue_delete_object_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_object
+            .push_back(Ok(DeleteObjectOutput::default()));
+    }
+
+    /// Queue a delete_bucket Ok response.
+    pub fn queue_delete_bucket_ok(&self) {
+        self.inner
+            .lock()
+            .expect("lock")
+            .delete_bucket
+            .push_back(Ok(DeleteBucketOutput::default()));
     }
 
     /// Queue a list_objects_v2 error. Used to verify that callers do
@@ -475,6 +582,16 @@ impl DummyBackend {
     }
 
     /// Snapshot the head_object call log.
+    /// Snapshot the recorded delete_object invocations.
+    pub fn delete_object_calls(&self) -> Vec<DeleteObjectCall> {
+        self.inner.lock().expect("lock").delete_object_calls.clone()
+    }
+
+    /// Snapshot the buckets passed to delete_bucket.
+    pub fn delete_bucket_calls(&self) -> Vec<String> {
+        self.inner.lock().expect("lock").delete_bucket_calls.clone()
+    }
+
     pub fn head_object_calls(&self) -> Vec<HeadObjectCall> {
         self.inner.lock().expect("lock").head_object_calls.clone()
     }
@@ -522,7 +639,7 @@ impl StorageBackend for DummyBackend {
             inner.put_object_calls.push(PutObjectCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                metadata: input.metadata,
             });
             let stall = inner.stall_put_object;
             let entered = inner.put_object_entered.clone();
@@ -543,7 +660,12 @@ impl StorageBackend for DummyBackend {
     }
 
     async fn delete_object(&self, bucket: &str, key: &str, _ak: &str, _sk: &str) -> Result<DeleteObjectOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_object.pop_front() {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_object_calls.push(DeleteObjectCall {
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+        });
+        match inner.delete_object.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchKey(format!("{bucket}/{key}"))),
         }
@@ -599,11 +721,27 @@ impl StorageBackend for DummyBackend {
         }
     }
 
-    async fn list_buckets(&self, _ak: &str, _sk: &str) -> Result<ListBucketsOutput, Self::Error> {
+    async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
         match self.inner.lock().expect("lock").list_buckets.pop_front() {
             Some(r) => r,
             None => Ok(ListBucketsOutput::default()),
         }
+    }
+
+    #[cfg(feature = "webdav")]
+    async fn list_buckets_for_session(
+        &self,
+        session_context: &SessionContext,
+        request_headers: &http::HeaderMap,
+        secure_transport: bool,
+    ) -> s3s::S3Result<ListBucketsOutput> {
+        let _ = session_context;
+        let mut inner = self.inner.lock().expect("lock");
+        inner.last_session_list_context = Some((request_headers.clone(), secure_transport));
+        inner
+            .session_list_buckets
+            .pop_front()
+            .unwrap_or_else(|| Ok(ListBucketsOutput::default()))
     }
 
     async fn create_bucket(&self, _bucket: &str, _ak: &str, _sk: &str) -> Result<CreateBucketOutput, Self::Error> {
@@ -614,7 +752,9 @@ impl StorageBackend for DummyBackend {
     }
 
     async fn delete_bucket(&self, bucket: &str, _ak: &str, _sk: &str) -> Result<DeleteBucketOutput, Self::Error> {
-        match self.inner.lock().expect("lock").delete_bucket.pop_front() {
+        let mut inner = self.inner.lock().expect("lock");
+        inner.delete_bucket_calls.push(bucket.to_string());
+        match inner.delete_bucket.pop_front() {
             Some(r) => r,
             None => Err(DummyError::NoSuchBucket(bucket.to_string())),
         }
@@ -638,7 +778,7 @@ impl StorageBackend for DummyBackend {
             inner.create_multipart_calls.push(CreateMultipartCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                metadata: input.metadata.clone(),
+                metadata: input.metadata,
             });
         }
         match self.inner.lock().expect("lock").create_multipart_upload.pop_front() {
@@ -656,7 +796,7 @@ impl StorageBackend for DummyBackend {
             inner.upload_part_calls.push(UploadPartCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
                 part_number: input.part_number,
                 content_length: input.content_length,
             });
@@ -694,7 +834,7 @@ impl StorageBackend for DummyBackend {
             inner.complete_multipart_calls.push(CompleteCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
                 part_count,
             });
         }
@@ -715,7 +855,7 @@ impl StorageBackend for DummyBackend {
             inner.abort_multipart_calls.push(AbortCall {
                 bucket: input.bucket.to_string(),
                 key: input.key.to_string(),
-                upload_id: input.upload_id.to_string(),
+                upload_id: input.upload_id,
             });
         }
         match self.inner.lock().expect("lock").abort_multipart_upload.pop_front() {

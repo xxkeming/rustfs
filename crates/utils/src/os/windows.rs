@@ -158,11 +158,53 @@ pub fn same_disk(disk1: &str, disk2: &str) -> std::io::Result<bool> {
     Ok(volume1 == volume2)
 }
 
+/// Automatic replacement formatting is disabled until Windows has an
+/// equivalent mount identity probe.
+pub fn is_mount_point(_path: &std::path::Path) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 pub fn get_physical_device_ids(disk: &str) -> std::io::Result<Vec<String>> {
     let path_wide = to_wide_path(Path::new(disk));
     let volume = get_volume_name(&path_wide)?;
 
     Ok(vec![String::from_utf16_lossy(&volume)])
+}
+
+/// Returns the volume serial number for the filesystem backing `path`.
+///
+/// This is the Windows equivalent of Linux's `st_dev` major:minor pair and is
+/// useful for diagnostic purposes when validating physical disk independence.
+// SAFETY: `path_wide` is a valid null-terminated UTF-16 string and all output
+// SAFETY: pointers target initialized stack variables with documented MAX_PATH sizing.
+#[allow(unsafe_code)]
+pub fn get_volume_serial_number(path: &str) -> std::io::Result<u32> {
+    let path_wide = to_wide_path(Path::new(path));
+    let volume = get_volume_name(&path_wide)?;
+
+    let mut volume_serial_number = 0u32;
+    let mut maximum_component_length = 0u32;
+    let mut file_system_flags = 0u32;
+    let mut volume_name_buffer = [0u16; MAX_PATH as usize];
+    let mut file_system_name_buffer = [0u16; MAX_PATH as usize];
+
+    // SAFETY:
+    // 1. `volume` is a valid null-terminated UTF-16 string (volume root path).
+    // 2. Buffers are allocated with `MAX_PATH` size.
+    // 3. Pointers to output variables are valid.
+    unsafe {
+        GetVolumeInformationW(
+            windows::core::PCWSTR::from_raw(volume.as_ptr()),
+            Some(&mut volume_name_buffer),
+            Some(&mut volume_serial_number),
+            Some(&mut maximum_component_length),
+            Some(&mut file_system_flags),
+            Some(&mut file_system_name_buffer),
+        )
+        .map_err(|e| Error::from_raw_os_error(e.code().0))?;
+    }
+
+    Ok(volume_serial_number)
 }
 
 pub fn check_cross_device_mounts(_paths: &[String]) -> std::io::Result<()> {

@@ -66,10 +66,9 @@ pub fn hex(data: impl AsRef<[u8]>) -> String {
 /// * `s` - A string slice to be verified
 ///
 /// # Returns
-/// A `bool` indicating whether the input string is a valid SHA-256 checksum (64
-///
+/// A `bool` indicating whether the input string is exactly 64 lowercase hexadecimal characters.
+/// Uppercase hexadecimal characters are not accepted.
 pub fn is_sha256_checksum(s: &str) -> bool {
-    // TODO: optimize
     let is_lowercase_hex = |c: u8| matches!(c, b'0'..=b'9' | b'a'..=b'f');
     s.len() == 64 && s.as_bytes().iter().copied().all(is_lowercase_hex)
 }
@@ -85,7 +84,7 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 /// A 20-byte array containing the HMAC-SHA1 hash of the input data using the provided key
 ///
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).unwrap();
+    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
     m.finalize().into_bytes().into()
 }
@@ -101,7 +100,7 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 /// A 32-byte array containing the HMAC-SHA256 hash of the input data using the provided key
 ///
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).unwrap();
+    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
     m.finalize().into_bytes().into()
 }
@@ -148,10 +147,23 @@ fn test_base64_encoding_decoding() {
 
     let encoded_string = base64_encode_url_safe_no_pad(original_uuid_timestamp.as_bytes());
 
-    println!("Encoded: {}", &encoded_string);
+    println!("Encoded: {}", encoded_string);
 
-    let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.as_bytes()).unwrap();
-    let decoded_string = String::from_utf8(decoded_bytes).unwrap();
+    let decoded_bytes = base64_decode_url_safe_no_pad(encoded_string.as_bytes()).expect("operation should succeed");
+    let decoded_string = String::from_utf8(decoded_bytes).expect("operation should succeed");
 
     assert_eq!(decoded_string, original_uuid_timestamp)
+}
+
+#[test]
+fn sha256_checksum_accepts_exact_lowercase_hex() {
+    assert!(is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+}
+
+#[test]
+fn sha256_checksum_rejects_wrong_length_or_non_lowercase_hex() {
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde"));
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"));
+    assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
+    assert!(!is_sha256_checksum("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"));
 }

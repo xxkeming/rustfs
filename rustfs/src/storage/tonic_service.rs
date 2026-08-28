@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use crate::storage::rpc::make_server;
-#[allow(dead_code)]
+pub(crate) use crate::storage::rpc::node_service::make_heal_control_server_with_cache;
+#[cfg(test)]
+pub(crate) use crate::storage::rpc::node_service::{heal::heal_topology_fingerprint, make_heal_control_server_for_source};
+pub use crate::storage::rpc::{make_heal_control_server, make_server, make_tier_mutation_control_server};
 pub type NodeService = crate::storage::rpc::NodeService;

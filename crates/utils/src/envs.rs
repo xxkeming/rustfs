@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::{
+    any::type_name,
     collections::BTreeSet,
     collections::HashSet,
     env,
@@ -78,10 +79,7 @@ static WARNED_ENV_MESSAGES: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 
 fn log_once(key: &str, message: impl FnOnce() -> String) {
     let seen = WARNED_ENV_MESSAGES.get_or_init(|| Mutex::new(HashSet::new()));
-    let mut seen = match seen.lock() {
-        Ok(seen) => seen,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut seen = seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if seen.insert(key.to_string()) {
         warn!("{}", message());
     }
@@ -146,6 +144,7 @@ const EXTERNAL_COMPATIBLE_SUFFIXES: &[&str] = &[
     "IDENTITY_OPENID_CLIENT_SECRET",
     "IDENTITY_OPENID_CONFIG_URL",
     "IDENTITY_OPENID_DISPLAY_NAME",
+    "IDENTITY_OPENID_ISSUER",
     "IDENTITY_OPENID_REDIRECT_URI",
     "IDENTITY_OPENID_SCOPES",
     "ILM_EXPIRATION_WORKERS",
@@ -264,7 +263,15 @@ fn parse_env_value<T>(key: &str) -> Option<T>
 where
     T: std::str::FromStr,
 {
-    resolve_env_with_aliases(key, &[]).and_then(|(_, value)| value.parse().ok())
+    let (used_key, value) = resolve_env_with_aliases(key, &[])?;
+    value
+        .parse::<T>()
+        .map_err(|_| {
+            log_once(&format!("env_invalid_value:{used_key}"), || {
+                format!("Invalid {} value for {used_key}. Treating as unset.", type_name::<T>())
+            });
+        })
+        .ok()
 }
 
 pub fn get_env_str_with_aliases(key: &str, deprecated: &[&str], default: &str) -> String {
@@ -527,6 +534,49 @@ pub fn get_env_opt_u64(key: &str) -> Option<u64> {
     parse_env_value(key)
 }
 
+/// Outcome of reading and parsing an environment variable.
+///
+/// Unlike the `get_env_opt_*` helpers, this distinguishes an absent variable
+/// from one that is present but fails to parse, so callers can treat a
+/// malformed value as a hard configuration error instead of silently falling
+/// back to a default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EnvParseOutcome<T> {
+    /// The variable (and any alias) is not set.
+    Absent,
+    /// The variable is set but its value failed to parse into `T`.
+    Invalid,
+    /// The variable is set and parsed successfully.
+    Parsed(T),
+}
+
+/// Read an environment variable and report whether it is absent, present but
+/// malformed, or parsed successfully.
+///
+/// #Parameters
+/// - `key`: The environment variable key to look up (deprecated aliases apply).
+///
+/// #Returns
+/// - `EnvParseOutcome<T>`: `Absent`, `Invalid`, or `Parsed(value)`.
+pub fn get_env_parse_outcome<T>(key: &str) -> EnvParseOutcome<T>
+where
+    T: std::str::FromStr,
+{
+    let Some((used_key, value)) = resolve_env_with_aliases(key, &[]) else {
+        return EnvParseOutcome::Absent;
+    };
+
+    match value.parse::<T>() {
+        Ok(parsed) => EnvParseOutcome::Parsed(parsed),
+        Err(_) => {
+            log_once(&format!("env_invalid_value:{used_key}"), || {
+                format!("Invalid {} value for {used_key}. Treating as unset.", type_name::<T>())
+            });
+            EnvParseOutcome::Invalid
+        }
+    }
+}
+
 /// Retrieve an environment variable as a specific type, with a default value if not set or parsing fails.
 ///
 /// #Parameters
@@ -681,8 +731,8 @@ pub fn apply_external_env_compat() -> ExternalEnvCompatReport {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases,
-        get_env_i32_with_aliases, get_env_str,
+        EnvParseOutcome, apply_external_env_compat, build_external_env_compat_report_from_entries, get_env_bool_with_aliases,
+        get_env_f64, get_env_i32_with_aliases, get_env_opt_f64, get_env_opt_u64, get_env_parse_outcome, get_env_str, get_env_u64,
     };
 
     fn source_key(suffix: &str) -> String {
@@ -803,6 +853,35 @@ mod tests {
             temp_env::with_var("RUSTFS_TEST_I32_LEGACY", Some("not-an-i32"), || {
                 assert_eq!(get_env_i32_with_aliases("RUSTFS_TEST_I32", &["RUSTFS_TEST_I32_LEGACY"], 8), 8);
             });
+        });
+    }
+
+    #[test]
+    fn invalid_u64_value_falls_back_to_default_and_optional_none() {
+        temp_env::with_var("RUSTFS_TEST_U64", Some("not-a-u64"), || {
+            assert_eq!(get_env_u64("RUSTFS_TEST_U64", 42), 42);
+            assert_eq!(get_env_opt_u64("RUSTFS_TEST_U64"), None);
+        });
+    }
+
+    #[test]
+    fn invalid_f64_value_falls_back_to_default_and_optional_none() {
+        temp_env::with_var("RUSTFS_TEST_F64", Some("not-a-f64"), || {
+            assert_eq!(get_env_f64("RUSTFS_TEST_F64", 0.25), 0.25);
+            assert_eq!(get_env_opt_f64("RUSTFS_TEST_F64"), None);
+        });
+    }
+
+    #[test]
+    fn env_parse_outcome_distinguishes_absent_invalid_and_parsed() {
+        temp_env::with_var_unset("RUSTFS_TEST_OUTCOME", || {
+            assert_eq!(get_env_parse_outcome::<u64>("RUSTFS_TEST_OUTCOME"), EnvParseOutcome::Absent);
+        });
+        temp_env::with_var("RUSTFS_TEST_OUTCOME", Some("not-a-u64"), || {
+            assert_eq!(get_env_parse_outcome::<u64>("RUSTFS_TEST_OUTCOME"), EnvParseOutcome::Invalid);
+        });
+        temp_env::with_var("RUSTFS_TEST_OUTCOME", Some("42"), || {
+            assert_eq!(get_env_parse_outcome::<u64>("RUSTFS_TEST_OUTCOME"), EnvParseOutcome::Parsed(42));
         });
     }
 

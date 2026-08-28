@@ -12,50 +12,193 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::data_usage_define::DATA_USAGE_CACHE_KEY_FORMAT;
+use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerItem, scan_data_folder};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
-    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageEntryInfo,
-    DataUsageInfo, SizeSummary, TierStats,
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
+    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
+    ScannerError, SizeSummary, TierStats,
 };
 use futures::future::join_all;
 use metrics::counter;
 use rand::seq::SliceRandom as _;
-use rustfs_common::heal_channel::HealScanMode;
-use rustfs_common::metrics::{Metric, Metrics, emit_scan_bucket_drive_complete};
-use rustfs_ecstore::bucket::bucket_target_sys::BucketTargetSys;
-use rustfs_ecstore::bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState;
-use rustfs_ecstore::bucket::lifecycle::lifecycle::Lifecycle;
-use rustfs_ecstore::bucket::metadata_sys::{get_lifecycle_config, get_object_lock_config, get_replication_config};
-use rustfs_ecstore::bucket::replication::{ReplicationConfig, ReplicationConfigurationExt};
-use rustfs_ecstore::bucket::versioning::VersioningApi as _;
-use rustfs_ecstore::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::config::storageclass;
-use rustfs_ecstore::disk::STORAGE_FORMAT_FILE;
-use rustfs_ecstore::disk::{Disk, DiskAPI};
-use rustfs_ecstore::error::{Error, StorageError};
-use rustfs_ecstore::global::GLOBAL_TierConfigMgr;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::set_disk::SetDisks;
-use rustfs_ecstore::store_api::{BucketInfo, BucketOperations, BucketOptions, ObjectInfo};
-use rustfs_ecstore::{StorageAPI, error::Result, store::ECStore};
+#[cfg(test)]
+use rustfs_config::{ENV_SCANNER_MAX_CONCURRENT_DISK_SCANS, ENV_SCANNER_MAX_CONCURRENT_SET_SCANS};
+use rustfs_data_usage::{BucketTargetUsageInfo, BucketUsageInfo};
 use rustfs_filemeta::FileMeta;
+use rustfs_heal_contracts::heal_channel::HealScanMode;
+use rustfs_lock::{LockError, NamespaceLockGuard};
+use rustfs_scanner_contracts::metrics::{
+    Metric, Metrics, emit_scan_bucket_drive_complete, emit_scan_bucket_drive_partial, global_metrics,
+};
 use rustfs_utils::path::path_join_buf;
-use s3s::dto::{BucketLifecycleConfiguration, ReplicationConfiguration};
-use std::collections::HashMap;
+use s3s::dto::{
+    BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLockEnabled, ReplicationConfiguration, VersioningConfiguration,
+};
+use sha2::{Digest as _, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::Path;
-use std::time::SystemTime;
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex as StdMutex, MutexGuard};
+use std::time::{Instant, SystemTime};
 use std::{fmt::Debug, sync::Arc};
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, Semaphore, mpsc};
 use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, error, warn};
 
-fn record_set_scan_failure(first_err: &mut Option<Error>, err: Error) {
-    if first_err.is_none() {
-        *first_err = Some(err);
+use crate::ScannerObjectInfo as ObjectInfo;
+use crate::storage_api::scan::NamespaceLocking as _;
+use crate::storage_api::scanner_io::{BucketInfo, BucketOptions};
+use crate::{
+    BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
+    RUSTFS_META_BUCKET, ReplicationConfig, STORAGE_FORMAT_FILE, ScannerConfigObjectDelete as _, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError,
+    begin_tier_registry_cycle, complete_tier_registry_cycle, enqueue_runtime_free_version, get_lifecycle_config,
+    get_object_lock_config, get_replication_config, runtime_tier_names, runtime_tier_registry_for_cycle,
+    scanner_publication_admission_for_epoch, scanner_publication_epoch, storageclass,
+};
+
+pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
+pub(crate) const SCANNER_METADATA_CORRUPT_ERROR: &str = "scanner metadata corrupt";
+pub(crate) const SCANNER_METADATA_TRANSIENT_ERROR: &str = "scanner metadata transient";
+const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_IO: &str = "io";
+// Mirrors `scanner_folder.rs` so the versioning-lookup fallback warn keeps its
+// historical `rustfs::scanner::folder` lifecycle event identity after the
+// lookup moved into `get_size`.
+const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";
+const EVENT_SCANNER_LIFECYCLE_ACTION: &str = "scanner_lifecycle_action";
+const EVENT_SCANNER_DISK_BUCKET_STATE: &str = "scanner_disk_bucket_state";
+const EVENT_SCANNER_DATA_USAGE_STREAM: &str = "scanner_data_usage_stream";
+const EVENT_SCANNER_CACHE_PERSIST_STATE: &str = "scanner_cache_persist_state";
+const EVENT_SCANNER_SET_STATE: &str = "scanner_set_state";
+const SCANNER_CACHE_LOCK_SUFFIX: &str = ".scanner-cycle.lock";
+const SCANNER_CACHE_LOCK_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(not(test))]
+const SCANNER_CACHE_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const SCANNER_CACHE_LOCK_LOSS_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
+
+const METRIC_SCANNER_SET_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_set_scan_concurrency_limit";
+const METRIC_SCANNER_DISK_SCAN_CONCURRENCY_LIMIT: &str = "rustfs_scanner_disk_scan_concurrency_limit";
+const METRIC_SCANNER_SET_SCAN_WAIT_SECONDS: &str = "rustfs_scanner_set_scan_wait_seconds";
+const METRIC_SCANNER_DISK_SCAN_WAIT_SECONDS: &str = "rustfs_scanner_disk_scan_wait_seconds";
+const METRIC_SCANNER_SET_SCANS_ACTIVE: &str = "rustfs_scanner_set_scans_active";
+const METRIC_SCANNER_SET_SCANS_QUEUED: &str = "rustfs_scanner_set_scans_queued";
+const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucket_scans_active";
+const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
+
+pub type DirtyUsageBuckets = HashMap<String, u64>;
+
+#[derive(Clone, Debug)]
+struct DirtyUsageSnapshot {
+    buckets: Arc<DirtyUsageBuckets>,
+    generation: u64,
+    covers_all_pending: bool,
+}
+
+pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
+    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_CORRUPT_ERROR))
+}
+
+pub(crate) fn is_scanner_metadata_transient_error(err: &StorageError) -> bool {
+    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_TRANSIENT_ERROR))
+}
+
+fn scanner_metadata_corrupt_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
+    StorageError::other(format!(
+        "{SCANNER_METADATA_CORRUPT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
+    ))
+}
+
+fn scanner_metadata_transient_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
+    StorageError::other(format!(
+        "{SCANNER_METADATA_TRANSIENT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
+    ))
+}
+
+async fn object_lock_config_for_scanner_item(item: &ScannerItem) -> Option<Arc<ObjectLockConfiguration>> {
+    if let Some(config) = item.object_lock.clone() {
+        return Some(config);
     }
+
+    get_object_lock_config(&item.bucket)
+        .await
+        .ok()
+        .map(|(config, _)| Arc::new(config))
+}
+
+fn object_lock_config_enabled(config: &ObjectLockConfiguration) -> bool {
+    config
+        .object_lock_enabled
+        .as_ref()
+        .is_some_and(|enabled| enabled.as_str() == ObjectLockEnabled::ENABLED)
+}
+
+pub struct ScannerBucketScanPlan {
+    buckets: Vec<BucketInfo>,
+    all_buckets: Arc<Vec<BucketInfo>>,
+    digest: DataUsageScanPlanDigest,
+    leader_epoch: u64,
+    tier_registry_generation: u64,
+    /// Epoch captured once for the whole scanner cycle.  `None` is retained
+    /// for unfenced test implementations; production plans always carry the
+    /// admission token captured before bucket enumeration.
+    publication_epoch: Option<u64>,
+    dirty_usage_buckets: Arc<DirtyUsageBuckets>,
+    bucket_failures: ScannerBucketFailureState,
+    pending_maintenance_work: Arc<AtomicBool>,
+    cache_cycle_floor: Arc<AtomicU64>,
+}
+
+#[derive(Clone, Default)]
+struct ScannerBucketFailureState {
+    hard: Arc<Mutex<HashSet<String>>>,
+    partial: Arc<Mutex<HashSet<String>>>,
+    namespace_not_found: Arc<Mutex<HashSet<String>>>,
+}
+
+fn scanner_bucket_plan_digest(buckets: &[BucketInfo], activity_digest: [u8; 32]) -> DataUsageScanPlanDigest {
+    let mut buckets = buckets.iter().collect::<Vec<_>>();
+    buckets.sort_unstable_by(|left, right| left.name.cmp(&right.name));
+
+    let mut hasher = Sha256::new();
+    hasher.update(activity_digest);
+    hasher.update(u64::try_from(buckets.len()).unwrap_or(u64::MAX).to_be_bytes());
+    for bucket in buckets {
+        let name = bucket.name.as_bytes();
+        hasher.update(u64::try_from(name.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(name);
+        match bucket.created {
+            Some(created) => {
+                hasher.update([1]);
+                hasher.update(created.unix_timestamp_nanos().to_be_bytes());
+            }
+            None => hasher.update([0]),
+        }
+    }
+    DataUsageScanPlanDigest(hasher.finalize().into())
+}
+
+fn scanner_bucket_cache_digest(
+    scan_plan_digest: DataUsageScanPlanDigest,
+    dirty_generation: Option<u64>,
+) -> DataUsageScanPlanDigest {
+    let Some(dirty_generation) = dirty_generation else {
+        return scan_plan_digest;
+    };
+
+    let mut hasher = Sha256::new();
+    hasher.update(scan_plan_digest.0);
+    hasher.update(dirty_generation.to_be_bytes());
+    DataUsageScanPlanDigest(hasher.finalize().into())
 }
 
 fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error>) -> Result<()> {
@@ -70,6 +213,147 @@ fn finalize_nsscanner_result(results: &[DataUsageCache], first_err: Option<Error
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerBucketScanStatus {
+    Complete,
+    Failed,
+    Partial,
+    NamespaceNotFound,
+}
+
+fn scanner_bucket_scan_status(has_failed: bool, has_partial: bool, has_namespace_not_found: bool) -> ScannerBucketScanStatus {
+    if has_failed {
+        ScannerBucketScanStatus::Failed
+    } else if has_partial {
+        ScannerBucketScanStatus::Partial
+    } else if has_namespace_not_found {
+        ScannerBucketScanStatus::NamespaceNotFound
+    } else {
+        ScannerBucketScanStatus::Complete
+    }
+}
+
+fn classify_nsscanner_cycle(
+    completed_all_sets: bool,
+    budget_elapsed: bool,
+    cancelled: bool,
+    bucket_scan_status: ScannerBucketScanStatus,
+    dirty_usage_status: DirtyUsageSnapshotStatus,
+    activity_status: ScannerCycleActivityStatus,
+) -> ScannerCycleStatus {
+    // The post-scan activity proof is required regardless of why the scan was
+    // incomplete.  Returning Incomplete first would apply the long ordinary
+    // retry/backoff path to an unverifiable publication and could acknowledge
+    // a cycle without a movement-generation proof.
+    if activity_status == ScannerCycleActivityStatus::Unverified {
+        return ScannerCycleStatus::Deferred(ScannerCycleDeferReason::ActivityBaselineUnavailable);
+    }
+    if budget_elapsed
+        || cancelled
+        || !matches!(bucket_scan_status, ScannerBucketScanStatus::Complete)
+        || dirty_usage_status == DirtyUsageSnapshotStatus::Unverified
+    {
+        return ScannerCycleStatus::Incomplete;
+    }
+    if !completed_all_sets {
+        return ScannerCycleStatus::Incomplete;
+    }
+
+    match (activity_status, dirty_usage_status) {
+        (ScannerCycleActivityStatus::Unchanged, DirtyUsageSnapshotStatus::Current) => ScannerCycleStatus::Complete,
+        _ => ScannerCycleStatus::Superseded,
+    }
+}
+
+fn should_publish_usage_snapshot(status: ScannerCycleStatus) -> bool {
+    matches!(status, ScannerCycleStatus::Complete | ScannerCycleStatus::Superseded)
+}
+
+fn prepare_usage_snapshot_for_publication(
+    status: ScannerCycleStatus,
+    mut data_usage_info: DataUsageInfo,
+) -> Option<DataUsageInfo> {
+    if !should_publish_usage_snapshot(status) {
+        return None;
+    }
+
+    data_usage_info.usage_snapshot_converged = Some(status == ScannerCycleStatus::Complete);
+    Some(data_usage_info)
+}
+
+async fn publish_usage_snapshot(
+    updates: &mpsc::Sender<DataUsageInfo>,
+    status: ScannerCycleStatus,
+    data_usage_info: DataUsageInfo,
+) -> Result<bool> {
+    let Some(data_usage_info) = prepare_usage_snapshot_for_publication(status, data_usage_info) else {
+        return Ok(false);
+    };
+    send_data_usage_update(updates, data_usage_info).await?;
+    Ok(true)
+}
+
+async fn publish_observational_snapshot(
+    updates: &mpsc::Sender<DataUsageInfo>,
+    mut data_usage_info: DataUsageInfo,
+) -> Result<bool> {
+    data_usage_info.usage_snapshot_complete = false;
+    data_usage_info.usage_snapshot_partial = true;
+    data_usage_info.usage_snapshot_converged = Some(false);
+    send_data_usage_update(updates, data_usage_info).await?;
+    Ok(true)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScannerCycleActivityStatus {
+    Unchanged,
+    Changed,
+    Unverified,
+}
+
+async fn scanner_cycle_activity_status(
+    store: &ECStore,
+    distributed: bool,
+    before: &crate::scanner::ScannerActivitySnapshot,
+) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>) {
+    match crate::scanner::probe_scanner_activity(store, distributed).await {
+        Ok(after) => {
+            let status = if after == *before {
+                ScannerCycleActivityStatus::Unchanged
+            } else {
+                ScannerCycleActivityStatus::Changed
+            };
+            (status, crate::scanner::scanner_activity_publication_lease_targets(&after))
+        }
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner::io",
+                event = EVENT_SCANNER_SET_STATE,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_IO,
+                state = "cycle_activity_probe_failed",
+                error = %err,
+                "Scanner cycle activity verification failed"
+            );
+            (ScannerCycleActivityStatus::Unverified, Vec::new())
+        }
+    }
+}
+
+fn scanner_results_have_pending_maintenance_work(results: &[DataUsageCache]) -> bool {
+    results.iter().any(|result| !result.info.pending_heals.is_empty())
+}
+
+fn pending_maintenance_work_for_cycle(pending: &AtomicBool, results: &[DataUsageCache]) -> bool {
+    pending.load(Ordering::Acquire) || scanner_results_have_pending_maintenance_work(results)
+}
+
+fn record_bucket_pending_maintenance_work(cache: &DataUsageCache, pending: &AtomicBool) {
+    if !cache.info.pending_heals.is_empty() {
+        pending.store(true, Ordering::Release);
+    }
+}
+
 fn is_xl_meta_path(path: &str) -> bool {
     Path::new(path)
         .file_name()
@@ -77,22 +361,130 @@ fn is_xl_meta_path(path: &str) -> bool {
         .is_some_and(|name| name == STORAGE_FORMAT_FILE)
 }
 
-async fn persist_and_publish_cache_snapshot<S: StorageAPI>(
-    store: Arc<S>,
-    updates: &mpsc::Sender<DataUsageCache>,
-    cache_snapshot: DataUsageCache,
-) -> Option<SystemTime> {
-    let last_update = cache_snapshot.info.last_update;
+pub(crate) fn cache_root_entry_info(cache: &DataUsageCache) -> std::result::Result<DataUsageEntryInfo, ScannerError> {
+    if cache.info.name.is_empty() {
+        return Err(ScannerError::Other("scanner cache root name is empty".to_string()));
+    }
+    let entry = cache
+        .checked_flatten_complete_scope(&cache.info.name)
+        .ok_or_else(|| ScannerError::Other(format!("scanner cache root is missing or corrupt: {}", cache.info.name)))?;
 
-    if let Err(e) = cache_snapshot.save(store, DATA_USAGE_CACHE_NAME).await {
-        error!("Failed to save data usage cache: {}", e);
+    Ok(DataUsageEntryInfo {
+        name: cache.info.name.clone(),
+        parent: DATA_USAGE_ROOT.to_string(),
+        entry,
+        tier_registry_generation: cache.info.tier_registry_generation,
+    })
+}
+
+fn apply_bucket_result_to_cache(cache: &mut DataUsageCache, result: DataUsageEntryInfo, update_time: SystemTime) -> bool {
+    if cache.info.tier_registry_generation != result.tier_registry_generation {
+        // A result from another registry generation must never be folded into
+        // this cycle. Leaving it unapplied makes the cycle incomplete and
+        // forces the caller to re-account it under one frozen registry.
+        return false;
+    }
+    cache.replace(&result.name, &result.parent, result.entry);
+    cache.info.last_update = Some(update_time);
+    true
+}
+
+fn should_publish_completed_snapshot(completed_count: usize, total_count: usize, budget_elapsed: bool, cancelled: bool) -> bool {
+    completed_count == total_count && !budget_elapsed && !cancelled
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NamespaceScannerWorkerMode {
+    Coordinator,
+    RemoteV4(uuid::Uuid),
+}
+
+fn namespace_scanner_workers<T>(
+    coordinator_disks: Vec<T>,
+    remote_disks: Vec<(T, uuid::Uuid)>,
+) -> Vec<(T, NamespaceScannerWorkerMode)> {
+    let mut workers = Vec::with_capacity(coordinator_disks.len() + remote_disks.len());
+    workers.extend(
+        coordinator_disks
+            .into_iter()
+            .map(|disk| (disk, NamespaceScannerWorkerMode::Coordinator)),
+    );
+    workers.extend(
+        remote_disks
+            .into_iter()
+            .map(|(disk, server_epoch)| (disk, NamespaceScannerWorkerMode::RemoteV4(server_epoch))),
+    );
+    workers
+}
+
+fn group_remote_disks_by_peer<T>(disks: Vec<T>, peer_key: impl Fn(&T) -> String) -> Vec<Vec<T>> {
+    let mut groups = HashMap::<String, Vec<T>>::new();
+    for disk in disks {
+        groups.entry(peer_key(&disk)).or_default().push(disk);
+    }
+    groups.into_values().collect()
+}
+
+fn scanner_results_match_scan_scope(results: &[DataUsageCache], expected_sources: &HashSet<DataUsageCacheSource>) -> bool {
+    if results.is_empty() {
+        return false;
     }
 
-    if let Err(e) = updates.send(cache_snapshot).await {
-        error!("Failed to send data usage cache: {}", e);
-    }
+    let sources_match_topology = results
+        .iter()
+        .map(|result| result.info.source)
+        .collect::<Option<HashSet<_>>>()
+        .is_some_and(|sources| sources.len() == results.len() && sources == *expected_sources);
+    let plan_digests = results
+        .iter()
+        .map(|result| result.info.scan_plan_digest)
+        .collect::<Option<HashSet<_>>>();
+    let cycles = results.iter().map(|result| result.info.next_cycle).collect::<HashSet<_>>();
+    let leader_epochs = results.iter().map(|result| result.info.leader_epoch).collect::<HashSet<_>>();
 
-    last_update
+    sources_match_topology
+        && plan_digests.is_some_and(|digests| digests.len() == 1)
+        && cycles.len() == 1
+        && leader_epochs.len() == 1
+}
+
+fn scanner_results_form_complete_snapshot(results: &[DataUsageCache], expected_sources: &HashSet<DataUsageCacheSource>) -> bool {
+    results
+        .iter()
+        .all(|result| result.info.last_update.is_some() && result.info.snapshot_complete)
+        && scanner_results_match_scan_scope(results, expected_sources)
+}
+
+fn checked_bucket_usage_info(entry: &DataUsageEntry) -> Option<BucketUsageInfo> {
+    let mut usage = BucketUsageInfo {
+        size: u64::try_from(entry.size).ok()?,
+        versions_count: u64::try_from(entry.versions).ok()?,
+        objects_count: u64::try_from(entry.objects).ok()?,
+        delete_markers_count: u64::try_from(entry.delete_markers).ok()?,
+        object_size_histogram: entry.obj_sizes.to_map(),
+        object_versions_histogram: entry.obj_versions.to_map(),
+        ..Default::default()
+    };
+
+    if let Some(replication) = &entry.replication_stats {
+        usage.replica_size = replication.replica_size;
+        usage.replica_count = replication.replica_count;
+        for (target, stats) in &replication.targets {
+            usage.replication_info.insert(
+                target.clone(),
+                BucketTargetUsageInfo {
+                    replication_pending_size: stats.pending_size,
+                    replicated_size: stats.replicated_size,
+                    replication_failed_size: stats.failed_size,
+                    replication_pending_count: stats.pending_count,
+                    replication_failed_count: stats.failed_count,
+                    replicated_count: stats.replicated_count,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    Some(usage)
 }
 
 #[async_trait::async_trait]
@@ -100,6 +492,7 @@ pub trait ScannerIO: Send + Sync + Debug + 'static {
     async fn nsscanner(
         &self,
         ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
         updates: mpsc::Sender<DataUsageInfo>,
         want_cycle: u64,
         scan_mode: HealScanMode,
@@ -107,11 +500,25 @@ pub trait ScannerIO: Send + Sync + Debug + 'static {
 }
 
 #[async_trait::async_trait]
+pub(crate) trait ScannerIOCycle: Send + Sync + Debug + 'static {
+    async fn nsscanner_with_status(
+        &self,
+        ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
+        updates: mpsc::Sender<DataUsageInfo>,
+        want_cycle: u64,
+        leader_epoch: u64,
+        scan_mode: HealScanMode,
+    ) -> Result<ScannerCycleResult>;
+}
+
+#[async_trait::async_trait]
 pub trait ScannerIOCache: Send + Sync + Debug + 'static {
     async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
-        buckets: Vec<BucketInfo>,
+        budget: Arc<ScannerCycleBudget>,
+        scan_plan: ScannerBucketScanPlan,
         updates: mpsc::Sender<DataUsageCache>,
         want_cycle: u64,
         scan_mode: HealScanMode,
@@ -121,643 +528,203 @@ pub trait ScannerIOCache: Send + Sync + Debug + 'static {
 #[async_trait::async_trait]
 pub trait ScannerIODisk: Send + Sync + Debug + 'static {
     async fn nsscanner_disk(
-        &self,
-        ctx: CancellationToken,
-        cache: DataUsageCache,
-        updates: Option<mpsc::Sender<DataUsageEntry>>,
-        scan_mode: HealScanMode,
-    ) -> Result<DataUsageCache>;
-
-    async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
-}
-
-#[async_trait::async_trait]
-impl ScannerIO for ECStore {
-    #[tracing::instrument(skip(self, updates))]
-    async fn nsscanner(
-        &self,
-        ctx: CancellationToken,
-        updates: mpsc::Sender<DataUsageInfo>,
-        want_cycle: u64,
-        scan_mode: HealScanMode,
-    ) -> Result<()> {
-        let child_token = ctx.child_token();
-
-        let all_buckets = self.list_bucket(&BucketOptions::default()).await?;
-
-        if all_buckets.is_empty() {
-            if let Err(e) = updates.send(DataUsageInfo::default()).await {
-                error!("Failed to send data usage info: {}", e);
-            }
-            return Ok(());
-        }
-
-        let mut total_results = 0;
-        for pool in self.pools.iter() {
-            total_results += pool.disk_set.len();
-        }
-
-        let results = vec![DataUsageCache::default(); total_results];
-        let results_mutex: Arc<Mutex<Vec<DataUsageCache>>> = Arc::new(Mutex::new(results));
-        let first_err_mutex: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
-        let mut results_index: i32 = -1_i32;
-        let mut wait_futs = Vec::new();
-
-        for pool in self.pools.iter() {
-            for set in pool.disk_set.iter() {
-                results_index += 1;
-
-                let results_index_clone = results_index as usize;
-                // Clone the Arc to move it into the spawned task
-                let set_clone: Arc<SetDisks> = Arc::clone(set);
-                let pool_label = set.pool_index.to_string();
-                let set_label = set.set_index.to_string();
-
-                let child_token_clone = child_token.clone();
-                let want_cycle_clone = want_cycle;
-                let scan_mode_clone = scan_mode;
-                let results_mutex_clone = results_mutex.clone();
-                let first_err_mutex_clone = first_err_mutex.clone();
-
-                let (tx, mut rx) = mpsc::channel::<DataUsageCache>(1);
-
-                // Spawn task to receive and store results
-                let receiver_fut = tokio::spawn(async move {
-                    while let Some(result) = rx.recv().await {
-                        let mut results = results_mutex_clone.lock().await;
-                        results[results_index_clone] = result;
-                    }
-                });
-                wait_futs.push(receiver_fut);
-
-                let all_buckets_clone = all_buckets.clone();
-                // Spawn task to run the scanner
-                let scanner_fut = tokio::spawn(async move {
-                    if let Err(e) = set_clone
-                        .nsscanner_cache(child_token_clone.clone(), all_buckets_clone, tx, want_cycle_clone, scan_mode_clone)
-                        .await
-                    {
-                        counter!(
-                            "rustfs_scanner_set_failure_total",
-                            "pool" => pool_label.clone(),
-                            "set" => set_label.clone(),
-                            "stage" => "nsscanner_cache".to_string()
-                        )
-                        .increment(1);
-                        error!(
-                            pool = %pool_label,
-                            set = %set_label,
-                            error = %e,
-                            "Failed to scan set; continuing scanner cycle"
-                        );
-                        let mut first_err = first_err_mutex_clone.lock().await;
-                        record_set_scan_failure(&mut first_err, e);
-                    }
-                });
-                wait_futs.push(scanner_fut);
-            }
-        }
-
-        let (update_tx, mut update_rx) = tokio::sync::oneshot::channel::<()>();
-
-        let all_buckets_clone = all_buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>();
-        let results_mutex_for_updates = results_mutex.clone();
-        tokio::spawn(async move {
-            let mut last_update = SystemTime::UNIX_EPOCH;
-            let mut has_sent_once = false;
-
-            let mut ticker = tokio::time::interval(Duration::from_secs(30));
-            loop {
-                tokio::select! {
-                    _ = child_token.cancelled() => {
-                        break;
-                    }
-                    res = &mut update_rx => {
-                        if res.is_err() {
-                            break;
-                        }
-
-                        let results = results_mutex_for_updates.lock().await;
-                        let mut all_merged = DataUsageCache::default();
-                        for result in results.iter() {
-                            if result.info.last_update.is_none() {
-                                continue;
-                            }
-                            all_merged.merge(result);
-                        }
-
-                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
-                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
-                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
-                            if let Err(e) = updates.send(dui).await {
-                                error!("Failed to send data usage info: {}", e);
-                            }
-                        }
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        let results = results_mutex_for_updates.lock().await;
-                        let mut all_merged = DataUsageCache::default();
-                        for result in results.iter() {
-                            if result.info.last_update.is_none() {
-                                continue;
-                            }
-                            all_merged.merge(result);
-                        }
-
-                        let merged_last_update = all_merged.info.last_update.unwrap_or(SystemTime::UNIX_EPOCH);
-                        if all_merged.root().is_some() && (!has_sent_once || merged_last_update > last_update) {
-                            let dui = all_merged.dui(&all_merged.info.name, &all_buckets_clone);
-                            if let Err(e) = updates.send(dui).await {
-                                error!("Failed to send data usage info: {}", e);
-                            }
-                            has_sent_once = true;
-                            last_update = merged_last_update;
-                        }
-                    }
-                }
-            }
-        });
-
-        let _ = join_all(wait_futs).await;
-
-        let _ = update_tx.send(());
-
-        let first_err = first_err_mutex.lock().await.take();
-        let results = results_mutex.lock().await.clone();
-        finalize_nsscanner_result(&results, first_err)
-    }
-}
-
-#[async_trait::async_trait]
-impl ScannerIOCache for SetDisks {
-    #[tracing::instrument(skip(self, updates))]
-    async fn nsscanner_cache(
         self: Arc<Self>,
         ctx: CancellationToken,
-        buckets: Vec<BucketInfo>,
-        updates: mpsc::Sender<DataUsageCache>,
-        want_cycle: u64,
-        scan_mode: HealScanMode,
-    ) -> Result<()> {
-        if buckets.is_empty() {
-            return Ok(());
-        }
-
-        let (disks, healing) = self.get_online_disks_with_healing(false).await;
-        if disks.is_empty() {
-            debug!("nsscanner_cache: no online disks available for set");
-            return Ok(());
-        }
-
-        let mut old_cache = DataUsageCache::default();
-        old_cache.load(self.clone(), DATA_USAGE_CACHE_NAME).await?;
-
-        let mut cache = DataUsageCache {
-            info: DataUsageCacheInfo {
-                name: DATA_USAGE_ROOT.to_string(),
-                next_cycle: old_cache.info.next_cycle,
-                ..Default::default()
-            },
-            cache: HashMap::new(),
-        };
-
-        let (bucket_tx, bucket_rx) = mpsc::channel::<BucketInfo>(buckets.len());
-
-        let mut permutes = buckets.clone();
-        permutes.shuffle(&mut rand::rng());
-
-        for bucket in permutes.iter() {
-            if old_cache.find(&bucket.name).is_none()
-                && let Err(e) = bucket_tx.send(bucket.clone()).await
-            {
-                error!("Failed to send bucket info: {}", e);
-            }
-        }
-
-        for bucket in permutes.iter() {
-            if let Some(c) = old_cache.find(&bucket.name) {
-                cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
-
-                if let Err(e) = bucket_tx.send(bucket.clone()).await {
-                    error!("Failed to send bucket info: {}", e);
-                }
-            }
-        }
-
-        drop(bucket_tx);
-
-        let cache_mutex: Arc<Mutex<DataUsageCache>> = Arc::new(Mutex::new(cache));
-
-        let (bucket_result_tx, mut bucket_result_rx) = mpsc::channel::<DataUsageEntryInfo>(disks.len());
-
-        let cache_mutex_clone = cache_mutex.clone();
-        let store_clone = self.clone();
-        let ctx_clone = ctx.clone();
-        let send_update_fut = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(3 + rand::random::<u64>() % 10));
-
-            let mut last_update = None;
-
-            loop {
-                tokio::select! {
-                    _ = ctx_clone.cancelled() => {
-                        break;
-                    }
-                    _ = ticker.tick() => {
-                        let cache_snapshot = {
-                            let cache = cache_mutex_clone.lock().await;
-                            if cache.info.last_update == last_update {
-                                None
-                            } else {
-                                Some(cache.clone())
-                            }
-                        };
-
-                        let Some(cache_snapshot) = cache_snapshot else {
-                            continue;
-                        };
-                        last_update =
-                            persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
-                    }
-                    res =  bucket_result_rx.recv() => {
-                        if let Some(result) = res {
-                            let mut cache = cache_mutex_clone.lock().await;
-                            cache.replace(&result.name, &result.parent, result.entry);
-                            cache.info.last_update = Some(SystemTime::now());
-
-                        } else {
-                            let cache_snapshot = {
-                                let mut cache = cache_mutex_clone.lock().await;
-                                cache.info.next_cycle = want_cycle;
-                                cache.info.last_update = Some(SystemTime::now());
-                                cache.clone()
-                            };
-                            let _ = persist_and_publish_cache_snapshot(store_clone.clone(), &updates, cache_snapshot).await;
-
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        let mut futs = Vec::new();
-
-        let bucket_rx_mutex: Arc<Mutex<mpsc::Receiver<BucketInfo>>> = Arc::new(Mutex::new(bucket_rx));
-        let bucket_result_tx_clone: Arc<Mutex<mpsc::Sender<DataUsageEntryInfo>>> = Arc::new(Mutex::new(bucket_result_tx));
-        for disk in disks.into_iter() {
-            let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
-            let ctx_clone = ctx.clone();
-            let store_clone_clone = self.clone();
-            let bucket_result_tx_clone_clone = bucket_result_tx_clone.clone();
-            let disk_clone = disk.clone();
-            futs.push(tokio::spawn(async move {
-                while let Some(bucket) = bucket_rx_mutex_clone.lock().await.recv().await {
-                    if ctx_clone.is_cancelled() {
-                        break;
-                    }
-
-                    debug!("nsscanner_disk: got bucket: {}", bucket.name);
-
-                    let cache_name = path_join_buf(&[&bucket.name, DATA_USAGE_CACHE_NAME]);
-
-                    let mut cache = DataUsageCache::default();
-                    if let Err(e) = cache.load(store_clone_clone.clone(), &cache_name).await {
-                        error!("Failed to load data usage cache: {}", e);
-                    }
-
-                    if cache.info.name.is_empty() {
-                        cache.info.name = bucket.name.clone();
-                    }
-
-                    cache.info.skip_healing = healing;
-                    cache.info.next_cycle = want_cycle;
-                    if cache.info.name != bucket.name {
-                        cache.info = DataUsageCacheInfo {
-                            name: bucket.name.clone(),
-                            next_cycle: want_cycle,
-                            ..Default::default()
-                        };
-                    }
-
-                    debug!("nsscanner_disk: cache.info.name: {:?}", cache.info.name);
-
-                    let (updates_tx, mut updates_rx) = mpsc::channel::<DataUsageEntry>(1);
-
-                    let ctx_clone_clone = ctx_clone.clone();
-                    let bucket_name_clone = bucket.name.clone();
-                    let bucket_result_tx_clone_clone_clone = bucket_result_tx_clone_clone.clone();
-                    let update_fut = tokio::spawn(async move {
-                        while let Some(result) = updates_rx.recv().await {
-                            if ctx_clone_clone.is_cancelled() {
-                                break;
-                            }
-
-                            if let Err(e) = bucket_result_tx_clone_clone_clone
-                                .lock()
-                                .await
-                                .send(DataUsageEntryInfo {
-                                    name: bucket_name_clone.clone(),
-                                    parent: DATA_USAGE_ROOT.to_string(),
-                                    entry: result,
-                                })
-                                .await
-                            {
-                                error!("Failed to send data usage entry info: {}", e);
-                            }
-                        }
-                    });
-
-                    let before = cache.info.last_update;
-
-                    cache = match disk_clone
-                        .nsscanner_disk(ctx_clone.clone(), cache.clone(), Some(updates_tx), scan_mode)
-                        .await
-                    {
-                        Ok(cache) => cache,
-                        Err(e) => {
-                            error!("Failed to scan disk: {}", e);
-
-                            if let (Some(last_update), Some(before_update)) = (cache.info.last_update, before)
-                                && last_update > before_update
-                                && let Err(e) = cache.save(store_clone_clone.clone(), cache_name.as_str()).await
-                            {
-                                error!("Failed to save data usage cache: {}", e);
-                            }
-
-                            if let Err(e) = update_fut.await {
-                                error!("Failed to update data usage cache: {}", e);
-                            }
-                            continue;
-                        }
-                    };
-
-                    debug!("nsscanner_disk: got cache: {}", cache.info.name);
-
-                    if let Err(e) = update_fut.await {
-                        error!("nsscanner_disk: Failed to update data usage cache: {}", e);
-                    }
-
-                    let root = if let Some(r) = cache.root() {
-                        cache.flatten(&r)
-                    } else {
-                        DataUsageEntry::default()
-                    };
-
-                    if ctx_clone.is_cancelled() {
-                        break;
-                    }
-
-                    debug!("nsscanner_disk: sending data usage entry info: {}", cache.info.name);
-
-                    if let Err(e) = bucket_result_tx_clone_clone
-                        .lock()
-                        .await
-                        .send(DataUsageEntryInfo {
-                            name: cache.info.name.clone(),
-                            parent: DATA_USAGE_ROOT.to_string(),
-                            entry: root,
-                        })
-                        .await
-                    {
-                        error!("nsscanner_disk: Failed to send data usage entry info: {}", e);
-                    }
-
-                    if let Err(e) = cache.save(store_clone_clone.clone(), &cache_name).await {
-                        error!("nsscanner_disk: Failed to save data usage cache: {}", e);
-                    }
-                }
-            }));
-        }
-
-        let _ = join_all(futs).await;
-
-        drop(bucket_result_tx_clone);
-
-        send_update_fut.await?;
-
-        debug!("nsscanner_cache: done");
-
-        Ok(())
-    }
-}
-
-#[async_trait::async_trait]
-impl ScannerIODisk for Disk {
-    async fn get_size(&self, mut item: ScannerItem) -> Result<SizeSummary> {
-        let done_object = Metrics::time(Metric::ScanObject);
-
-        if !is_xl_meta_path(&item.path) {
-            return Err(StorageError::other("skip file".to_string()));
-        }
-
-        let data = match self.read_metadata(&item.bucket, &item.object_path()).await {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(
-                    "Failed to read metadata: {e}, bucket={}, object_path={}",
-                    &item.bucket,
-                    &item.object_path()
-                );
-
-                return Err(StorageError::other("failed to read metadata".to_string()));
-            }
-        };
-
-        item.transform_meta_dir();
-
-        let meta = FileMeta::load(&data)?;
-        let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
-            Ok(versions) => versions,
-            Err(e) => {
-                error!("Failed to get file info versions: {}/{}, err: {e}", item.bucket, item.object_path());
-                return Err(StorageError::other("skip file".to_string()));
-            }
-        };
-
-        let versioned = BucketVersioningSys::get(&item.bucket)
-            .await
-            .map(|v| v.versioned(&item.object_path()))
-            .unwrap_or(false);
-
-        let object_infos = fivs
-            .versions
-            .iter()
-            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
-            .collect::<Vec<ObjectInfo>>();
-        let free_version_infos = fivs
-            .free_versions
-            .iter()
-            .map(|v| ObjectInfo::from_file_info(v, item.bucket.as_str(), item.object_path().as_str(), versioned))
-            .collect::<Vec<ObjectInfo>>();
-
-        let mut size_summary = SizeSummary::default();
-
-        let tiers = {
-            let tier_config_mgr = GLOBAL_TierConfigMgr.read().await;
-            tier_config_mgr.list_tiers()
-        };
-
-        for tier in tiers.iter() {
-            size_summary.tier_stats.insert(tier.name.clone(), TierStats::default());
-        }
-        if !size_summary.tier_stats.is_empty() {
-            size_summary
-                .tier_stats
-                .insert(storageclass::STANDARD.to_string(), TierStats::default());
-            size_summary
-                .tier_stats
-                .insert(storageclass::RRS.to_string(), TierStats::default());
-        }
-
-        let lock_config = match get_object_lock_config(&item.bucket).await {
-            Ok((cfg, _)) => Some(Arc::new(cfg)),
-            Err(_) => None,
-        };
-
-        item.apply_actions(object_infos, lock_config, &mut size_summary).await;
-
-        if !free_version_infos.is_empty() {
-            let mut expiry_state = GLOBAL_ExpiryState.write().await;
-            for oi in free_version_infos {
-                expiry_state.enqueue_free_version(oi).await;
-            }
-        }
-
-        done_object();
-
-        Ok(size_summary)
-    }
-
-    #[tracing::instrument(skip(self, updates, cache))]
-    async fn nsscanner_disk(
-        &self,
-        ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
+        set_disks: Vec<Arc<Disk>>,
         cache: DataUsageCache,
         updates: Option<mpsc::Sender<DataUsageEntry>>,
         scan_mode: HealScanMode,
-    ) -> Result<DataUsageCache> {
-        let done_drive = Metrics::time(Metric::ScanBucketDrive);
-        let drive_start = std::time::Instant::now();
-        let bucket = cache.info.name.clone();
-        let disk_path = self.path().to_string_lossy().to_string();
-        let _guard = self.start_scan();
+    ) -> Result<ScannerDiskScanOutcome>;
 
-        let mut cache = cache;
+    async fn get_size(&self, item: ScannerItem) -> Result<SizeSummary>;
 
-        let (lifecycle_config, _) = get_lifecycle_config(&cache.info.name)
-            .await
-            .unwrap_or_else(|_| (BucketLifecycleConfiguration::default(), OffsetDateTime::now_utc()));
+    /// Read one object using a registry snapshot captured at scan start.
+    async fn get_size_with_tier_names(&self, item: ScannerItem, tier_names: &[String]) -> Result<SizeSummary>;
+}
 
-        if lifecycle_config.has_active_rules("") {
-            cache.info.lifecycle = Some(Arc::new(lifecycle_config));
-        }
+#[derive(Debug)]
+pub enum ScannerDiskScanOutcome {
+    Complete(DataUsageCache),
+    Partial(DataUsageCache),
+    NamespaceNotFound(DataUsageCache),
+}
 
-        let (replication_config, _) = get_replication_config(&cache.info.name).await.unwrap_or((
-            ReplicationConfiguration {
-                role: "".to_string(),
-                rules: vec![],
-            },
-            OffsetDateTime::now_utc(),
-        ));
+pub(crate) async fn scanner_set_disk_inventory(set: &SetDisks) -> Vec<Arc<Disk>> {
+    let membership = set.drive_membership_snapshot().await;
+    let capacity = membership
+        .online
+        .len()
+        .saturating_add(membership.suspect.len())
+        .saturating_add(membership.returning.len())
+        .saturating_add(membership.offline.len());
+    let mut disks = Vec::with_capacity(capacity);
+    disks.extend(membership.online);
+    disks.extend(membership.suspect);
+    disks.extend(membership.returning);
+    disks.extend(membership.offline);
+    disks
+}
 
-        if replication_config.has_active_rules("", true)
-            && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
-        {
-            cache.info.replication = Some(Arc::new(ReplicationConfig {
-                config: Some(replication_config),
-                remotes: Some(targets),
-            }));
-        }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerCycleDeferReason {
+    ActivityBaselineUnavailable,
+    DataMovement,
+}
 
-        // TODO: object lock
-
-        let Some(ecstore) = new_object_layer_fn() else {
-            error!("ECStore not available");
-            return Err(StorageError::other("ECStore not available".to_string()));
-        };
-
-        let disk_location = self.get_disk_location();
-
-        let (Some(pool_idx), Some(set_idx)) = (disk_location.pool_idx, disk_location.set_idx) else {
-            error!("Disk location not available");
-            return Err(StorageError::other("Disk location not available".to_string()));
-        };
-
-        let disks_result = ecstore.get_disks(pool_idx, set_idx).await?;
-
-        let Some(disk_idx) = disk_location.disk_idx else {
-            error!("Disk index not available");
-            return Err(StorageError::other("Disk index not available".to_string()));
-        };
-
-        let local_disk = if let Some(Some(local_disk)) = disks_result.get(disk_idx) {
-            local_disk.clone()
-        } else {
-            error!("Local disk not available");
-            return Err(StorageError::other("Local disk not available".to_string()));
-        };
-
-        let disks = disks_result.into_iter().flatten().collect::<Vec<Arc<Disk>>>();
-
-        let result = scan_data_folder(ctx, disks, local_disk, cache, updates, scan_mode, SCANNER_SLEEPER.clone()).await;
-
-        match result {
-            Ok(mut data_usage_info) => {
-                done_drive();
-                emit_scan_bucket_drive_complete(true, &bucket, &disk_path, drive_start.elapsed());
-                data_usage_info.info.last_update = Some(SystemTime::now());
-                Ok(data_usage_info)
-            }
-            Err(e) => {
-                emit_scan_bucket_drive_complete(false, &bucket, &disk_path, drive_start.elapsed());
-                Err(StorageError::other(format!("Failed to scan data folder: {e}")))
-            }
+impl ScannerCycleDeferReason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ActivityBaselineUnavailable => "activity_baseline_unavailable",
+            Self::DataMovement => "data_movement",
         }
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScannerCycleStatus {
+    Complete,
+    Incomplete,
+    Superseded,
+    Deferred(ScannerCycleDeferReason),
+}
+
+enum ScannerActivityPreflight {
+    Ready(crate::scanner::ScannerActivitySnapshot),
+    ActivityBaselineUnavailable(String),
+    DataMovement,
+}
+
+fn scanner_activity_preflight(
+    activity: std::result::Result<crate::scanner::ScannerActivitySnapshot, String>,
+) -> ScannerActivityPreflight {
+    match activity {
+        Err(error) => ScannerActivityPreflight::ActivityBaselineUnavailable(error),
+        Ok(snapshot) if !crate::scanner::scanner_activity_allows_usage_publication(&snapshot) => {
+            ScannerActivityPreflight::DataMovement
+        }
+        Ok(snapshot) => ScannerActivityPreflight::Ready(snapshot),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ScannerCycleResult {
+    pub(crate) status: ScannerCycleStatus,
+    publication_epoch: Option<u64>,
+    dirty_usage_clear: Option<DirtyUsageBuckets>,
+    remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    remote_publication_lease_targets: Vec<(String, String, u64)>,
+    failed_dirty_usage: bool,
+    pending_maintenance_work: bool,
+    required_cycle_floor: Option<u64>,
+}
+
+impl ScannerCycleResult {
+    pub(crate) fn new(status: ScannerCycleStatus, dirty_usage_clear: Option<DirtyUsageBuckets>) -> Self {
+        Self {
+            status,
+            publication_epoch: None,
+            dirty_usage_clear,
+            remote_dirty_usage_acknowledgements: Vec::new(),
+            remote_publication_lease_targets: Vec::new(),
+            failed_dirty_usage: false,
+            pending_maintenance_work: false,
+            required_cycle_floor: None,
+        }
+    }
+
+    pub(crate) fn with_publication_epoch(mut self, publication_epoch: Option<u64>) -> Self {
+        self.publication_epoch = publication_epoch;
+        self
+    }
+
+    pub(crate) fn publication_epoch(&self) -> Option<u64> {
+        self.publication_epoch
+    }
+
+    fn with_failed_dirty_usage(mut self, failed_dirty_usage: bool) -> Self {
+        self.failed_dirty_usage = failed_dirty_usage;
+        self
+    }
+
+    fn with_pending_maintenance_work(mut self, pending_maintenance_work: bool) -> Self {
+        self.pending_maintenance_work = pending_maintenance_work;
+        self
+    }
+
+    fn with_required_cycle_floor(mut self, required_cycle_floor: Option<u64>) -> Self {
+        self.required_cycle_floor = required_cycle_floor;
+        self
+    }
+
+    pub(crate) fn with_remote_dirty_usage_acknowledgements(
+        mut self,
+        acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    ) -> Self {
+        self.remote_dirty_usage_acknowledgements = acknowledgements;
+        self
+    }
+
+    pub(crate) fn with_remote_publication_lease_targets(mut self, targets: Vec<(String, String, u64)>) -> Self {
+        self.remote_publication_lease_targets = targets;
+        self
+    }
+
+    pub(crate) fn remote_publication_lease_targets(&self) -> &[(String, String, u64)] {
+        &self.remote_publication_lease_targets
+    }
+
+    pub(crate) fn acknowledge_durable_usage(self) -> Vec<crate::scanner::ScannerDirtyUsageAcknowledgement> {
+        if let Some(snapshot) = self.dirty_usage_clear {
+            clear_dirty_usage_buckets(&snapshot);
+        }
+        self.remote_dirty_usage_acknowledgements
+    }
+
+    pub(crate) fn has_dirty_usage_to_acknowledge(&self) -> bool {
+        self.dirty_usage_clear.as_ref().is_some_and(|snapshot| !snapshot.is_empty())
+            || !self.remote_dirty_usage_acknowledgements.is_empty()
+    }
+
+    pub(crate) fn has_failed_dirty_usage(&self) -> bool {
+        self.failed_dirty_usage
+    }
+
+    pub(crate) fn has_pending_maintenance_work(&self) -> bool {
+        self.pending_maintenance_work
+    }
+
+    pub(crate) fn required_cycle_floor(&self) -> Option<u64> {
+        self.required_cycle_floor
+    }
+}
+
+mod cache;
+mod dirty_usage;
+mod guards;
+mod io_cache;
+mod io_cycle;
+mod io_disk;
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod publish_gate_tests;
+#[cfg(test)]
+mod tests;
 
-    #[test]
-    fn record_set_scan_failure_preserves_first_error() {
-        let mut first = None;
-        record_set_scan_failure(&mut first, Error::other("first"));
-        record_set_scan_failure(&mut first, Error::other("second"));
+use cache::*;
+use dirty_usage::*;
+use guards::*;
 
-        let first = first.expect("first error should be recorded");
-        assert!(first.to_string().contains("first"));
-    }
-
-    #[test]
-    fn finalize_nsscanner_result_returns_ok_when_any_set_succeeds() {
-        let mut results = vec![DataUsageCache::default(), DataUsageCache::default()];
-        results[1].info.last_update = Some(SystemTime::now());
-
-        let result = finalize_nsscanner_result(&results, Some(Error::other("set failed")));
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn finalize_nsscanner_result_returns_first_error_when_all_sets_fail() {
-        let results = vec![DataUsageCache::default(), DataUsageCache::default()];
-
-        let err = finalize_nsscanner_result(&results, Some(Error::other("set failed")))
-            .expect_err("all failed sets should bubble first error");
-        assert!(err.to_string().contains("set failed"));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn is_xl_meta_path_accepts_windows_separator() {
-        assert!(is_xl_meta_path("D:\\data\\bucket\\object\\xl.meta"));
-    }
-
-    #[test]
-    fn is_xl_meta_path_accepts_forward_separator() {
-        assert!(is_xl_meta_path("/data/bucket/object/xl.meta"));
-    }
-}
+pub(crate) use cache::{
+    DataUsageCacheReuseOptions, DataUsageCacheScanState, acquire_scanner_cache_locks,
+    current_cache_root_or_prepare_with_generation,
+};
+pub use dirty_usage::{
+    ScannerDirtyUsageAckError, ScannerDirtyUsageState, acknowledge_dirty_usage_generation, clear_dirty_usage_bucket,
+    record_dirty_usage_bucket, record_scanner_maintenance_change, scanner_activity_epoch, scanner_dirty_usage_state,
+    scanner_maintenance_generation,
+};
+#[cfg(test)]
+pub(crate) use dirty_usage::{clear_dirty_usage_buckets_for_tests, dirty_usage_buckets_for_tests};
+pub(crate) use dirty_usage::{
+    dirty_usage_bucket_notified, dirty_usage_buckets_pending, dirty_usage_generation, scanner_maintenance_changed,
+};

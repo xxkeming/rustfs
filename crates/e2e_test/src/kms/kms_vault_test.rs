@@ -19,14 +19,12 @@
 //! multipart upload behaviour.
 
 use crate::common::{TEST_BUCKET, init_logging};
-use serial_test::serial;
-use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 use super::common::{
-    VAULT_KEY_NAME, VaultTestEnvironment, get_kms_status, skip_if_kms_admin_tool_unavailable, sse_customer_key_md5_base64,
-    start_kms, test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management, test_sse_c_encryption,
-    test_sse_kms_encryption, test_sse_s3_encryption,
+    SSE_C_KEY_MISMATCH_MESSAGE, VAULT_KEY_NAME, VaultTestEnvironment, assert_s3_error, get_kms_status,
+    sse_customer_key_md5_base64, start_kms, test_all_multipart_encryption_types, test_error_scenarios, test_kms_key_management,
+    test_sse_c_encryption, test_sse_kms_encryption, test_sse_s3_encryption,
 };
 
 /// Helper that brings up Vault, configures RustFS, and starts the KMS service.
@@ -46,8 +44,8 @@ impl VaultKmsTestContext {
 
         start_kms(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
-        // Allow Vault to finish initialising token auth and transit engine.
-        sleep(Duration::from_secs(2)).await;
+        // Wait for KMS to finish initialising.
+        super::common::wait_for_kms_ready(&env.base_env.url, &env.base_env.access_key, &env.base_env.secret_key).await?;
 
         Ok(Self { env })
     }
@@ -62,12 +60,8 @@ impl VaultKmsTestContext {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_end_to_end") {
-        return Ok(());
-    }
     info!("Starting Vault KMS End-to-End Test with default key {}", VAULT_KEY_NAME);
 
     let context = VaultKmsTestContext::new().await?;
@@ -118,12 +112,8 @@ async fn test_vault_kms_end_to_end() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_isolation") {
-        return Ok(());
-    }
     info!("Starting Vault KMS SSE-C key isolation test");
 
     let context = VaultKmsTestContext::new().await?;
@@ -137,8 +127,8 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 
     let key1 = "01234567890123456789012345678901";
     let key2 = "98765432109876543210987654321098";
-    let key1_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key1);
-    let key2_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, key2);
+    let key1_b64 = base64_simd::STANDARD.encode_to_string(key1);
+    let key2_b64 = base64_simd::STANDARD.encode_to_string(key2);
     let key1_md5 = sse_customer_key_md5_base64(key1);
     let key2_md5 = sse_customer_key_md5_base64(key2);
 
@@ -192,7 +182,13 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
         .sse_customer_key_md5(&key2_md5)
         .send()
         .await;
-    assert!(wrong_key.is_err(), "Object1 should not decrypt with key2");
+    assert_s3_error(
+        wrong_key,
+        400,
+        "InvalidRequest",
+        SSE_C_KEY_MISMATCH_MESSAGE,
+        "Vault-backed SSE-C object GET with a wrong key must be rejected",
+    );
 
     context
         .base_env()
@@ -205,12 +201,8 @@ async fn test_vault_kms_key_isolation() -> Result<(), Box<dyn std::error::Error 
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_large_file") {
-        return Ok(());
-    }
     info!("Starting Vault KMS large file SSE-S3 test");
 
     let context = VaultKmsTestContext::new().await?;
@@ -270,12 +262,8 @@ async fn test_vault_kms_large_file() -> Result<(), Box<dyn std::error::Error + S
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_multipart_upload") {
-        return Ok(());
-    }
     info!("Starting Vault KMS multipart upload encryption suite");
 
     let context = VaultKmsTestContext::new().await?;
@@ -301,12 +289,8 @@ async fn test_vault_kms_multipart_upload() -> Result<(), Box<dyn std::error::Err
 }
 
 #[tokio::test]
-#[serial]
 async fn test_vault_kms_key_operations() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     init_logging();
-    if skip_if_kms_admin_tool_unavailable("test_vault_kms_key_operations") {
-        return Ok(());
-    }
     info!("Starting Vault KMS key operations test (CRUD)");
 
     let context = VaultKmsTestContext::new().await?;
@@ -417,6 +401,22 @@ async fn test_vault_kms_key_crud(
 
     info!("✅ Read: Successfully listed keys, found test key");
 
+    // A waiting window outside 7-30 days is refused at the endpoint for this
+    // backend too: the bound is enforced once in the service (rustfs/backlog#1585).
+    for days in [6, 31] {
+        let window_error = crate::common::execute_awscurl(
+            &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&pending_window_in_days={days}"),
+            "DELETE",
+            None,
+            access_key,
+            secret_key,
+        )
+        .await
+        .err()
+        .ok_or_else(|| format!("A {days}-day deletion window must be refused"))?;
+        info!("✅ Delete window {} correctly refused: {}", days, window_error);
+    }
+
     // Delete
     let delete_response = crate::common::execute_awscurl(
         &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}"),
@@ -449,29 +449,32 @@ async fn test_vault_kms_key_crud(
 
     info!("✅ Delete verification: Key state correctly changed to: {}", key_state);
 
-    // Force Delete - Force immediate deletion for PendingDeletion key
-    let force_delete_response = crate::common::execute_awscurl(
+    // Force Delete - the query string can no longer ask for immediate deletion,
+    // and a default server refuses it in any case (rustfs/backlog#1585):
+    // destroying the key material immediately would take every object encrypted
+    // under the key with it.
+    let force_delete_error = crate::common::execute_awscurl(
         &format!("{base_url}/rustfs/admin/v3/kms/keys/delete?keyId={key_id}&force_immediate=true"),
         "DELETE",
         None,
         access_key,
         secret_key,
     )
-    .await?;
+    .await
+    .expect_err("Immediate KMS key deletion must be refused on a default server");
+    info!("✅ Force Delete: correctly refused for key {}: {}", key_id, force_delete_error);
 
-    // Parse and validate the force delete response
-    let force_delete_result: serde_json::Value = serde_json::from_str(&force_delete_response)?;
-    assert_eq!(force_delete_result["success"], true, "Force delete operation must return success=true");
-    info!("✅ Force Delete: Successfully force deleted key: {}", key_id);
+    // The refused request must leave the key exactly as it was: still present,
+    // still pending deletion, still recoverable through cancel-deletion.
+    let describe_after_refusal =
+        crate::common::awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await?;
+    let describe_after_refusal: serde_json::Value = serde_json::from_str(&describe_after_refusal)?;
+    assert_eq!(
+        describe_after_refusal["key_metadata"]["key_state"], "PendingDeletion",
+        "A refused immediate deletion must leave the key pending deletion"
+    );
 
-    // Verify key no longer exists after force deletion (should return error)
-    let describe_force_deleted_result =
-        crate::common::awscurl_get(&format!("{base_url}/rustfs/admin/v3/kms/keys/{key_id}"), access_key, secret_key).await;
-
-    // After force deletion, key should not be found (GET should fail)
-    assert!(describe_force_deleted_result.is_err(), "Force deleted key should not be found");
-
-    info!("✅ Force Delete verification: Key was permanently deleted and is no longer accessible");
+    info!("✅ Force Delete verification: Key survived the refused immediate deletion");
 
     info!("Vault KMS key CRUD operations completed successfully");
     Ok(())

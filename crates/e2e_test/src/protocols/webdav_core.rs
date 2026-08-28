@@ -13,18 +13,29 @@
 // limitations under the License.
 
 //! Core WebDAV tests
+//!
+//! # Security regression coverage
+//!
+//! GHSA-3p3x-734c-h5vx (constant-time secret comparison on the WebDAV/FTPS
+//! password login path, fixed in rustfs/rustfs#4403) is anchored end-to-end by
+//! the authentication-failure block in [`test_webdav_core_operations`], marked
+//! with a `GHSA-3p3x` comment. It drives the `ct_eq` rejection branch in
+//! `WebDavAuth::authenticate` (`crates/protocols/src/webdav/server.rs`): a
+//! valid access key with a wrong secret is rejected (the exact branch the
+//! advisory hardened), and an unknown user is rejected with the same status so
+//! the two failures are indistinguishable. The sibling FTPS assertion lives in
+//! `ftps_core.rs`; the internode RPC fail-closed advisory
+//! (GHSA-r5qv-rc46-hv8q, rustfs/rustfs#4402) is anchored by the `ghsa_r5qv_*`
+//! unit tests in `crates/ecstore/src/cluster/rpc/http_auth.rs`. See
+//! `docs/testing/security-regressions.md` for the full advisory -> test map.
+//!
+//! Advisory: <https://github.com/rustfs/rustfs/security/advisories/GHSA-3p3x-734c-h5vx>
 
-use crate::common::local_http_client;
 use crate::common::rustfs_binary_path_with_features;
+use crate::common::{AdminTransport, admin_add_canned_policy_via, admin_attach_user_policy_via, admin_create_user_via};
 use crate::protocols::test_env::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY, ProtocolTestEnvironment};
 use anyhow::Result;
-use base64::Engine;
-use http::header::{CONTENT_TYPE, HOST};
 use reqwest::Client;
-use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-use rustfs_signer::sign_v4;
-use s3s::Body;
-use serial_test::serial;
 use tokio::process::Command;
 use tracing::info;
 
@@ -48,96 +59,47 @@ fn basic_auth_header() -> String {
 
 fn basic_auth_header_for(access_key: &str, secret_key: &str) -> String {
     let credentials = format!("{}:{}", access_key, secret_key);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(credentials);
+    let encoded = base64_simd::STANDARD.encode_to_string(credentials);
     format!("Basic {}", encoded)
 }
 
-async fn signed_admin_request(
-    method: http::Method,
-    url: &str,
-    body: Option<Vec<u8>>,
-    content_type: Option<&str>,
-) -> Result<reqwest::Response> {
-    let uri = url.parse::<http::Uri>()?;
-    let authority = uri
-        .authority()
-        .ok_or_else(|| anyhow::anyhow!("request URL missing authority"))?
-        .to_string();
-    let mut request = http::Request::builder().method(method.clone()).uri(uri);
-    request = request.header(HOST, authority);
-    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-    if let Some(content_type) = content_type {
-        request = request.header(CONTENT_TYPE, content_type);
-    }
-
-    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
-    let signed = sign_v4(
-        request.body(Body::empty())?,
-        content_len,
+async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
+    admin_create_user_via(
+        AdminTransport::Signed,
+        base_url,
         DEFAULT_ACCESS_KEY,
         DEFAULT_SECRET_KEY,
-        "",
-        "us-east-1",
-    );
-
-    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
-    let mut request_builder = local_http_client().request(reqwest_method, url);
-    for (name, value) in signed.headers() {
-        request_builder = request_builder.header(name, value);
-    }
-    if let Some(body) = body {
-        request_builder = request_builder.body(body);
-    }
-
-    Ok(request_builder.send().await?)
-}
-
-async fn admin_create_user(base_url: &str, username: &str, secret_key: &str) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-user?accessKey={}", base_url, username);
-    let body = serde_json::json!({
-        "secretKey": secret_key,
-        "status": "enabled"
-    });
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(body.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("create user failed: {status} {body}");
-    }
-
-    Ok(())
+        username,
+        secret_key,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_add_canned_policy(base_url: &str, policy_name: &str, policy: &serde_json::Value) -> Result<()> {
-    let url = format!("{}/rustfs/admin/v3/add-canned-policy?name={}", base_url, policy_name);
-    let response =
-        signed_admin_request(http::Method::PUT, &url, Some(policy.to_string().into_bytes()), Some("application/json")).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("add canned policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        &policy.to_string(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 async fn admin_attach_policy_to_user(base_url: &str, policy_name: &str, username: &str) -> Result<()> {
-    let url = format!(
-        "{}/rustfs/admin/v3/set-user-or-group-policy?policyName={}&userOrGroup={}&isGroup=false",
-        base_url, policy_name, username
-    );
-    let response = signed_admin_request(http::Method::PUT, &url, Some(Vec::new()), None).await?;
-
-    if response.status() != reqwest::StatusCode::OK {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("attach policy failed: {status} {body}");
-    }
-
-    Ok(())
+    admin_attach_user_policy_via(
+        AdminTransport::Signed,
+        base_url,
+        DEFAULT_ACCESS_KEY,
+        DEFAULT_SECRET_KEY,
+        policy_name,
+        username,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Test WebDAV: MKCOL (create bucket), PUT, GET, DELETE, PROPFIND operations
@@ -151,6 +113,7 @@ pub async fn test_webdav_core_operations() -> Result<()> {
     let mut server_process = Command::new(&binary_path)
         .arg("--address")
         .arg(S3_TEST_ADDRESS)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
         .env("RUSTFS_WEBDAV_ENABLE", "true")
         .env("RUSTFS_WEBDAV_ADDRESS", WEBDAV_ADDRESS)
         .env("RUSTFS_WEBDAV_TLS_ENABLED", "false") // No TLS for testing
@@ -214,6 +177,111 @@ pub async fn test_webdav_core_operations() -> Result<()> {
             resp.status()
         );
         info!("PASS: PUT file '{}' successful", filename);
+
+        // Regression for #6260: a bucket-scoped policy must be able to discover its bucket at the
+        // WebDAV root without the unrelated global ListAllMyBuckets permission.
+        let scoped_bucket = "webdav-scoped-bucket";
+        let scoped_file = "visible.txt";
+        let scoped_user = "webdav-scoped-user";
+        let scoped_secret = "webdav-scoped-secret";
+        let scoped_policy_name = "webdav-scoped-policy";
+
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"MKCOL").unwrap(), format!("{}/{}", base_url, scoped_bucket))
+            .header("Authorization", &auth_header)
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test bucket should be created");
+
+        let resp = client
+            .put(format!("{}/{}/{}", base_url, scoped_bucket, scoped_file))
+            .header("Authorization", &auth_header)
+            .body("visible to the scoped principal")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 201, "scoped test object should be created");
+
+        admin_create_user(&admin_base_url, scoped_user, scoped_secret).await?;
+        admin_add_canned_policy(
+            &admin_base_url,
+            scoped_policy_name,
+            &serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ]
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "Bool": { "aws:SecureTransport": "true" } }
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Action": ["s3:*"],
+                        "Resource": [
+                            format!("arn:aws:s3:::{}", scoped_bucket),
+                            format!("arn:aws:s3:::{}/*", scoped_bucket)
+                        ],
+                        "Condition": { "StringEquals": { "s3:signatureversion": "AWS4-HMAC-SHA256" } }
+                    }
+                ]
+            }),
+        )
+        .await?;
+        admin_attach_policy_to_user(&admin_base_url, scoped_policy_name, scoped_user).await?;
+
+        let scoped_auth = basic_auth_header_for(scoped_user, scoped_secret);
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .header("x-amz-content-sha256", "STREAMING-AWS4-HMAC-SHA256-PAYLOAD")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "bucket-scoped root PROPFIND should succeed");
+        let root_listing = resp.text().await?;
+        assert!(root_listing.contains(scoped_bucket), "the authorized bucket should be listed");
+        assert!(!root_listing.contains(bucket_name), "an unauthorized bucket must not be listed");
+
+        let resp = client
+            .request(
+                reqwest::Method::from_bytes(b"PROPFIND").unwrap(),
+                format!("{}/{}", base_url, scoped_bucket),
+            )
+            .header("Authorization", &scoped_auth)
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(resp.status().as_u16(), 207, "authorized bucket PROPFIND should succeed");
+        assert!(resp.text().await?.contains(scoped_file), "the authorized object should be listed");
+
+        let denied_user = "webdav-no-buckets-user";
+        let denied_secret = "webdav-no-buckets-secret";
+        admin_create_user(&admin_base_url, denied_user, denied_secret).await?;
+        let resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for(denied_user, denied_secret))
+            .header("Depth", "1")
+            .send()
+            .await?;
+        assert_eq!(
+            resp.status().as_u16(),
+            207,
+            "PROPFIND keeps the root resource visible when the directory listing is forbidden"
+        );
+        let denied_body = resp.text().await?;
+        assert!(!denied_body.contains(scoped_bucket), "a denied response must not leak the scoped bucket");
+        assert!(!denied_body.contains(bucket_name), "a denied response must not leak the admin bucket");
 
         // Test GET (download file)
         info!("Testing WebDAV: GET (download file '{}')", filename);
@@ -652,15 +720,38 @@ pub async fn test_webdav_core_operations() -> Result<()> {
         );
         info!("PASS: DELETE bucket '{}' successful", bucket_name);
 
-        // Test authentication failure
-        info!("Testing WebDAV: Authentication failure");
-        let resp = client
+        // Security regression (GHSA-3p3x-734c-h5vx): constant-time secret
+        // comparison on the WebDAV password login path (fixed in
+        // rustfs/rustfs#4403). A valid access key with a wrong secret must be
+        // rejected via the `ct_eq` branch in `WebDavAuth::authenticate`, and an
+        // unknown user must be rejected with the same status so the two are
+        // indistinguishable. Behavior-only assertion (no timing checks).
+        info!("Testing WebDAV (GHSA-3p3x): valid access key + wrong secret is rejected");
+        let wrong_secret_resp = client
             .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
-            .header("Authorization", "Basic aW52YWxpZDppbnZhbGlk") // invalid:invalid
+            .header("Authorization", basic_auth_header_for(DEFAULT_ACCESS_KEY, "definitely-not-the-secret"))
             .send()
             .await?;
-        assert_eq!(resp.status().as_u16(), 401, "Invalid auth should return 401, got: {}", resp.status());
-        info!("PASS: Authentication failure test successful");
+        let wrong_secret_status = wrong_secret_resp.status().as_u16();
+        assert_eq!(
+            wrong_secret_status, 401,
+            "valid access key + wrong secret should return 401, got: {wrong_secret_status}"
+        );
+        info!("PASS: WebDAV wrong secret rejected with 401");
+
+        info!("Testing WebDAV (GHSA-3p3x): unknown user is rejected");
+        let unknown_user_resp = client
+            .request(reqwest::Method::from_bytes(b"PROPFIND").unwrap(), &base_url)
+            .header("Authorization", basic_auth_header_for("no-such-access-key", "definitely-not-the-secret"))
+            .send()
+            .await?;
+        let unknown_user_status = unknown_user_resp.status().as_u16();
+        assert_eq!(unknown_user_status, 401, "unknown user should return 401, got: {unknown_user_status}");
+        assert_eq!(
+            wrong_secret_status, unknown_user_status,
+            "invalid-user and invalid-secret failures must be indistinguishable at the protocol layer"
+        );
+        info!("PASS: WebDAV authentication failure (GHSA-3p3x) test successful");
 
         info!("WebDAV core tests passed");
         Ok(())
@@ -675,7 +766,6 @@ pub async fn test_webdav_core_operations() -> Result<()> {
 }
 
 #[tokio::test]
-#[serial]
 async fn test_webdav_core_operations_direct() -> Result<()> {
     test_webdav_core_operations().await
 }

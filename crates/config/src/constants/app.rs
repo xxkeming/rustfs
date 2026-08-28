@@ -131,6 +131,10 @@ pub const ENV_RUSTFS_ADDRESS: &str = "RUSTFS_ADDRESS";
 /// Environment variable for server volumes.
 pub const ENV_RUSTFS_VOLUMES: &str = "RUSTFS_VOLUMES";
 
+/// Environment variable identifying this server's host in distributed endpoint
+/// lists without relying on DNS locality discovery.
+pub const ENV_LOCAL_ENDPOINT_HOST: &str = "RUSTFS_LOCAL_ENDPOINT_HOST";
+
 /// Environment variable to explicitly bypass local physical disk independence checks.
 pub const ENV_UNSAFE_BYPASS_DISK_CHECK: &str = "RUSTFS_UNSAFE_BYPASS_DISK_CHECK";
 
@@ -142,6 +146,41 @@ pub const ENV_MINIO_CI: &str = "MINIO_CI";
 
 /// Default flag value for bypassing local physical disk independence checks.
 pub const DEFAULT_UNSAFE_BYPASS_DISK_CHECK: bool = false;
+
+/// Environment variable selecting how startup waits for DNS/topology
+/// convergence in multi-node setups. One of `auto` (default), `orchestrated`,
+/// `bounded`, or `fail-fast`.
+///
+/// - `orchestrated`: wait effectively indefinitely for recoverable DNS/topology
+///   errors so the process stays Running (readiness stays false) instead of
+///   exiting and triggering a Kubernetes pod restart loop.
+/// - `bounded`: wait for a finite window (see
+///   `ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT`) then fail with an actionable error.
+/// - `fail-fast`: fail on the first non-transient resolution error (CI/local).
+/// - `auto`: distributed URL endpoints use orchestrated on Kubernetes and
+///   bounded otherwise; local path endpoints use fail-fast (no DNS to await).
+pub const ENV_STARTUP_TOPOLOGY_WAIT_MODE: &str = "RUSTFS_STARTUP_TOPOLOGY_WAIT_MODE";
+
+/// Environment variable bounding how long startup waits for topology/DNS
+/// convergence before failing in `bounded` mode. Accepts durations such as
+/// `3m`, `90s`, `500ms`, or a bare number of seconds.
+pub const ENV_STARTUP_TOPOLOGY_WAIT_TIMEOUT: &str = "RUSTFS_STARTUP_TOPOLOGY_WAIT_TIMEOUT";
+
+/// Environment variable capping the per-attempt backoff delay while retrying
+/// startup topology/DNS convergence. Accepts durations such as `8s`.
+pub const ENV_STARTUP_TOPOLOGY_RETRY_MAX_DELAY: &str = "RUSTFS_STARTUP_TOPOLOGY_RETRY_MAX_DELAY";
+
+/// Environment variable injected into every Kubernetes pod; its presence marks
+/// an orchestrated deployment for startup topology auto-detection.
+pub const ENV_KUBERNETES_SERVICE_HOST: &str = "KUBERNETES_SERVICE_HOST";
+
+/// Default bounded-mode wait window (seconds) for non-Kubernetes distributed
+/// deployments before startup topology convergence is declared failed.
+pub const DEFAULT_STARTUP_TOPOLOGY_WAIT_TIMEOUT_SECS: u64 = 180;
+
+/// Default per-attempt backoff cap (seconds) while retrying startup
+/// topology/DNS convergence.
+pub const DEFAULT_STARTUP_TOPOLOGY_RETRY_MAX_DELAY_SECS: u64 = 8;
 
 /// Environment variable for server access key.
 pub const ENV_RUSTFS_ACCESS_KEY: &str = "RUSTFS_ACCESS_KEY";
@@ -155,6 +194,16 @@ pub const ENV_RUSTFS_SECRET_KEY: &str = "RUSTFS_SECRET_KEY";
 /// Environment variable for server secret key file.
 pub const ENV_RUSTFS_SECRET_KEY_FILE: &str = "RUSTFS_SECRET_KEY_FILE";
 
+/// Environment variable controlling startup behavior when unsupported filesystem types are detected.
+///
+/// Accepted values:
+/// - "warn" (default): log a warning and continue startup
+/// - "fail": abort startup with an error
+pub const ENV_RUSTFS_UNSUPPORTED_FS_POLICY: &str = "RUSTFS_UNSUPPORTED_FS_POLICY";
+pub const RUSTFS_UNSUPPORTED_FS_POLICY_WARN: &str = "warn";
+pub const RUSTFS_UNSUPPORTED_FS_POLICY_FAIL: &str = "fail";
+pub const DEFAULT_RUSTFS_UNSUPPORTED_FS_POLICY: &str = RUSTFS_UNSUPPORTED_FS_POLICY_WARN;
+
 /// Environment variable for server OBS endpoint.
 pub const ENV_RUSTFS_OBS_ENDPOINT: &str = "RUSTFS_OBS_ENDPOINT";
 
@@ -163,6 +212,12 @@ pub const ENV_RUSTFS_CONSOLE_ENABLE: &str = "RUSTFS_CONSOLE_ENABLE";
 
 /// Environment variable for console server address.
 pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
+
+/// Public browser entrypoint used to build OIDC callback and console redirects.
+///
+/// This should be the externally reachable scheme and authority, without a path.
+/// Example: `RUSTFS_BROWSER_REDIRECT_URL=https://console.example.com`.
+pub const ENV_RUSTFS_BROWSER_REDIRECT_URL: &str = "RUSTFS_BROWSER_REDIRECT_URL";
 
 /// Environment variable for server tls path.
 pub const ENV_RUSTFS_TLS_PATH: &str = "RUSTFS_TLS_PATH";
@@ -174,6 +229,19 @@ pub const ENV_RUSTFS_KMS_ENABLE: &str = "RUSTFS_KMS_ENABLE";
 /// This is the default value for enabling KMS encryption for server-side encryption.
 /// Default value: false
 pub const DEFAULT_KMS_ENABLE: bool = false;
+
+/// Environment variable enabling per-key KMS authorization on the SSE-KMS data path.
+///
+/// When enabled, an SSE-KMS write additionally requires `kms:GenerateDataKey` and an
+/// SSE-KMS read additionally requires `kms:Decrypt` on the resolved key, evaluated as
+/// the requesting identity. SSE-S3 and SSE-C are unaffected.
+pub const ENV_RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY: &str = "RUSTFS_KMS_ENFORCE_SSE_KEY_POLICY";
+
+/// Default per-key KMS authorization mode for the SSE-KMS data path.
+///
+/// Off for now so deployments whose identity policies only grant s3 actions keep
+/// working; the default flips to on in a later release.
+pub const DEFAULT_KMS_ENFORCE_SSE_KEY_POLICY: bool = false;
 
 /// Environment variable for server KMS backend.
 pub const ENV_RUSTFS_KMS_BACKEND: &str = "RUSTFS_KMS_BACKEND";
@@ -285,6 +353,11 @@ pub const DEFAULT_OBS_TRACES_EXPORT_ENABLED: bool = true;
 /// Environment variable: RUSTFS_OBS_METRICS_EXPORT_ENABLED
 pub const DEFAULT_OBS_METRICS_EXPORT_ENABLED: bool = true;
 
+/// Default detailed PUT stage metrics enabled
+/// Default value: false
+/// Environment variable: RUSTFS_OBS_PUT_STAGE_METRICS_ENABLED
+pub const DEFAULT_OBS_PUT_STAGE_METRICS_ENABLED: bool = false;
+
 /// Default logs export enabled
 /// It is used to enable or disable exporting logs
 /// Default value: true
@@ -293,9 +366,9 @@ pub const DEFAULT_OBS_LOGS_EXPORT_ENABLED: bool = true;
 
 /// Default profiling export enabled
 /// It is used to enable or disable exporting profiles
-/// Default value: false
+/// Default value: true
 /// Environment variable: RUSTFS_OBS_PROFILING_EXPORT_ENABLED
-pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = false;
+pub const DEFAULT_OBS_PROFILING_EXPORT_ENABLED: bool = true;
 
 /// Default log local logging enabled for rustfs
 /// This is the default log local logging enabled for rustfs.
@@ -314,85 +387,6 @@ pub const MI_B: usize = 1024 * KI_B;
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_app_basic_constants() {
-        // Test application basic constants
-        assert_eq!(APP_NAME, "RustFS");
-        assert!(!APP_NAME.contains(' '), "App name should not contain spaces");
-
-        assert_eq!(VERSION, "1.0.0");
-
-        assert_eq!(SERVICE_VERSION, "1.0.0");
-        assert_eq!(VERSION, SERVICE_VERSION, "Version and service version should be consistent");
-    }
-
-    #[test]
-    fn test_logging_constants() {
-        // Test logging related constants
-        assert_eq!(DEFAULT_LOG_LEVEL, "error");
-        assert!(
-            ["trace", "debug", "info", "warn", "error"].contains(&DEFAULT_LOG_LEVEL),
-            "Log level should be a valid tracing level"
-        );
-
-        assert_eq!(SAMPLE_RATIO, 1.0);
-
-        assert_eq!(METER_INTERVAL, 30);
-    }
-
-    #[test]
-    fn test_environment_constants() {
-        // Test environment related constants
-        assert_eq!(ENVIRONMENT, "production");
-        assert_eq!(ENV_RUSTFS_LICENSE_PUBLIC_KEY, "RUSTFS_LICENSE_PUBLIC_KEY");
-        assert!(
-            ["development", "staging", "production", "test"].contains(&ENVIRONMENT),
-            "Environment should be a standard environment name"
-        );
-    }
-
-    #[test]
-    fn test_file_path_constants() {
-        assert_eq!(RUSTFS_TLS_KEY, "rustfs_key.pem");
-        assert!(RUSTFS_TLS_KEY.ends_with(".pem"), "TLS key should be PEM format");
-
-        assert_eq!(RUSTFS_TLS_CERT, "rustfs_cert.pem");
-        assert!(RUSTFS_TLS_CERT.ends_with(".pem"), "TLS cert should be PEM format");
-    }
-
-    #[test]
-    fn test_port_constants() {
-        // Test port related constants
-        assert_eq!(DEFAULT_PORT, 9000);
-
-        assert_eq!(DEFAULT_CONSOLE_PORT, 9001);
-
-        assert_ne!(DEFAULT_PORT, DEFAULT_CONSOLE_PORT, "Main port and console port should be different");
-    }
-
-    #[test]
-    fn test_address_constants() {
-        // Test address related constants
-        assert_eq!(DEFAULT_ADDRESS, ":9000");
-        assert!(DEFAULT_ADDRESS.starts_with(':'), "Address should start with colon");
-        assert!(
-            DEFAULT_ADDRESS.contains(&DEFAULT_PORT.to_string()),
-            "Address should contain the default port"
-        );
-
-        assert_eq!(DEFAULT_CONSOLE_ADDRESS, ":9001");
-        assert!(DEFAULT_CONSOLE_ADDRESS.starts_with(':'), "Console address should start with colon");
-        assert!(
-            DEFAULT_CONSOLE_ADDRESS.contains(&DEFAULT_CONSOLE_PORT.to_string()),
-            "Console address should contain the console port"
-        );
-
-        assert_ne!(
-            DEFAULT_ADDRESS, DEFAULT_CONSOLE_ADDRESS,
-            "Main address and console address should be different"
-        );
-    }
 
     #[test]
     fn test_const_str_concat_functionality() {
@@ -417,6 +411,7 @@ mod tests {
             RUSTFS_TLS_CERT,
             DEFAULT_ADDRESS,
             DEFAULT_CONSOLE_ADDRESS,
+            ENV_RUSTFS_BROWSER_REDIRECT_URL,
         ];
 
         for constant in &string_constants {

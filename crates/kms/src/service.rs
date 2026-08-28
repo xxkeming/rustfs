@@ -14,18 +14,33 @@
 
 //! Object encryption service for S3-compatible encryption
 
+use crate::api_types::{
+    TagKeyRequest, TagKeyResponse, UntagKeyRequest, UntagKeyResponse, UpdateKeyDescriptionRequest, UpdateKeyDescriptionResponse,
+};
+use crate::cache::KmsCacheStats;
 use crate::encryption::ciphers::{create_cipher, generate_iv};
+use crate::encryption::context_aad;
 use crate::error::{KmsError, Result};
 use crate::manager::KmsManager;
 use crate::types::*;
-use base64::Engine;
 use jiff::Zoned;
+use md5::{Digest as Md5Digest, Md5};
 use rand::random;
+use rustfs_utils::http::object_encryption_keys::{
+    INTERNAL_ENCRYPTION_ALGORITHM_HEADER, INTERNAL_ENCRYPTION_CONTEXT_HEADER, INTERNAL_ENCRYPTION_IV_HEADER,
+    INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, INTERNAL_ENCRYPTION_TAG_HEADER,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, info};
+use tracing::debug;
 use zeroize::Zeroize;
+
+fn md5_hex(input: impl AsRef<[u8]>) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(input.as_ref());
+    hex_simd::encode_to_string(hasher.finalize(), hex_simd::AsciiCase::Lower)
+}
 
 /// Data key for object encryption
 /// SECURITY: This struct automatically zeros sensitive key material when dropped
@@ -49,7 +64,25 @@ pub struct ObjectEncryptionService {
     kms_manager: KmsManager,
 }
 
-const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
+fn canonical_bucket_path(bucket: &str, object_key: &str) -> String {
+    let bucket = bucket.trim_matches('/');
+    let object_key = object_key.trim_matches('/');
+    if object_key.is_empty() {
+        bucket.to_string()
+    } else if bucket.is_empty() {
+        object_key.to_string()
+    } else {
+        format!("{bucket}/{object_key}")
+    }
+}
+
+fn request_encryption_context(context: &ObjectEncryptionContext) -> HashMap<String, String> {
+    let mut enc_context = context.encryption_context.clone();
+    enc_context
+        .entry(context.bucket.clone())
+        .or_insert_with(|| canonical_bucket_path(&context.bucket, &context.object_key));
+    enc_context
+}
 
 /// Result of object encryption
 #[derive(Debug, Clone)]
@@ -85,6 +118,23 @@ impl ObjectEncryptionService {
         self.kms_manager.create_key(request).await
     }
 
+    /// Create a new master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - CreateKeyRequest with key parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// CreateKeyResponse with created key details
+    ///
+    pub async fn create_key_with_context(
+        &self,
+        request: CreateKeyRequest,
+        context: &OperationContext,
+    ) -> Result<CreateKeyResponse> {
+        self.kms_manager.create_key_with_context(request, context).await
+    }
+
     /// Describe a master key (delegates to KMS manager)
     ///
     /// # Arguments
@@ -97,6 +147,23 @@ impl ObjectEncryptionService {
         self.kms_manager.describe_key(request).await
     }
 
+    /// Describe a master key on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - DescribeKeyRequest with key ID
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// DescribeKeyResponse with key metadata
+    ///
+    pub async fn describe_key_with_context(
+        &self,
+        request: DescribeKeyRequest,
+        context: &OperationContext,
+    ) -> Result<DescribeKeyResponse> {
+        self.kms_manager.describe_key_with_context(request, context).await
+    }
+
     /// List master keys (delegates to KMS manager)
     ///
     /// # Arguments
@@ -107,6 +174,77 @@ impl ObjectEncryptionService {
     ///
     pub async fn list_keys(&self, request: ListKeysRequest) -> Result<ListKeysResponse> {
         self.kms_manager.list_keys(request).await
+    }
+
+    /// List master keys on behalf of `context`'s principal
+    ///
+    /// # Arguments
+    /// * `request` - ListKeysRequest with listing parameters
+    /// * `context` - Identity and correlation data recorded in the audit trail
+    ///
+    /// # Returns
+    /// ListKeysResponse with list of keys
+    ///
+    pub async fn list_keys_with_context(&self, request: ListKeysRequest, context: &OperationContext) -> Result<ListKeysResponse> {
+        self.kms_manager.list_keys_with_context(request, context).await
+    }
+
+    /// Replace a master key's description (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - UpdateKeyDescriptionRequest with key ID and the new
+    ///   description; an empty description clears the stored value
+    ///
+    /// # Returns
+    /// UpdateKeyDescriptionResponse acknowledging the update
+    ///
+    pub async fn update_key_description(&self, request: UpdateKeyDescriptionRequest) -> Result<UpdateKeyDescriptionResponse> {
+        let description = (!request.description.is_empty()).then_some(request.description.as_str());
+        self.kms_manager.update_key_description(&request.key_id, description).await?;
+
+        Ok(UpdateKeyDescriptionResponse {
+            success: true,
+            message: "key description updated".to_string(),
+            key_id: request.key_id,
+        })
+    }
+
+    /// Add or overwrite master key tags (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - TagKeyRequest with key ID and the tags to set; tags
+    ///   outside the request are left untouched
+    ///
+    /// # Returns
+    /// TagKeyResponse acknowledging the update
+    ///
+    pub async fn tag_key(&self, request: TagKeyRequest) -> Result<TagKeyResponse> {
+        self.kms_manager.tag_key(&request.key_id, &request.tags).await?;
+
+        Ok(TagKeyResponse {
+            success: true,
+            message: "key tags updated".to_string(),
+            key_id: request.key_id,
+        })
+    }
+
+    /// Remove master key tags (delegates to KMS manager)
+    ///
+    /// # Arguments
+    /// * `request` - UntagKeyRequest with key ID and the tag keys to remove;
+    ///   tag keys that are not set are ignored, so the call is idempotent
+    ///
+    /// # Returns
+    /// UntagKeyResponse acknowledging the removal
+    ///
+    pub async fn untag_key(&self, request: UntagKeyRequest) -> Result<UntagKeyResponse> {
+        self.kms_manager.untag_key(&request.key_id, &request.tag_keys).await?;
+
+        Ok(UntagKeyResponse {
+            success: true,
+            message: "key tags removed".to_string(),
+            key_id: request.key_id,
+        })
     }
 
     /// Generate a data encryption key (delegates to KMS manager)
@@ -133,9 +271,9 @@ impl ObjectEncryptionService {
     /// Get cache statistics
     ///
     /// # Returns
-    /// Option with (hits, misses) if caching is enabled
+    /// A [`KmsCacheStats`] snapshot if caching is enabled, `None` otherwise
     ///
-    pub async fn cache_stats(&self) -> Option<(u64, u64)> {
+    pub async fn cache_stats(&self) -> Option<KmsCacheStats> {
         self.kms_manager.cache_stats().await
     }
 
@@ -155,6 +293,50 @@ impl ObjectEncryptionService {
     ///
     pub async fn health_check(&self) -> Result<bool> {
         self.kms_manager.health_check().await
+    }
+
+    /// Report the capabilities of the configured backend
+    ///
+    /// # Returns
+    /// The capability matrix advertised by the active KMS backend
+    ///
+    pub fn backend_capabilities(&self) -> crate::backends::BackendCapabilities {
+        self.kms_manager.backend_capabilities()
+    }
+
+    /// Re-wrap an object's encrypted data key onto its master key's current
+    /// version, without the plaintext data key ever reaching the caller.
+    ///
+    /// Pure passthrough: the backend owns the format and the no-op decision
+    /// ([`RewrapDataKeyResponse::rewrapped`] false means nothing to persist).
+    /// The context must be the object's own — the backend refuses an envelope
+    /// whose recorded context the caller cannot reproduce.
+    pub async fn rewrap_data_key(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::RewrapDataKeyResponse> {
+        self.kms_manager
+            .rewrap_data_key(crate::types::RewrapDataKeyRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
+    }
+
+    /// Report which master key version wraps an object's encrypted data key,
+    /// and whether a rewrap would change anything.
+    pub async fn describe_data_key_wrapping(
+        &self,
+        encrypted_key: &[u8],
+        context: &ObjectEncryptionContext,
+    ) -> Result<crate::types::DescribeDataKeyWrappingResponse> {
+        self.kms_manager
+            .describe_data_key_wrapping(crate::types::DescribeDataKeyWrappingRequest {
+                ciphertext: encrypted_key.to_vec(),
+                encryption_context: request_encryption_context(context),
+            })
+            .await
     }
 
     /// Create a data encryption key for object encryption
@@ -178,15 +360,10 @@ impl ObjectEncryptionService {
             .or_else(|| self.kms_manager.get_default_key_id().map(|s| s.as_str()))
             .ok_or_else(|| KmsError::configuration_error("No KMS key ID specified and no default configured"))?;
 
-        // Build encryption context
-        let mut enc_context = context.encryption_context.clone();
-        enc_context.insert("bucket".to_string(), context.bucket.clone());
-        enc_context.insert("object_key".to_string(), context.object_key.clone());
-
         let request = GenerateDataKeyRequest {
             key_id: actual_key_id.to_string(),
             key_spec: KeySpec::Aes256,
-            encryption_context: enc_context,
+            encryption_context: request_encryption_context(context),
         };
 
         let data_key_response = self.kms_manager.generate_data_key(request).await?;
@@ -194,7 +371,7 @@ impl ObjectEncryptionService {
         // Generate a unique random nonce for this data key
         // This ensures each object/part gets a unique base nonce for streaming encryption
         let nonce: [u8; 12] = random();
-        tracing::info!("Generated random nonce for data key: {:02x?}", nonce);
+        tracing::debug!("Generated random nonce for data key");
 
         let data_key = DataKey {
             plaintext_key: data_key_response
@@ -216,10 +393,27 @@ impl ObjectEncryptionService {
     /// # Returns
     /// DataKey with decrypted key
     ///
-    pub async fn decrypt_data_key(&self, encrypted_key: &[u8], _context: &ObjectEncryptionContext) -> Result<DataKey> {
+    pub async fn decrypt_data_key(&self, encrypted_key: &[u8], context: &ObjectEncryptionContext) -> Result<DataKey> {
+        self.decrypt_data_key_with_context(encrypted_key, request_encryption_context(context))
+            .await
+    }
+
+    /// Decrypt a data key written by legacy RustFS versions that reused KMS data
+    /// keys across objects with different encryption contexts.
+    ///
+    /// Callers must restrict this to positively identified legacy object metadata.
+    pub async fn decrypt_legacy_data_key(&self, encrypted_key: &[u8]) -> Result<DataKey> {
+        self.decrypt_data_key_with_context(encrypted_key, HashMap::new()).await
+    }
+
+    async fn decrypt_data_key_with_context(
+        &self,
+        encrypted_key: &[u8],
+        encryption_context: HashMap<String, String>,
+    ) -> Result<DataKey> {
         let decrypt_request = DecryptRequest {
             ciphertext: encrypted_key.to_vec(),
-            encryption_context: HashMap::new(),
+            encryption_context,
             grant_tokens: Vec::new(),
         };
 
@@ -287,7 +481,7 @@ impl ObjectEncryptionService {
                 key_id: actual_key_id.to_string(),
             };
             if let Err(KmsError::KeyNotFound { .. }) = self.kms_manager.describe_key(describe_req).await {
-                info!("Auto-creating SSE-S3 key: {}", actual_key_id);
+                debug!(key_id = %actual_key_id, "Auto-creating SSE-S3 key");
                 let create_req = CreateKeyRequest {
                     key_name: Some(actual_key_id.to_string()),
                     key_usage: KeyUsage::EncryptDecrypt,
@@ -318,11 +512,7 @@ impl ObjectEncryptionService {
             encryption_context: context.clone(),
         };
 
-        let data_key = self
-            .kms_manager
-            .generate_data_key(request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to generate data key: {e}")))?;
+        let data_key = self.kms_manager.generate_data_key(request).await?;
 
         let plaintext_key = data_key.plaintext_key;
 
@@ -331,7 +521,7 @@ impl ObjectEncryptionService {
         let iv = generate_iv(algorithm);
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -345,11 +535,20 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: data_key.ciphertext_blob,
         };
 
-        info!("Successfully encrypted object {}/{} ({} bytes)", bucket, object_key, original_size);
+        debug!(
+            bucket,
+            object = object_key,
+            original_size,
+            algorithm = %algorithm.as_str(),
+            "Object encrypted"
+        );
 
         Ok(EncryptionResult { ciphertext, metadata })
     }
@@ -393,17 +592,19 @@ impl ObjectEncryptionService {
             grant_tokens: Vec::new(),
         };
 
-        let decrypt_response = self
-            .kms_manager
-            .decrypt(decrypt_request)
-            .await
-            .map_err(|e| KmsError::backend_error(format!("Failed to decrypt data key: {e}")))?;
+        let decrypt_response = self.kms_manager.decrypt(decrypt_request).await?;
 
         // Create cipher
         let cipher = create_cipher(&algorithm, &decrypt_response.plaintext)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -414,7 +615,13 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!("Successfully decrypted object {}/{} ({} bytes)", bucket, object_key, plaintext.len());
+        debug!(
+            bucket,
+            object = object_key,
+            plaintext_len = plaintext.len(),
+            algorithm = %metadata.algorithm,
+            "Object decrypted"
+        );
 
         Ok(Box::new(Cursor::new(plaintext)))
     }
@@ -450,8 +657,7 @@ impl ObjectEncryptionService {
 
         // Validate key MD5 if provided
         if let Some(expected_md5) = customer_key_md5 {
-            let actual_md5 = md5::compute(customer_key);
-            let actual_md5_hex = format!("{actual_md5:x}");
+            let actual_md5_hex = md5_hex(customer_key);
             if actual_md5_hex != expected_md5.to_lowercase() {
                 return Err(KmsError::validation_error("Customer key MD5 mismatch"));
             }
@@ -474,7 +680,7 @@ impl ObjectEncryptionService {
             ("sse_type".to_string(), "customer".to_string()),
         ]);
 
-        let aad = serde_json::to_vec(&context)?;
+        let aad = context_aad(&context)?;
 
         // Encrypt the data
         let (ciphertext, tag) = cipher.encrypt(&data, &iv, &aad)?;
@@ -488,11 +694,14 @@ impl ObjectEncryptionService {
             tag: Some(tag),
             encryption_context: context,
             encrypted_at: Zoned::now(),
+            // Pinned to the bytes actually fed to the AEAD, so the projection
+            // below can store them verbatim instead of re-deriving them.
+            context_aad: Some(aad),
             original_size,
             encrypted_data_key: Vec::new(), // Empty for SSE-C
         };
 
-        info!(
+        debug!(
             "Successfully encrypted object {}/{} with SSE-C ({} bytes)",
             bucket, object_key, original_size
         );
@@ -542,7 +751,13 @@ impl ObjectEncryptionService {
         let cipher = create_cipher(&algorithm, customer_key)?;
 
         // Build AAD from encryption context
-        let aad = serde_json::to_vec(&metadata.encryption_context)?;
+        // Prefer the bytes the object was sealed under. Deriving them from the
+        // parsed map would re-order a pre-canonicalization context and fail the
+        // AEAD on an object that is otherwise perfectly readable.
+        let aad = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context)?,
+        };
 
         // Get tag from metadata
         let tag = metadata
@@ -553,7 +768,7 @@ impl ObjectEncryptionService {
         // Decrypt the data
         let plaintext = cipher.decrypt(&ciphertext, &metadata.iv, tag, &aad)?;
 
-        info!(
+        debug!(
             "Successfully decrypted SSE-C object {}/{} ({} bytes)",
             bucket,
             object_key,
@@ -614,27 +829,34 @@ impl ObjectEncryptionService {
             headers.insert(INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), metadata.key_id.clone());
         }
 
+        // Record the cipher separately from the SSE mode advertised above.
+        headers.insert(INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), metadata.algorithm.clone());
+
         // Internal headers for decryption
         headers.insert(
-            "x-rustfs-encryption-iv".to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.iv),
+            INTERNAL_ENCRYPTION_IV_HEADER.to_string(),
+            base64_simd::STANDARD.encode_to_string(&metadata.iv),
         );
 
         if let Some(ref tag) = metadata.tag {
-            headers.insert(
-                "x-rustfs-encryption-tag".to_string(),
-                base64::engine::general_purpose::STANDARD.encode(tag),
-            );
+            headers.insert(INTERNAL_ENCRYPTION_TAG_HEADER.to_string(), base64_simd::STANDARD.encode_to_string(tag));
         }
 
         headers.insert(
-            "x-rustfs-encryption-key".to_string(),
-            base64::engine::general_purpose::STANDARD.encode(&metadata.encrypted_data_key),
+            INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+            base64_simd::STANDARD.encode_to_string(&metadata.encrypted_data_key),
         );
 
+        // Whatever the object was sealed under is what gets stored: for a
+        // pre-canonicalization object that is its original ordering, which must
+        // survive a re-projection rather than being rewritten into sorted form.
+        let context_bytes = match metadata.context_aad.as_ref() {
+            Some(stored) => stored.clone(),
+            None => context_aad(&metadata.encryption_context).unwrap_or_default(),
+        };
         headers.insert(
-            "x-rustfs-encryption-context".to_string(),
-            serde_json::to_string(&metadata.encryption_context).unwrap_or_default(),
+            INTERNAL_ENCRYPTION_CONTEXT_HEADER.to_string(),
+            String::from_utf8_lossy(&context_bytes).into_owned(),
         );
 
         headers
@@ -649,18 +871,27 @@ impl ObjectEncryptionService {
     /// EncryptionMetadata parsed from headers
     ///
     pub fn headers_to_metadata(&self, headers: &HashMap<String, String>) -> Result<EncryptionMetadata> {
-        let algorithm = headers
+        let sse_mode = headers
             .get("x-amz-server-side-encryption")
             .ok_or_else(|| KmsError::validation_error("Missing encryption algorithm header"))?
             .clone();
 
-        let key_id = if algorithm == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
+        // Prefer the recorded cipher; fall back to the SSE mode for objects
+        // written before that header existed, where `AES256`/`aws:kms` was the
+        // only thing stored and AES-256-GCM was the only cipher in use.
+        let algorithm = match headers.get(INTERNAL_ENCRYPTION_ALGORITHM_HEADER) {
+            Some(algorithm) => algorithm.clone(),
+            None if sse_mode == "aws:kms" => EncryptionAlgorithm::Aes256.as_str().to_string(),
+            None => sse_mode.clone(),
+        };
+
+        let key_id = if sse_mode == "AES256" && headers.contains_key("x-amz-server-side-encryption-customer-algorithm") {
             "sse-c".to_string()
         } else if let Some(key_id) = headers.get(INTERNAL_ENCRYPTION_KEY_ID_HEADER) {
             key_id.clone()
         } else if let Some(kms_key_id) = headers.get("x-amz-server-side-encryption-aws-kms-key-id") {
             kms_key_id.clone()
-        } else if algorithm == "AES256" {
+        } else if sse_mode == "AES256" {
             self.get_default_key_id()
                 .cloned()
                 .ok_or_else(|| KmsError::validation_error("Missing key ID"))?
@@ -669,35 +900,41 @@ impl ObjectEncryptionService {
         };
 
         let iv = headers
-            .get("x-rustfs-encryption-iv")
+            .get(INTERNAL_ENCRYPTION_IV_HEADER)
             .ok_or_else(|| KmsError::validation_error("Missing IV header"))?;
-        let iv = base64::engine::general_purpose::STANDARD
-            .decode(iv)
+        let iv = base64_simd::STANDARD
+            .decode_to_vec(iv)
             .map_err(|e| KmsError::validation_error(format!("Invalid IV: {e}")))?;
 
-        let tag = if let Some(tag_str) = headers.get("x-rustfs-encryption-tag") {
+        let tag = if let Some(tag_str) = headers.get(INTERNAL_ENCRYPTION_TAG_HEADER) {
             Some(
-                base64::engine::general_purpose::STANDARD
-                    .decode(tag_str)
+                base64_simd::STANDARD
+                    .decode_to_vec(tag_str)
                     .map_err(|e| KmsError::validation_error(format!("Invalid tag: {e}")))?,
             )
         } else {
             None
         };
 
-        let encrypted_data_key = if let Some(key_str) = headers.get("x-rustfs-encryption-key") {
-            base64::engine::general_purpose::STANDARD
-                .decode(key_str)
+        let encrypted_data_key = if let Some(key_str) = headers.get(INTERNAL_ENCRYPTION_KEY_HEADER) {
+            base64_simd::STANDARD
+                .decode_to_vec(key_str)
                 .map_err(|e| KmsError::validation_error(format!("Invalid encrypted key: {e}")))?
         } else {
             Vec::new() // Empty for SSE-C
         };
 
-        let encryption_context = if let Some(context_str) = headers.get("x-rustfs-encryption-context") {
-            serde_json::from_str(context_str)
-                .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?
-        } else {
-            HashMap::new()
+        // The stored string is the AAD verbatim. It is parsed into a map for
+        // callers that inspect the context, but the bytes are carried through
+        // untouched: re-serializing the parsed map is exactly how the original
+        // ordering — and with it the ability to open the object — was lost.
+        let (encryption_context, context_aad) = match headers.get(INTERNAL_ENCRYPTION_CONTEXT_HEADER) {
+            Some(context_str) => (
+                serde_json::from_str(context_str)
+                    .map_err(|e| KmsError::validation_error(format!("Invalid encryption context: {e}")))?,
+                Some(context_str.as_bytes().to_vec()),
+            ),
+            None => (HashMap::new(), None),
         };
 
         Ok(EncryptionMetadata {
@@ -710,6 +947,7 @@ impl ObjectEncryptionService {
             encrypted_at: Zoned::now(),
             original_size: 0, // Not available from headers
             encrypted_data_key,
+            context_aad,
         })
     }
 }
@@ -723,7 +961,9 @@ mod tests {
 
     async fn create_test_service() -> (ObjectEncryptionService, TempDir) {
         let temp_dir = TempDir::new().expect("Failed to create temp dir");
-        let config = KmsConfig::local(temp_dir.path().to_path_buf()).with_default_key("test-key".to_string());
+        let config = KmsConfig::local(temp_dir.path().to_path_buf())
+            .with_insecure_development_defaults()
+            .with_default_key("test-key".to_string());
         let backend = Arc::new(
             crate::backends::local::LocalKmsBackend::new(config.clone())
                 .await
@@ -824,6 +1064,8 @@ mod tests {
             encrypted_at: Zoned::now(),
             original_size: 100,
             encrypted_data_key: vec![1, 2, 3, 4],
+            // A hand-built record with no sealed bytes to defer to.
+            context_aad: None,
         };
 
         // Convert to headers
@@ -863,5 +1105,169 @@ mod tests {
                 .validate_encryption_context(&actual_context, &invalid_expected)
                 .is_err()
         );
+    }
+
+    async fn describe(service: &ObjectEncryptionService, key_id: &str) -> KeyMetadata {
+        service
+            .describe_key(DescribeKeyRequest {
+                key_id: key_id.to_string(),
+            })
+            .await
+            .expect("describe should succeed")
+            .key_metadata
+    }
+
+    async fn create_metadata_test_key(service: &ObjectEncryptionService, key_id: &str) {
+        service
+            .create_key(CreateKeyRequest {
+                key_name: Some(key_id.to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: Some("original".to_string()),
+                policy: None,
+                tags: HashMap::from([
+                    ("name".to_string(), key_id.to_string()),
+                    ("team".to_string(), "storage".to_string()),
+                ]),
+                origin: None,
+            })
+            .await
+            .expect("test key should be created");
+    }
+
+    #[tokio::test]
+    async fn key_metadata_updates_are_visible_to_describe() {
+        let (service, _temp_dir) = create_test_service().await;
+        create_metadata_test_key(&service, "metadata-key").await;
+
+        service
+            .update_key_description(UpdateKeyDescriptionRequest {
+                key_id: "metadata-key".to_string(),
+                description: "updated".to_string(),
+            })
+            .await
+            .expect("description update should succeed");
+        service
+            .tag_key(TagKeyRequest {
+                key_id: "metadata-key".to_string(),
+                tags: HashMap::from([
+                    ("team".to_string(), "platform".to_string()),
+                    ("env".to_string(), "prod".to_string()),
+                ]),
+            })
+            .await
+            .expect("tagging should succeed");
+
+        // Reading through the manager's metadata cache must observe the
+        // updates, not the snapshot cached when the key was created.
+        let metadata = describe(&service, "metadata-key").await;
+        assert_eq!(metadata.description.as_deref(), Some("updated"));
+        assert_eq!(metadata.tags.get("team").map(String::as_str), Some("platform"));
+        assert_eq!(metadata.tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(
+            metadata.tags.get("name").map(String::as_str),
+            Some("metadata-key"),
+            "tags set at creation must survive a later tag update"
+        );
+
+        // Untagging is idempotent: removing an absent tag is a no-op, not an
+        // error, so a retried request stays safe.
+        for attempt in 1..=2 {
+            service
+                .untag_key(UntagKeyRequest {
+                    key_id: "metadata-key".to_string(),
+                    tag_keys: vec!["env".to_string()],
+                })
+                .await
+                .unwrap_or_else(|error| panic!("untag attempt {attempt} should succeed: {error:?}"));
+        }
+        let metadata = describe(&service, "metadata-key").await;
+        assert!(!metadata.tags.contains_key("env"), "untagged tag must be gone: {:?}", metadata.tags);
+        assert_eq!(
+            metadata.tags.get("team").map(String::as_str),
+            Some("platform"),
+            "untagging must not touch other tags"
+        );
+
+        // An empty description clears the stored value.
+        service
+            .update_key_description(UpdateKeyDescriptionRequest {
+                key_id: "metadata-key".to_string(),
+                description: String::new(),
+            })
+            .await
+            .expect("clearing the description should succeed");
+        assert_eq!(describe(&service, "metadata-key").await.description, None);
+    }
+
+    #[tokio::test]
+    async fn identity_tag_is_not_writable_through_metadata_updates() {
+        let (service, _temp_dir) = create_test_service().await;
+        create_metadata_test_key(&service, "identity-key").await;
+
+        let rewrite = service
+            .tag_key(TagKeyRequest {
+                key_id: "identity-key".to_string(),
+                tags: HashMap::from([("name".to_string(), "other-key".to_string())]),
+            })
+            .await
+            .expect_err("rewriting the identity tag must be rejected");
+        assert!(matches!(rewrite, KmsError::InvalidOperation { .. }), "got {rewrite:?}");
+
+        let removal = service
+            .untag_key(UntagKeyRequest {
+                key_id: "identity-key".to_string(),
+                tag_keys: vec!["team".to_string(), "name".to_string()],
+            })
+            .await
+            .expect_err("removing the identity tag must be rejected");
+        assert!(matches!(removal, KmsError::InvalidOperation { .. }), "got {removal:?}");
+
+        // Both rejections are pre-write: the record is untouched, including
+        // the ordinary tag that shared the rejected untag request.
+        let metadata = describe(&service, "identity-key").await;
+        assert_eq!(metadata.tags.get("name").map(String::as_str), Some("identity-key"));
+        assert_eq!(metadata.tags.get("team").map(String::as_str), Some("storage"));
+    }
+
+    #[tokio::test]
+    async fn test_decrypt_data_key_uses_object_encryption_context() {
+        let (service, _temp_dir) = create_test_service().await;
+        service
+            .create_key(CreateKeyRequest {
+                key_name: Some("test-key".to_string()),
+                key_usage: KeyUsage::EncryptDecrypt,
+                description: None,
+                policy: None,
+                tags: HashMap::new(),
+                origin: None,
+            })
+            .await
+            .expect("test key should be created");
+        let create_context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string())
+            .with_encryption_context("tenant".to_string(), "alpha".to_string());
+        let kms_key = Some("test-key".to_string());
+        let (_data_key, encrypted_key) = service
+            .create_data_key(&kms_key, &create_context)
+            .await
+            .expect("create data key should succeed");
+
+        let wrong_context = ObjectEncryptionContext::new("bucket".to_string(), "dir/object".to_string())
+            .with_encryption_context("tenant".to_string(), "beta".to_string());
+        assert!(
+            service.decrypt_data_key(&encrypted_key, &wrong_context).await.is_err(),
+            "decrypt should reject mismatched KMS context"
+        );
+
+        let decrypted = service
+            .decrypt_data_key(&encrypted_key, &create_context)
+            .await
+            .expect("decrypt should accept matching KMS context");
+        assert_ne!(decrypted.plaintext_key, [0u8; 32]);
+
+        let legacy_decrypted = service
+            .decrypt_legacy_data_key(&encrypted_key)
+            .await
+            .expect("legacy decrypt should use the backend compatibility path");
+        assert_eq!(legacy_decrypted.plaintext_key, decrypted.plaintext_key);
     }
 }

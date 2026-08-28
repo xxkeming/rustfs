@@ -25,34 +25,78 @@
 //! Connection pooling is delegated to `deadpool-postgres`; the pool itself
 //! is `Clone`, so no `Mutex` is required around it.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, queue_store_subdir_name,
+        TargetType, build_queued_payload, open_target_queue_store, persist_queued_payload_to_store, redacted_optional_secret,
+        redacted_secret, with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
-use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
+use deadpool_postgres::{Client as PooledClient, Manager, ManagerConfig, Pool, RecyclingMethod, Runtime, Timeouts};
 use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
-use rustls_pki_types::pem::PemObject;
-use rustls_pki_types::{CertificateDer, PrivateKeyDer};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use rustfs_s3_types::EventName;
+use rustfs_tls_runtime::{load_certs, load_private_key};
 use std::fmt;
-use std::io::BufReader;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio_postgres::Config;
 use tokio_postgres_rustls::MakeRustlsConnect;
-use tracing::{error, info, instrument, warn};
+use tracing::{info, instrument, warn};
 use url::Url;
 use uuid::Uuid;
 
 const TARGET_LOG_KEY_FIELD: &str = "Key";
+
+/// Bounds the underlying TCP connect + startup handshake for a new backend
+/// connection so an unreachable server cannot block a pool slot forever.
+const POSTGRES_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum time `pool.get()` waits for a free slot before returning a timeout.
+const POSTGRES_POOL_WAIT_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum time to create a brand-new pooled connection.
+const POSTGRES_POOL_CREATE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Maximum time to recycle (health-check) an idle pooled connection.
+const POSTGRES_POOL_RECYCLE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Absolute ceiling on a single checkout, wrapping `pool.get()` in a Tokio
+/// timeout as a belt-and-suspenders guard on top of the deadpool timeouts.
+const POSTGRES_POOL_CHECKOUT_HARD_LIMIT: Duration = Duration::from_secs(20);
+/// Absolute ceiling for one SQL delivery, including pool checkout and execution.
+const POSTGRES_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Returns `true` for any `s3:ObjectRemoved:*` event.
+///
+/// Used by the `namespace` format so that object deletions remove the row
+/// instead of leaving stale state behind via an UPSERT.
+fn is_object_removed_event(event: &EventName) -> bool {
+    event.as_str().starts_with("s3:ObjectRemoved")
+}
+
+/// Checks out a client from the pool, wrapping `pool.get()` in a Tokio timeout.
+///
+/// The deadpool wait/create timeouts already bound the checkout, but the outer
+/// timeout guarantees a hard ceiling even if a lower layer misbehaves. Any
+/// timeout maps to `TargetError::Timeout`, which is a connectivity error so the
+/// queue store retains the payload for replay.
+async fn checkout_client(pool: &Pool, context: &str) -> Result<PooledClient, TargetError> {
+    match tokio::time::timeout(POSTGRES_POOL_CHECKOUT_HARD_LIMIT, pool.get()).await {
+        Ok(Ok(client)) => Ok(client),
+        Ok(Err(e)) => Err(map_pool_error(e, context)),
+        Err(_) => Err(TargetError::Timeout(format!(
+            "{context}: pool checkout exceeded {}s hard limit",
+            POSTGRES_POOL_CHECKOUT_HARD_LIMIT.as_secs()
+        ))),
+    }
+}
 
 /// Output format selection for the PostgreSQL target.
 ///
@@ -92,7 +136,7 @@ pub fn parse_postgres_format(value: Option<&str>) -> Result<PostgresFormat, Targ
 }
 
 /// Parsed representation of a PostgreSQL DSN string.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct PostgresDsn {
     pub host: String,
     pub port: u16,
@@ -100,6 +144,19 @@ pub struct PostgresDsn {
     pub password: Option<String>,
     pub database: String,
     pub schema: String,
+}
+
+impl fmt::Debug for PostgresDsn {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresDsn")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("password", &redacted_optional_secret(self.password.as_deref()))
+            .field("database", &self.database)
+            .field("schema", &self.schema)
+            .finish()
+    }
 }
 
 impl PostgresDsn {
@@ -298,14 +355,7 @@ impl fmt::Debug for PostgresArgs {
             .field("tls_required", &self.tls_required)
             .field("tls_ca", &self.tls_ca)
             .field("tls_client_cert", &self.tls_client_cert)
-            .field(
-                "tls_client_key",
-                if self.tls_client_key.is_empty() {
-                    &""
-                } else {
-                    &"***REDACTED***"
-                },
-            )
+            .field("tls_client_key", &redacted_secret(&self.tls_client_key))
             .field("queue_dir", &self.queue_dir)
             .field("queue_limit", &self.queue_limit)
             .field("target_type", &self.target_type)
@@ -380,6 +430,13 @@ pub fn namespace_upsert_sql(schema: &str, table: &str) -> String {
     )
 }
 
+/// SQL for the `namespace` format on object removal. Deletes the row keyed on
+/// the object key so the `namespace` table stays consistent with the object
+/// lifecycle instead of retaining stale state after a delete.
+pub fn namespace_delete_sql(schema: &str, table: &str) -> String {
+    format!("DELETE FROM {} WHERE key = $1", qualified_table(schema, table))
+}
+
 /// SQL for the `access` format. Append-only with `event_id` as PK so that
 /// store-replay scenarios silently skip duplicates while distinct events still
 /// land as separate rows.
@@ -425,11 +482,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
             let _ = root_store.add(cert);
         }
     } else {
-        let pem = std::fs::read(&args.tls_ca)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CA}: {e}")))?;
-        let mut reader = BufReader::new(pem.as_slice());
-        for cert in CertificateDer::pem_reader_iter(&mut reader) {
-            let cert = cert.map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        let certs =
+            load_certs(&args.tls_ca).map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CA}: {e}")))?;
+        for cert in certs {
             root_store
                 .add(cert)
                 .map_err(|e| TargetError::Configuration(format!("failed to add CA cert: {e}")))?;
@@ -439,16 +494,9 @@ pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, Tar
     let builder = rustls::ClientConfig::builder().with_root_certificates(root_store);
 
     let client_config = if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
-        let cert_pem = std::fs::read(&args.tls_client_cert)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-        let key_pem = std::fs::read(&args.tls_client_key)
-            .map_err(|e| TargetError::Configuration(format!("failed to read {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
-
-        let certs: Vec<_> = CertificateDer::pem_reader_iter(&mut BufReader::new(cert_pem.as_slice()))
-            .collect::<Result<_, _>>()
+        let certs = load_certs(&args.tls_client_cert)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_CERT}: {e}")))?;
-
-        let key = PrivateKeyDer::from_pem_reader(&mut BufReader::new(key_pem.as_slice()))
+        let key = load_private_key(&args.tls_client_key)
             .map_err(|e| TargetError::Configuration(format!("invalid {POSTGRES_TLS_CLIENT_KEY}: {e}")))?;
 
         builder
@@ -473,6 +521,9 @@ pub fn build_pool(args: &PostgresArgs) -> Result<Pool, TargetError> {
         .port(parsed.port)
         .user(&parsed.user)
         .dbname(&parsed.database)
+        // Bound the TCP connect + startup handshake so an unreachable backend
+        // cannot block a pool slot indefinitely.
+        .connect_timeout(POSTGRES_CONNECT_TIMEOUT)
         .options(format!("-c search_path={}", parsed.schema));
     if let Some(password) = parsed.password.as_deref()
         && !password.is_empty()
@@ -492,9 +543,42 @@ pub fn build_pool(args: &PostgresArgs) -> Result<Pool, TargetError> {
         Manager::from_config(pg_config, tokio_postgres::NoTls, manager_config)
     };
 
+    // Explicit wait/create/recycle timeouts guarantee that `pool.get()` always
+    // returns within a bounded time when the broker/DB is unreachable, instead
+    // of blocking the delivery thread forever. A Tokio runtime is required for
+    // deadpool to honor these timeouts.
     Pool::builder(manager)
+        .runtime(Runtime::Tokio1)
+        .timeouts(Timeouts {
+            wait: Some(POSTGRES_POOL_WAIT_TIMEOUT),
+            create: Some(POSTGRES_POOL_CREATE_TIMEOUT),
+            recycle: Some(POSTGRES_POOL_RECYCLE_TIMEOUT),
+        })
         .build()
         .map_err(|e| TargetError::Configuration(format!("failed to build PostgreSQL pool: {e}")))
+}
+
+/// Classifies a PostgreSQL SQLSTATE code into the proper `TargetError` variant.
+///
+/// Split out from [`map_pg_error`] so the SQLSTATE-to-variant mapping can be
+/// unit-tested without constructing an opaque `tokio_postgres::Error`.
+///
+/// Classification is by SQLSTATE class (first two characters):
+/// - `08` connection exception → `NotConnected` (retry, keep in store).
+/// - `28` invalid authorization → `Authentication` (permanent, surfaced).
+/// - `23`/`42` integrity/syntax → `Configuration` (permanent, surfaced).
+/// - `40` transaction rollback (`40001` serialization_failure,
+///   `40P01` deadlock_detected, …) → `Timeout`, a transient/retryable error:
+///   the transaction should be retried rather than dropped.
+/// - anything else → `Request` (treated as permanent/ambiguous).
+fn map_pg_sqlstate(code: &str, detail: &str) -> TargetError {
+    match code.get(..2).unwrap_or("") {
+        "08" => TargetError::NotConnected,
+        "28" => TargetError::Authentication(detail.to_string()),
+        "23" | "42" => TargetError::Configuration(detail.to_string()),
+        "40" => TargetError::Timeout(detail.to_string()),
+        _ => TargetError::Request(detail.to_string()),
+    }
 }
 
 /// Maps a `tokio_postgres::Error` to the proper `TargetError` variant.
@@ -503,19 +587,15 @@ pub fn build_pool(args: &PostgresArgs) -> Result<Pool, TargetError> {
 /// `NotConnected` so the queue store retains the payload for replay.
 /// Schema and constraint problems (SQLSTATE 23, 42) become `Configuration`
 /// so they are surfaced to the operator without endless retry.
+/// Transaction-rollback errors (SQLSTATE class 40, e.g. serialization failure
+/// or deadlock) become `Timeout` so they are retried transiently.
 pub fn map_pg_error(err: &tokio_postgres::Error, context: &str) -> TargetError {
     if err.is_closed() {
         return TargetError::NotConnected;
     }
     if let Some(db_err) = err.as_db_error() {
-        let class = db_err.code().code().get(..2).unwrap_or("");
-        return match class {
-            "08" => TargetError::NotConnected,
-            "28" => TargetError::Authentication(format!("{context}: {db_err}")),
-            "23" | "42" => TargetError::Configuration(format!("{context}: {db_err}")),
-            "40" => TargetError::Request(format!("{context}: {db_err}")),
-            _ => TargetError::Request(format!("{context}: {db_err}")),
-        };
+        let detail = format!("{context}: {db_err}");
+        return map_pg_sqlstate(db_err.code().code(), &detail);
     }
     TargetError::NotConnected
 }
@@ -548,14 +628,24 @@ fn resolve_payload_key(payload: &serde_json::Value, meta: &QueuedPayloadMeta) ->
 /// so that `clone_box` does not duplicate connection state. The optional
 /// `QueueStore` provides at-least-once delivery semantics consistent with the
 /// other built-in targets.
+///
+/// When `tls_adapter` is `Some`, the target participates in the
+/// coordinated TLS hot-reload system driven by `TlsReloadAdapter`,
+/// and the inline fingerprint check in `send_body` is skipped. When `None`,
+/// the legacy inline fingerprint check is used as a fallback.
 pub struct PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: PostgresArgs,
-    pool: Pool,
+    pool: Arc<parking_lot::Mutex<Pool>>,
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// When present, the adapter provides coordinator-managed TLS material;
+    /// otherwise the inline fingerprint path is used as a fallback.
+    tls_adapter: Option<TlsReloadAdapter<Pool>>,
     namespace_sql: String,
+    namespace_delete_sql: String,
     access_sql: String,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
@@ -564,14 +654,17 @@ where
 
 impl<E> PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(PostgresTarget::<E> {
             id: self.id.clone(),
             args: self.args.clone(),
-            pool: self.pool.clone(),
+            pool: Arc::clone(&self.pool),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             namespace_sql: self.namespace_sql.clone(),
+            namespace_delete_sql: self.namespace_delete_sql.clone(),
             access_sql: self.access_sql.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             delivery_counters: Arc::clone(&self.delivery_counters),
@@ -585,30 +678,24 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Postgres.as_str().to_string());
         let pool = build_pool(&args)?;
 
-        let queue_store = if !args.queue_dir.is_empty() {
-            let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path =
-                base_path.join(queue_store_subdir_name(ChannelTargetType::Postgres.as_str(), &target_id.id));
-            let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
-            };
-            let store = QueueStore::<QueuedPayload>::new(specific_queue_path, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                error!(target_id = %target_id, error = %e, "Failed to open store for PostgreSQL target");
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Postgres.as_str(),
+            &target_id,
+            "Failed to open store for PostgreSQL target",
+        )?;
 
         Ok(Self {
             id: target_id,
             namespace_sql: namespace_upsert_sql(&args.schema, &args.table),
+            namespace_delete_sql: namespace_delete_sql(&args.schema, &args.table),
             access_sql: access_insert_sql(&args.schema, &args.table),
             args,
-            pool,
+            pool: Arc::new(parking_lot::Mutex::new(pool)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_adapter: None,
             store: queue_store,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
@@ -620,45 +707,61 @@ where
     /// Identifier validation has already happened in `PostgresArgs::validate()`,
     /// so `qualified_table` cannot produce a malformed SQL string here.
     async fn send_body(&self, body: &[u8], event_id: &str, meta: &QueuedPayloadMeta) -> Result<(), TargetError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
+        // When a TLS reload adapter is attached, it drives pool rebuilds in
+        // the background. The inline per-send fingerprint check is skipped.
+        if self.tls_adapter.is_none() {
+            let next_fingerprint =
+                super::build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
+                    .await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.fingerprint.as_ref() != Some(&next_fingerprint)
+            };
+            if tls_changed {
+                let new_pool = build_pool(&self.args)?;
+                *self.pool.lock() = new_pool;
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
+        }
+
+        let pool = self.pool.lock().clone();
+        let client = checkout_client(&pool, "PostgreSQL pool checkout failed").await?;
 
         let payload: serde_json::Value =
             serde_json::from_slice(body).map_err(|e| TargetError::Serialization(format!("Failed to parse JSON payload: {e}")))?;
 
         let key = resolve_payload_key(&payload, meta);
 
-        let result = match self.args.format {
-            PostgresFormat::Namespace => client.execute(&self.namespace_sql, &[&key, &payload]).await,
-            PostgresFormat::Access => {
-                let event_name_str = meta.event_name.to_string();
-                let queued_at_ms = meta.queued_at_unix_ms as i64;
-                client
-                    .execute(&self.access_sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
-                    .await
+        with_delivery_deadline(POSTGRES_DELIVERY_TIMEOUT, "PostgreSQL delivery", async {
+            match self.args.format {
+                // For the single-row `namespace` format, an object removal must
+                // delete the row rather than UPSERT it, otherwise stale state
+                // lingers in the table after the object is gone.
+                PostgresFormat::Namespace if is_object_removed_event(&meta.event_name) => {
+                    client.execute(&self.namespace_delete_sql, &[&key]).await
+                }
+                PostgresFormat::Namespace => client.execute(&self.namespace_sql, &[&key, &payload]).await,
+                PostgresFormat::Access => {
+                    let event_name_str = meta.event_name.to_string();
+                    let queued_at_ms = meta.queued_at_unix_ms as i64;
+                    client
+                        .execute(&self.access_sql, &[&event_id, &event_name_str, &key, &payload, &queued_at_ms])
+                        .await
+                }
             }
-        };
+            .map_err(|err| map_pg_error(&err, "PostgreSQL insert failed"))
+        })
+        .await?;
 
-        match result {
-            Ok(_) => {
-                self.delivery_counters.record_success();
-                Ok(())
-            }
-            Err(err) => Err(map_pg_error(&err, "PostgreSQL insert failed")),
-        }
+        self.delivery_counters.record_success();
+        Ok(())
     }
 
     /// Probes the table from `init()`. Failure is non-fatal when a queue is
     /// configured: events buffer in the store until the schema is fixed.
     async fn probe_table(&self) -> Result<(), TargetError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed during init probe"))?;
+        let pool = self.pool.lock().clone();
+        let client = checkout_client(&pool, "PostgreSQL pool checkout failed during init probe").await?;
         let sql = table_probe_sql(&self.args.schema, &self.args.table);
         client
             .execute(sql.as_str(), &[])
@@ -669,9 +772,44 @@ where
 }
 
 #[async_trait]
+impl<E> ReloadableTargetTls for PostgresTarget<E>
+where
+    E: PluginEvent,
+{
+    type Material = Pool;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("postgres:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_pool(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.pool.lock() = (*material).clone();
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
+    }
+}
+
+#[async_trait]
 impl<E> Target<E> for PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -682,12 +820,9 @@ where
             return Ok(false);
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| map_pool_error(e, "PostgreSQL pool checkout failed"))?;
+        match tokio::time::timeout(Duration::from_secs(10), async {
+            let pool = self.pool.lock().clone();
+            let client = checkout_client(&pool, "PostgreSQL pool checkout failed").await?;
             client
                 .execute("SELECT 1", &[])
                 .await
@@ -712,16 +847,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
             Ok(())
         } else {
@@ -744,7 +872,8 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
-        self.pool.close();
+        self.pool.lock().close();
+        // Adapter cleanup is done by the coordinator; no local state to reset.
         info!(target_id = %self.id, "PostgreSQL target closed");
         Ok(())
     }
@@ -776,8 +905,11 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            // Postgres targets record no terminal failures and keep no failed store.
+            0,
+        )
     }
 
     fn record_final_failure(&self) {
@@ -788,6 +920,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::target::REDACTED_SECRET;
 
     fn base_args() -> PostgresArgs {
         PostgresArgs {
@@ -1000,6 +1133,18 @@ mod tests {
     }
 
     #[test]
+    fn debug_redacts_postgres_dsn_password() {
+        let dsn = PostgresDsn::parse("postgres://postgres:pg-secret@localhost:5432/rustfs_events?search_path=public")
+            .expect("valid DSN");
+
+        let rendered = format!("{dsn:?}");
+
+        assert!(!rendered.contains("pg-secret"));
+        assert!(rendered.contains(REDACTED_SECRET));
+        assert!(rendered.contains("rustfs_events"));
+    }
+
+    #[test]
     fn redact_postgres_dsn_masks_password_query_parameter() {
         let redacted = redact_postgres_dsn("postgres://postgres@localhost:5432/db?search_path=public&password=secret");
         assert!(!redacted.contains("secret"));
@@ -1027,6 +1172,53 @@ mod tests {
         assert!(sql.contains("ON CONFLICT (event_id) DO NOTHING"));
         assert!(sql.contains(r#""public"."events_access""#));
         assert!(sql.contains("$4::jsonb"));
+    }
+
+    #[test]
+    fn namespace_delete_targets_row_by_key() {
+        let sql = namespace_delete_sql("public", "events");
+        assert!(sql.starts_with("DELETE FROM"));
+        assert!(sql.contains(r#""public"."events""#));
+        assert!(sql.contains("WHERE key = $1"));
+    }
+
+    #[test]
+    fn is_object_removed_event_matches_all_removed_variants() {
+        assert!(is_object_removed_event(&EventName::ObjectRemovedDelete));
+        assert!(is_object_removed_event(&EventName::ObjectRemovedDeleteMarkerCreated));
+        assert!(is_object_removed_event(&EventName::ObjectRemovedDeleteAllVersions));
+        assert!(is_object_removed_event(&EventName::ObjectRemovedAll));
+        assert!(!is_object_removed_event(&EventName::ObjectCreatedPut));
+        assert!(!is_object_removed_event(&EventName::ObjectAccessedGet));
+    }
+
+    #[test]
+    fn map_pg_sqlstate_classifies_transaction_rollback_as_transient() {
+        // 40001 serialization_failure and 40P01 deadlock_detected are transient
+        // and must be retried, not dropped as permanent failures.
+        assert!(matches!(map_pg_sqlstate("40001", "ctx: serialization"), TargetError::Timeout(_)));
+        assert!(matches!(map_pg_sqlstate("40P01", "ctx: deadlock"), TargetError::Timeout(_)));
+        assert!(matches!(map_pg_sqlstate("40000", "ctx: rollback"), TargetError::Timeout(_)));
+    }
+
+    #[test]
+    fn map_pg_sqlstate_classifies_connection_and_permanent_errors() {
+        assert!(matches!(map_pg_sqlstate("08006", "ctx"), TargetError::NotConnected));
+        assert!(matches!(map_pg_sqlstate("08001", "ctx"), TargetError::NotConnected));
+        assert!(matches!(map_pg_sqlstate("28P01", "ctx: auth"), TargetError::Authentication(_)));
+        assert!(matches!(map_pg_sqlstate("23505", "ctx: unique"), TargetError::Configuration(_)));
+        assert!(matches!(map_pg_sqlstate("42P01", "ctx: undefined_table"), TargetError::Configuration(_)));
+        // Unknown class stays permanent (ambiguous → surfaced as Request).
+        assert!(matches!(map_pg_sqlstate("22001", "ctx: data"), TargetError::Request(_)));
+        assert!(matches!(map_pg_sqlstate("", "ctx: empty"), TargetError::Request(_)));
+    }
+
+    #[test]
+    fn transient_pg_errors_are_connectivity_errors() {
+        // Transaction-rollback errors must be treated as connectivity errors so
+        // the queue store retains the payload for replay instead of dropping it.
+        assert!(crate::target::is_connectivity_error(&map_pg_sqlstate("40001", "ctx")));
+        assert!(crate::target::is_connectivity_error(&map_pg_sqlstate("40P01", "ctx")));
     }
 
     #[test]
@@ -1058,7 +1250,7 @@ mod tests {
             "Records": []
         });
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket-a".to_string(),
             "fallback%2Fvalue.txt".to_string(),
             "application/json",
@@ -1075,7 +1267,7 @@ mod tests {
             "Records": []
         });
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket-a".to_string(),
             "hello+world%2Ftest.txt".to_string(),
             "application/json",

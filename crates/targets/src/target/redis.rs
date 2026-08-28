@@ -12,14 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsGeneration, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode,
+        validate_tls_material,
+    },
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, build_queued_payload, queue_store_subdir_name,
+        TargetType, build_queued_payload, invalidate_cache_on_connectivity_error, is_connectivity_error,
+        mark_target_disconnected_on_connectivity_error, open_target_queue_store, persist_queued_payload_to_store,
+        with_delivery_deadline,
     },
 };
 use async_trait::async_trait;
@@ -30,16 +37,30 @@ use redis::{
     io::tcp::{TcpSettings, socket2},
 };
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use rustls::pki_types::CertificateDer;
+use rustls::pki_types::pem::PemObject;
 use std::fmt;
-use std::path::{Path, PathBuf};
+use std::io::BufReader;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::Mutex;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use url::Url;
+
+const REDIS_CONNECTION_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+const REDIS_RESPONSE_TIMEOUT_DEFAULT: Duration = Duration::from_secs(5);
+
+fn redis_total_delivery_timeout(args: &RedisArgs) -> Duration {
+    let attempts = u32::try_from(args.max_retry_attempts).unwrap_or(u32::MAX);
+    let per_attempt = args
+        .connection_timeout
+        .unwrap_or(REDIS_CONNECTION_TIMEOUT_DEFAULT)
+        .saturating_add(args.response_timeout.unwrap_or(REDIS_RESPONSE_TIMEOUT_DEFAULT))
+        .saturating_add(args.max_retry_delay.unwrap_or(Duration::from_secs(2)));
+    per_attempt.saturating_mul(attempts)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RedisTlsPolicy {
@@ -207,6 +228,16 @@ impl RedisArgs {
             ));
         }
 
+        if self.connection_timeout == Some(Duration::ZERO) {
+            return Err(TargetError::Configuration(
+                "Redis connection_timeout must be greater than zero".to_string(),
+            ));
+        }
+
+        if self.response_timeout == Some(Duration::ZERO) {
+            return Err(TargetError::Configuration("Redis response_timeout must be greater than zero".to_string()));
+        }
+
         if self.pipeline_buffer_size == Some(0) {
             return Err(TargetError::Configuration(
                 "Redis pipeline_buffer_size must be greater than zero".to_string(),
@@ -292,11 +323,12 @@ fn validate_redis_tls_config(url: &Url, tls: &RedisTlsConfig) -> Result<(), Targ
 
 pub struct RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: RedisArgs,
-    publisher_client: Client,
+    /// Redis client, wrapped in a lock so TLS hot-reload can atomically replace it.
+    publisher_client: Arc<parking_lot::Mutex<Client>>,
     publisher: Arc<Mutex<Option<ConnectionManager>>>,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     /// Business-level liveness flag.
@@ -305,13 +337,19 @@ where
     /// publish exhausted retries, or the target was explicitly closed). Temporary reconnectable
     /// errors only invalidate the cached publisher so that a later request can lazily rebuild it.
     connected: Arc<AtomicBool>,
+    /// TLS fingerprint tracking for hot reload (inline fallback path).
+    tls_state: Arc<parking_lot::Mutex<super::TargetTlsState>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<Client>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: std::marker::PhantomData<E>,
 }
 
 impl<E> RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: RedisArgs) -> Result<Self, TargetError> {
@@ -320,31 +358,25 @@ where
         let target_id = TargetID::new(id, ChannelTargetType::Redis.as_str().to_string());
         let publisher_client = build_redis_client(&args)?;
 
-        let queue_store = if !args.queue_dir.is_empty() {
-            let base_path = PathBuf::from(&args.queue_dir);
-            let specific_queue_path = base_path.join(queue_store_subdir_name(ChannelTargetType::Redis.as_str(), &target_id.id));
-            let extension = match args.target_type {
-                TargetType::AuditLog => rustfs_config::audit::AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => rustfs_config::notify::NOTIFY_STORE_EXTENSION,
-            };
-            let store = QueueStore::<QueuedPayload>::new(specific_queue_path, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                error!(target_id = %target_id, error = %e, "Failed to open store for Redis target");
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Redis.as_str(),
+            &target_id,
+            "Failed to open store for Redis target",
+        )?;
 
         info!(target_id = %target_id, "Redis target created");
         Ok(Self {
             id: target_id,
             args,
-            publisher_client,
+            publisher_client: Arc::new(parking_lot::Mutex::new(publisher_client)),
             publisher: Arc::new(Mutex::new(None)),
             store: queue_store,
             connected: Arc::new(AtomicBool::new(false)),
+            tls_state: Arc::new(parking_lot::Mutex::new(super::TargetTlsState::default())),
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: std::marker::PhantomData,
         })
@@ -354,23 +386,61 @@ where
         Box::new(Self {
             id: self.id.clone(),
             args: self.args.clone(),
-            publisher_client: self.publisher_client.clone(),
+            publisher_client: Arc::clone(&self.publisher_client),
             publisher: Arc::clone(&self.publisher),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             connected: Arc::clone(&self.connected),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: std::marker::PhantomData,
         })
     }
 
     async fn get_or_create_publisher(&self) -> Result<ConnectionManager, TargetError> {
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let client: Client = (*adapter.current_material()).clone();
+
+            // Ensure the client is also stored locally so close() can drain it.
+            *self.publisher_client.lock() = client.clone();
+
+            let manager = client
+                .get_connection_manager_lazy(build_redis_connection_manager_config(&self.args))
+                .map_err(map_redis_error)?;
+
+            *self.publisher.lock().await = Some(manager.clone());
+            return Ok(manager);
+        }
+
+        // Inline fingerprint fallback path (no coordinator).
+        let secure_scheme = matches!(self.args.url.scheme(), "rediss" | "valkeys");
+        if secure_scheme {
+            let next_fingerprint = super::build_target_tls_fingerprint(
+                &self.args.tls.ca_path,
+                &self.args.tls.client_cert_path,
+                &self.args.tls.client_key_path,
+            )
+            .await?;
+            let tls_changed = {
+                let tls_state_guard = self.tls_state.lock();
+                tls_state_guard.needs_update(&next_fingerprint)
+            };
+            if tls_changed {
+                let new_client = build_redis_client(&self.args)?;
+                *self.publisher_client.lock() = new_client;
+                self.invalidate_cached_publisher().await;
+                self.tls_state.lock().refresh(next_fingerprint);
+            }
+        }
+
         let mut guard = self.publisher.lock().await;
         if let Some(manager) = guard.clone() {
             return Ok(manager);
         }
 
-        let manager = self
-            .publisher_client
+        let client = self.publisher_client.lock().clone();
+        let manager = client
             .get_connection_manager_lazy(build_redis_connection_manager_config(&self.args))
             .map_err(map_redis_error)?;
 
@@ -391,9 +461,7 @@ where
             Ok(_) => Ok(()),
             Err(err) => {
                 let mapped = map_redis_error(err);
-                if is_retryable_target_error(&mapped) {
-                    self.invalidate_cached_publisher().await;
-                }
+                invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
                 Err(mapped)
             }
         }
@@ -420,62 +488,104 @@ where
             "Sending Redis payload"
         );
 
-        let mut attempt = 0usize;
-        let mut last_error = None;
-        while attempt < self.args.max_retry_attempts {
-            attempt += 1;
+        let result = with_delivery_deadline(redis_total_delivery_timeout(&self.args), "Redis delivery", async {
+            let mut attempt = 0usize;
+            let mut last_error = None;
+            while attempt < self.args.max_retry_attempts {
+                attempt += 1;
 
-            let mut publisher = self.get_or_create_publisher().await?;
-            match publisher
-                .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
+                let connection_timeout = self.args.connection_timeout.unwrap_or(REDIS_CONNECTION_TIMEOUT_DEFAULT);
+                let mut publisher = match with_delivery_deadline(
+                    connection_timeout,
+                    "Redis connection",
+                    self.get_or_create_publisher(),
+                )
                 .await
-            {
-                Ok(_) => {
-                    debug!(target_id = %self.id, channel = %self.args.channel, attempt, "Event published to Redis channel");
-                    self.delivery_counters.record_success();
-                    return Ok(());
-                }
-                Err(err) => {
-                    let mapped = map_redis_error(err);
-                    if is_retryable_target_error(&mapped) {
-                        self.invalidate_cached_publisher().await;
+                {
+                    Ok(publisher) => publisher,
+                    Err(err) => {
+                        invalidate_cache_on_connectivity_error(&err, || self.invalidate_cached_publisher()).await;
+                        return Err(err);
                     }
+                };
+                let response_timeout = self.args.response_timeout.unwrap_or(REDIS_RESPONSE_TIMEOUT_DEFAULT);
+                match with_delivery_deadline(response_timeout, "Redis publish response", async {
+                    publisher
+                        .publish::<_, _, i64>(self.args.channel.as_str(), body.as_slice())
+                        .await
+                        .map_err(map_redis_error)
+                })
+                .await
+                {
+                    Ok(receiver_count) => {
+                        // PUBLISH returns the number of subscribers that received the
+                        // message. Redis pub/sub is best-effort: with zero subscribers
+                        // the event is delivered to no one, yet the durable copy is
+                        // deleted. Warn so operators relying on reliable delivery are
+                        // not silently losing events (backlog#982).
+                        if receiver_count == 0 {
+                            warn!(
+                                target_id = %self.id,
+                                channel = %self.args.channel,
+                                "Redis PUBLISH reached 0 subscribers; the event was not received by any consumer (pub/sub is best-effort)"
+                            );
+                        }
+                        debug!(
+                            target_id = %self.id,
+                            channel = %self.args.channel,
+                            attempt,
+                            receiver_count,
+                            "Event published to Redis channel"
+                        );
+                        self.delivery_counters.record_success();
+                        return Ok(());
+                    }
+                    Err(mapped) => {
+                        invalidate_cache_on_connectivity_error(&mapped, || self.invalidate_cached_publisher()).await;
 
-                    warn!(
-                        target_id = %self.id,
-                        channel = %self.args.channel,
-                        attempt,
-                        max_attempts = self.args.max_retry_attempts,
-                        error = %mapped,
-                        "Redis publish attempt failed"
-                    );
+                        warn!(
+                            target_id = %self.id,
+                            channel = %self.args.channel,
+                            attempt,
+                            max_attempts = self.args.max_retry_attempts,
+                            error = %mapped,
+                            "Redis publish attempt failed"
+                        );
 
-                    if !is_retryable_target_error(&mapped) || attempt >= self.args.max_retry_attempts {
+                        if !is_connectivity_error(&mapped) || attempt >= self.args.max_retry_attempts {
+                            last_error = Some(mapped);
+                            break;
+                        }
+
                         last_error = Some(mapped);
-                        break;
+                        tokio::time::sleep(compute_retry_delay(
+                            attempt,
+                            self.args.min_retry_delay.unwrap_or(Duration::from_millis(100)),
+                            self.args.max_retry_delay.unwrap_or(Duration::from_secs(2)),
+                        ))
+                        .await;
                     }
-
-                    last_error = Some(mapped);
-                    tokio::time::sleep(compute_retry_delay(
-                        attempt,
-                        self.args.min_retry_delay.unwrap_or(Duration::from_millis(100)),
-                        self.args.max_retry_delay.unwrap_or(Duration::from_secs(2)),
-                    ))
-                    .await;
                 }
             }
+
+            Err(last_error.unwrap_or(TargetError::Unknown(
+                "Redis publish failed without a captured error".to_string(),
+            )))
+        })
+        .await;
+
+        if let Err(err) = &result {
+            invalidate_cache_on_connectivity_error(err, || self.invalidate_cached_publisher()).await;
+            self.connected.store(false, Ordering::SeqCst);
         }
-
-        self.connected.store(false, Ordering::SeqCst);
-
-        Err(last_error.unwrap_or(TargetError::Unknown("Redis publish failed without a captured error".to_string())))
+        result
     }
 }
 
 #[async_trait]
 impl<E> Target<E> for RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -486,20 +596,25 @@ where
             return Ok(false);
         }
 
-        match tokio::time::timeout(Duration::from_secs(5), ping_redis_server(&self.publisher_client, &self.args)).await {
+        // Reuse the cached ConnectionManager for the health probe (via
+        // ensure_publisher_ready) instead of building a brand-new manager — and
+        // thus a fresh TCP+TLS handshake — on every health check (backlog#982).
+        // ensure_publisher_ready already invalidates the cached manager on a
+        // connectivity error so the next attempt rebuilds it.
+        match tokio::time::timeout(REDIS_CONNECTION_TIMEOUT_DEFAULT, self.ensure_publisher_ready()).await {
             Ok(Ok(())) => {
                 self.connected.store(true, Ordering::SeqCst);
                 Ok(true)
             }
             Ok(Err(err)) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
+                mark_target_disconnected_on_connectivity_error(&self.connected, &err);
                 Err(err)
             }
             Err(_) => {
-                self.invalidate_cached_publisher().await;
-                self.connected.store(false, Ordering::SeqCst);
-                Err(TargetError::Timeout("Redis connection timed out".to_string()))
+                let timeout_err = TargetError::Timeout("Redis connection timed out".to_string());
+                invalidate_cache_on_connectivity_error(&timeout_err, || self.invalidate_cached_publisher()).await;
+                mark_target_disconnected_on_connectivity_error(&self.connected, &timeout_err);
+                Err(timeout_err)
             }
         }
     }
@@ -514,17 +629,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
 
             debug!(target_id = %self.id, "Event saved to store for Redis target");
@@ -556,14 +663,14 @@ where
         }
 
         if let Err(err) = self.init_inner().await {
-            if matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_)) {
+            if is_connectivity_error(&err) {
                 warn!(target_id = %self.id, error = %err, "Redis target not ready; queued event remains in store");
             }
             return Err(err);
         }
 
         if let Err(err) = self.send_body(body, &meta).await {
-            if matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_)) {
+            if is_connectivity_error(&err) {
                 warn!(target_id = %self.id, error = %err, "Failed to send Redis event from store: target not connected. Event remains queued.");
             }
             return Err(err);
@@ -575,6 +682,7 @@ where
 
     async fn close(&self) -> Result<(), TargetError> {
         self.invalidate_cached_publisher().await;
+        self.tls_state.lock().reset();
         self.connected.store(false, Ordering::SeqCst);
         info!(target_id = %self.id, "Redis target closed");
         Ok(())
@@ -600,8 +708,11 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            // Redis targets record no terminal failures and keep no failed store.
+            0,
+        )
     }
 
     fn record_final_failure(&self) {
@@ -613,6 +724,13 @@ pub(crate) fn build_redis_client(args: &RedisArgs) -> Result<Client, TargetError
     let mut url = args.url.clone();
     if args.tls.allow_insecure {
         url.set_fragment(Some("insecure"));
+        // Mirror the webhook `skip_tls_verify` warning: this disables Redis
+        // server certificate verification and must only be used for testing
+        // (backlog#982).
+        warn!(
+            target = %redact_redis_url(&args.url),
+            "Redis tls_allow_insecure is enabled: server certificate verification is DISABLED (insecure). Use for testing only."
+        );
     }
 
     let mut connection_info: ConnectionInfo = url.into_connection_info().map_err(map_redis_error)?;
@@ -714,9 +832,20 @@ fn read_root_cert(tls: &RedisTlsConfig) -> Result<Option<Vec<u8>>, TargetError> 
         return Ok(None);
     }
 
-    std::fs::read(&tls.ca_path)
-        .map(Some)
-        .map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))
+    let pem =
+        std::fs::read(&tls.ca_path).map_err(|e| TargetError::Configuration(format!("Failed to read Redis root CA cert: {e}")))?;
+    let mut reader = BufReader::new(pem.as_slice());
+    let certs_der = CertificateDer::pem_reader_iter(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| TargetError::Configuration(format!("Failed to parse Redis root CA cert: {e}")))?;
+
+    if certs_der.is_empty() {
+        return Err(TargetError::Configuration(
+            "Redis root CA cert did not contain any parsable certificates".to_string(),
+        ));
+    }
+
+    Ok(Some(pem))
 }
 
 fn map_redis_error(err: RedisError) -> TargetError {
@@ -734,14 +863,50 @@ fn map_redis_error(err: RedisError) -> TargetError {
     }
 }
 
-fn is_retryable_target_error(err: &TargetError) -> bool {
-    matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
-}
-
 fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration) -> Duration {
     let shift = attempt.saturating_sub(1).min(16) as u32;
     let factor = 1u32 << shift;
     min_delay.saturating_mul(factor).min(max_delay)
+}
+
+/// Coordinated TLS hot-reload implementation for Redis targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the Redis client without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for RedisTarget<E>
+where
+    E: PluginEvent,
+{
+    type Material = Client;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls.ca_path.clone(),
+            client_cert_path: self.args.tls.client_cert_path.clone(),
+            client_key_path: self.args.tls.client_key_path.clone(),
+            target_label: format!("redis:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        build_redis_client(&self.args)
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        *self.publisher_client.lock() = (*material).clone();
+        self.invalidate_cached_publisher().await;
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls.ca_path, &self.args.tls.client_cert_path, &self.args.tls.client_key_path)
+    }
 }
 
 #[cfg(test)]
@@ -751,6 +916,10 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn absolute_test_path(path: &str) -> String {
+        std::env::temp_dir().join(path).to_string_lossy().into_owned()
+    }
 
     fn base_args() -> RedisArgs {
         RedisArgs {
@@ -799,12 +968,32 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_zero_connection_timeout() {
+        let args = RedisArgs {
+            connection_timeout: Some(Duration::ZERO),
+            ..base_args()
+        };
+
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_zero_response_timeout() {
+        let args = RedisArgs {
+            response_timeout: Some(Duration::ZERO),
+            ..base_args()
+        };
+
+        assert!(args.validate().is_err());
+    }
+
+    #[test]
     fn validate_accepts_custom_ca_tls_policy() {
         let args = RedisArgs {
             url: Url::parse("rediss://127.0.0.1:6379").unwrap(),
             tls: RedisTlsConfig {
                 policy: Some(RedisTlsPolicy::CustomCa),
-                ca_path: "/tmp/ca.pem".to_string(),
+                ca_path: absolute_test_path("redis-ca.pem"),
                 ..RedisTlsConfig::default()
             },
             ..base_args()
@@ -916,7 +1105,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_succeeds_when_ping_returns_pong() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, false));
 
@@ -932,7 +1125,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_returns_error_when_ping_fails() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -987,7 +1184,7 @@ mod tests {
         let payload = build_queued_payload(&EntityTarget {
             object_name: "greeting+file+%282%29.csv".to_string(),
             bucket_name: "bucket".to_string(),
-            event_name: rustfs_s3_common::EventName::ObjectCreatedPut,
+            event_name: rustfs_s3_types::EventName::ObjectCreatedPut,
             data: "payload-data".to_string(),
         })
         .expect("payload should build");
@@ -1076,7 +1273,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_body_keeps_connected_true_when_retryable_error_eventually_recovers() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, true));
 
@@ -1089,7 +1290,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1106,9 +1307,30 @@ mod tests {
         assert_eq!(target.delivery_snapshot().total_messages, 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn delivery_budget_respects_response_timeout_longer_than_sixty_seconds() {
+        let mut args = base_args();
+        args.max_retry_attempts = 1;
+        args.response_timeout = Some(Duration::from_secs(90));
+        let manager_config = build_redis_connection_manager_config(&args);
+
+        assert_eq!(manager_config.response_timeout(), Some(Duration::from_secs(90)));
+        assert_eq!(redis_total_delivery_timeout(&args), Duration::from_secs(97));
+        with_delivery_deadline(redis_total_delivery_timeout(&args), "Redis delivery", async {
+            tokio::time::sleep(Duration::from_secs(70)).await;
+            Ok::<_, TargetError>(())
+        })
+        .await
+        .expect("the configured delivery budget must not impose a fixed sixty-second cap");
+    }
+
     #[tokio::test]
     async fn send_body_sets_connected_false_after_retry_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1128,7 +1350,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",
@@ -1149,7 +1371,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_raw_from_store_failure_does_not_count_as_success() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1167,7 +1393,7 @@ mod tests {
 
         let target = RedisTarget::<String>::new("redis:test".to_string(), args).expect("target should build");
         let meta = QueuedPayloadMeta::new(
-            rustfs_s3_common::EventName::ObjectCreatedPut,
+            rustfs_s3_types::EventName::ObjectCreatedPut,
             "bucket".to_string(),
             "object".to_string(),
             "application/json",

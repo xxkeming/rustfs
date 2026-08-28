@@ -24,27 +24,40 @@ description = " RustFS Trusted Proxies module provides secure and efficient mana
 keywords = ["trusted-proxies", "network-security", "rustfs", "proxy-management"]
 categories = ["network-programming", "security", "web-programming"]
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/reqwest-0-13",
+    "rustfs-config/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-config/hotpath-alloc", "rustfs-utils/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-config/hotpath-cpu", "rustfs-utils/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 async-trait = { workspace = true }
 axum = { workspace = true }
 http = { workspace = true }
-ipnetwork = { workspace = true }
+ipnetwork = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }
 moka = { workspace = true, features = ["future", "sync"] }
-reqwest = { workspace = true }
+reqwest = { workspace = true, features = ["json"] }
 rustfs-config = { workspace = true }
 rustfs-utils = { workspace = true, features = ["net"] }
-serde.workspace = true
-serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "test-util"] }
-tower = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tower = { workspace = true, features = ["timeout"] }
 tracing = { workspace = true }
 regex = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["full", "test-util"] }
-tower = { workspace = true, features = ["util"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+tower = { workspace = true, features = ["util", "timeout"] }
 serial_test = { workspace = true }
 temp-env = { workspace = true }
 

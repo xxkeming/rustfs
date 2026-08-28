@@ -51,6 +51,7 @@ pub enum MetricSubsystem {
     Replication,
     Notification,
     Scanner,
+    Compression,
 
     // Custom paths
     Custom(String),
@@ -93,6 +94,7 @@ impl MetricSubsystem {
             Self::Replication => "/replication",
             Self::Notification => "/notification",
             Self::Scanner => "/scanner",
+            Self::Compression => "/compression",
 
             // Custom paths
             Self::Custom(path) => path,
@@ -100,7 +102,6 @@ impl MetricSubsystem {
     }
 
     /// Get the formatted metric name format string
-    #[allow(dead_code)]
     pub fn as_str(&self) -> String {
         format_path_to_metric_name(self.path())
     }
@@ -141,6 +142,7 @@ impl MetricSubsystem {
             "/replication" => Self::Replication,
             "/notification" => Self::Notification,
             "/scanner" => Self::Scanner,
+            "/compression" => Self::Compression,
 
             // Treat other paths as custom subsystems
             _ => Self::Custom(path.to_string()),
@@ -148,7 +150,6 @@ impl MetricSubsystem {
     }
 
     /// A convenient way to create custom subsystems directly
-    #[allow(dead_code)]
     pub fn new(path: impl Into<String>) -> Self {
         Self::Custom(path.into())
     }
@@ -173,7 +174,6 @@ impl std::fmt::Display for MetricSubsystem {
     }
 }
 
-#[allow(dead_code)]
 pub mod subsystems {
     use super::MetricSubsystem;
 
@@ -203,6 +203,7 @@ pub mod subsystems {
     pub const REPLICATION: MetricSubsystem = MetricSubsystem::Replication;
     pub const NOTIFICATION: MetricSubsystem = MetricSubsystem::Notification;
     pub const SCANNER: MetricSubsystem = MetricSubsystem::Scanner;
+    pub const COMPRESSION: MetricSubsystem = MetricSubsystem::Compression;
 }
 
 #[cfg(test)]

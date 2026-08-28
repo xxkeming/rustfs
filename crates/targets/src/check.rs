@@ -64,8 +64,8 @@ pub async fn check_mqtt_broker_available_with_tls(
     use crate::target::mqtt::build_mqtt_options;
     use rumqttc::{AsyncClient, QoS};
 
-    let url = rustfs_utils::parse_url(broker_url)
-        .map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
+    let url =
+        crate::parse_url(broker_url).map_err(|e| crate::TargetError::Configuration(format!("Broker URL parsing failed: {e}")))?;
     let url = url.url();
 
     // build_mqtt_options returns TargetError directly; Configuration variants propagate as-is.
@@ -100,11 +100,27 @@ pub async fn check_nats_server_available(args: &crate::target::nats::NATSArgs) -
             .flush()
             .await
             .map_err(|e| crate::TargetError::Network(format!("NATS connection check failed: {e}")))?;
+        // Validate the configured stream on the live connection before the drain closes it, so a
+        // missing or non-writable stream is rejected here rather than at first publish. The lookup is
+        // read-only and never creates a stream. The drain runs regardless of the validation outcome so
+        // the check connection is closed gracefully, and the validation error then propagates.
+        let validation = if args.jetstream_enable.unwrap_or(false) {
+            let mut context = async_nats::jetstream::new(client.clone());
+            // Match every other context construction site: the ack timeout is the per-operation await
+            // bound, so the validation get_stream lookup uses it rather than the library default.
+            context.set_timeout(std::time::Duration::from_secs(
+                args.jetstream_ack_timeout_secs
+                    .unwrap_or(rustfs_config::NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS),
+            ));
+            crate::target::nats::validate_jetstream_stream(&context, args, "nats-check", None).await
+        } else {
+            Ok(())
+        };
         client
             .drain()
             .await
             .map_err(|e| crate::TargetError::Network(format!("Failed to close NATS check connection: {e}")))?;
-        Ok(())
+        validation
     })
     .await
     .unwrap_or_else(|_| Err(crate::TargetError::Timeout("NATS connection timed out".to_string())))
@@ -228,8 +244,10 @@ pub async fn check_postgres_server_available(args: &crate::target::postgres::Pos
 
 pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs) -> Result<(), crate::TargetError> {
     use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
-    use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks, SecurityConfig};
+    use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, RequiredAcks};
     use std::time::Duration;
+
+    args.validate()?;
 
     let map_kafka_error = |err: KafkaError, context: &str| match err {
         KafkaError::Connection(ConnectionError::NoHostReachable) => crate::TargetError::NotConnected,
@@ -249,14 +267,7 @@ pub async fn check_kafka_broker_available(args: &crate::target::kafka::KafkaArgs
         .with_ack_timeout(Duration::from_secs(5))
         .with_required_acks(acks);
 
-    if args.tls_enable {
-        let mut security = SecurityConfig::new();
-        if !args.tls_ca.is_empty() {
-            security = security.with_ca_cert(args.tls_ca.clone());
-        }
-        if !args.tls_client_cert.is_empty() && !args.tls_client_key.is_empty() {
-            security = security.with_client_cert(args.tls_client_cert.clone(), args.tls_client_key.clone());
-        }
+    if let Some(security) = args.security_config(false)? {
         config = config.with_security(security);
     }
 
@@ -304,8 +315,28 @@ mod tests {
     use super::*;
     use crate::{
         TargetError,
-        target::{TargetType, mysql::MySqlArgs},
+        target::{TargetType, kafka::KafkaArgs, mysql::MySqlArgs},
     };
+
+    fn kafka_args() -> KafkaArgs {
+        KafkaArgs {
+            enable: true,
+            brokers: vec!["127.0.0.1:9092".to_string()],
+            topic: "rustfs-events".to_string(),
+            acks: 1,
+            tls_enable: false,
+            tls_ca: String::new(),
+            tls_client_cert: String::new(),
+            tls_client_key: String::new(),
+            sasl_enable: false,
+            sasl_mechanism: String::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
+            queue_dir: String::new(),
+            queue_limit: 100,
+            target_type: TargetType::NotifyEvent,
+        }
+    }
 
     fn mysql_args() -> MySqlArgs {
         MySqlArgs {
@@ -320,6 +351,24 @@ mod tests {
             queue_limit: 100,
             max_open_connections: 2,
             target_type: TargetType::NotifyEvent,
+        }
+    }
+
+    #[test]
+    fn check_kafka_broker_available_rejects_sasl_without_tls_before_connecting() {
+        let mut args = kafka_args();
+        args.sasl_enable = true;
+        args.sasl_username = "user".to_string();
+        args.sasl_password = "secret".to_string();
+
+        let err = tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(check_kafka_broker_available(&args))
+            .expect_err("SASL without TLS should fail before opening a network connection");
+
+        match err {
+            TargetError::Configuration(msg) => assert!(msg.contains("requires tls_enable")),
+            other => panic!("expected configuration error, got {other:?}"),
         }
     }
 

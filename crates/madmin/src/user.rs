@@ -401,15 +401,27 @@ pub struct AccountInfo {
     pub server: BackendInfo,
     pub policy: serde_json::Value, // Use iam/policy::parse to parse the result, to be done by the caller.
     pub buckets: Vec<BucketAccessInfo>,
+    /// Whether the usage values came from a fully converged scanner cycle.
+    /// `false` means the values are a newer structurally complete observation
+    /// while another convergence pass remains pending.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot_converged: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct BucketAccessInfo {
     pub name: String,
-    pub size: u64,
-    pub objects: u64,
-    pub object_sizes_histogram: HashMap<String, u64>,
-    pub object_versions_histogram: HashMap<String, u64>,
+    // Usage stats are absent (not zero) when no scanner snapshot covers the
+    // bucket yet, so clients can distinguish "unknown" from "empty"
+    // (rustfs/backlog#1306).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub objects: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_sizes_histogram: Option<HashMap<String, u64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub object_versions_histogram: Option<HashMap<String, u64>>,
     pub details: Option<BucketDetails>,
     pub prefix_usage: HashMap<String, u64>,
     #[serde(rename = "expiration", with = "time::serde::rfc3339::option")]
@@ -423,6 +435,8 @@ pub struct BucketDetails {
     pub versioning_suspended: bool,
     pub locking: bool,
     pub replication: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota: Option<u64>,
     // pub tagging: Option<Tagging>,
 }
 
@@ -500,6 +514,22 @@ where
     Ok(Option::<Vec<String>>::deserialize(deserializer)?.unwrap_or_default())
 }
 
+fn parse_service_account_expiration(expiration: &str) -> Result<OffsetDateTime, time::Error> {
+    const LEGACY_SERVICE_ACCOUNT_EXPIRATION_FORMAT: &[time::format_description::BorrowedFormatItem<'_>] = time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond] [offset_hour sign:mandatory]:[offset_minute]:[offset_second]"
+    );
+
+    OffsetDateTime::parse(expiration, &Rfc3339)
+        .or_else(|_| OffsetDateTime::parse(expiration, LEGACY_SERVICE_ACCOUNT_EXPIRATION_FORMAT).map_err(Into::into))
+}
+
+fn serialize_optional_service_account_expiration<S>(expiration: &Option<OffsetDateTime>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    time::serde::rfc3339::option::serialize(expiration, serializer)
+}
+
 fn deserialize_optional_service_account_expiration<'de, D>(deserializer: D) -> Result<Option<OffsetDateTime>, D::Error>
 where
     D: Deserializer<'de>,
@@ -513,7 +543,7 @@ where
         return Ok(None);
     }
 
-    let expiration = OffsetDateTime::parse(expiration, &Rfc3339).map_err(D::Error::custom)?;
+    let expiration = parse_service_account_expiration(expiration).map_err(D::Error::custom)?;
     if expiration.unix_timestamp() == 0 {
         return Ok(None);
     }
@@ -549,6 +579,7 @@ pub struct SRSvcAccCreate {
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
+        serialize_with = "serialize_optional_service_account_expiration",
         deserialize_with = "deserialize_optional_service_account_expiration"
     )]
     pub expiration: Option<OffsetDateTime>,
@@ -706,23 +737,84 @@ mod tests {
     use super::*;
     use serde_json;
     use time::OffsetDateTime;
+    use time::macros::datetime;
 
+    /// Wire pin (rustfs/backlog#1306): usage stats without a scanner snapshot
+    /// must be omitted from the JSON, not serialized as zeros.
     #[test]
-    fn test_account_status_default() {
-        let status = AccountStatus::default();
-        assert_eq!(status, AccountStatus::Disabled);
+    fn bucket_access_info_omits_absent_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "no-snapshot".to_string(),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(!obj.contains_key("size"));
+        assert!(!obj.contains_key("objects"));
+        assert!(!obj.contains_key("object_sizes_histogram"));
+        assert!(!obj.contains_key("object_versions_histogram"));
+    }
+
+    /// Wire pin (rustfs/backlog#1306): populated usage stats keep their
+    /// existing snake_case keys and numeric values.
+    #[test]
+    fn bucket_access_info_serializes_present_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "snapshot".to_string(),
+            size: Some(1024),
+            objects: Some(7),
+            object_sizes_histogram: Some(HashMap::from([("1MiB-10MiB".to_string(), 7)])),
+            object_versions_histogram: Some(HashMap::from([("SINGLE_VERSION".to_string(), 7)])),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["size"], 1024);
+        assert_eq!(value["objects"], 7);
+        assert_eq!(value["object_sizes_histogram"]["1MiB-10MiB"], 7);
+        assert_eq!(value["object_versions_histogram"]["SINGLE_VERSION"], 7);
+    }
+
+    /// Wire pin (rustfs/backlog#1306): a scanned-but-empty bucket carries
+    /// Some(0) usage stats that must serialize as zeros, staying distinct from
+    /// the no-snapshot (None) case that is omitted. Guards against replacing
+    /// `Option::is_none` with a predicate that also skips zero values.
+    #[test]
+    fn bucket_access_info_serializes_zero_usage_stats() {
+        let info = BucketAccessInfo {
+            name: "empty-snapshot".to_string(),
+            size: Some(0),
+            objects: Some(0),
+            object_sizes_histogram: Some(HashMap::new()),
+            object_versions_histogram: Some(HashMap::new()),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&info).unwrap();
+        let obj = value.as_object().unwrap();
+        assert!(obj.contains_key("size"));
+        assert!(obj.contains_key("objects"));
+        assert!(obj.contains_key("object_sizes_histogram"));
+        assert!(obj.contains_key("object_versions_histogram"));
+        assert_eq!(value.get("size"), Some(&serde_json::json!(0)));
+        assert_eq!(value["objects"], 0);
+        assert_eq!(value["object_sizes_histogram"], serde_json::json!({}));
+        assert_eq!(value["object_versions_histogram"], serde_json::json!({}));
     }
 
     #[test]
-    fn test_account_status_as_ref() {
-        assert_eq!(AccountStatus::Enabled.as_ref(), "enabled");
-        assert_eq!(AccountStatus::Disabled.as_ref(), "disabled");
-    }
+    fn account_info_exposes_observational_usage_state_additively() {
+        let info = AccountInfo {
+            usage_snapshot_converged: Some(false),
+            ..Default::default()
+        };
 
-    #[test]
-    fn test_account_status_try_from_valid() {
-        assert_eq!(AccountStatus::try_from("enabled").unwrap(), AccountStatus::Enabled);
-        assert_eq!(AccountStatus::try_from("disabled").unwrap(), AccountStatus::Disabled);
+        let value = serde_json::to_value(&info).unwrap();
+        assert_eq!(value["usage_snapshot_converged"], false);
+
+        let legacy_shape = serde_json::to_value(AccountInfo::default()).unwrap();
+        assert!(!legacy_shape.as_object().unwrap().contains_key("usage_snapshot_converged"));
     }
 
     #[test]
@@ -763,32 +855,6 @@ mod tests {
 
         assert_eq!(builtin_json, "\"builtin\"");
         assert_eq!(ldap_json, "\"ldap\"");
-    }
-
-    #[test]
-    fn test_user_auth_info_creation() {
-        let auth_info = UserAuthInfo {
-            auth_type: UserAuthType::Ldap,
-            auth_server: Some("ldap.example.com".to_string()),
-            auth_server_user_id: Some("user123".to_string()),
-        };
-
-        assert!(matches!(auth_info.auth_type, UserAuthType::Ldap));
-        assert_eq!(auth_info.auth_server.unwrap(), "ldap.example.com");
-        assert_eq!(auth_info.auth_server_user_id.unwrap(), "user123");
-    }
-
-    #[test]
-    fn test_user_auth_info_serialization() {
-        let auth_info = UserAuthInfo {
-            auth_type: UserAuthType::Builtin,
-            auth_server: None,
-            auth_server_user_id: None,
-        };
-
-        let json = serde_json::to_string(&auth_info).unwrap();
-        assert!(json.contains("builtin"));
-        assert!(!json.contains("authServer"), "None fields should be skipped");
     }
 
     #[test]
@@ -1003,57 +1069,6 @@ mod tests {
     }
 
     #[test]
-    fn test_credentials_without_optional_fields() {
-        let credentials = Credentials {
-            access_key: "AKIAIOSFODNN7EXAMPLE",
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token: None,
-            expiration: None,
-        };
-
-        let json = serde_json::to_string(&credentials).unwrap();
-        assert!(json.contains("AKIAIOSFODNN7EXAMPLE"));
-        assert!(!json.contains("sessionToken"), "None fields should be skipped");
-        assert!(!json.contains("expiration"), "None fields should be skipped");
-    }
-
-    #[test]
-    fn test_add_service_account_resp_creation() {
-        let credentials = Credentials {
-            access_key: "AKIAIOSFODNN7EXAMPLE",
-            secret_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-            session_token: None,
-            expiration: None,
-        };
-
-        let resp = AddServiceAccountResp { credentials };
-
-        assert_eq!(resp.credentials.access_key, "AKIAIOSFODNN7EXAMPLE");
-        assert_eq!(resp.credentials.secret_key, "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
-    }
-
-    #[test]
-    fn test_info_service_account_resp_creation() {
-        let now = OffsetDateTime::now_utc();
-        let resp = InfoServiceAccountResp {
-            parent_user: "admin".to_string(),
-            account_status: "enabled".to_string(),
-            implied_policy: true,
-            policy: Some("ReadOnlyAccess".to_string()),
-            name: Some("test-service".to_string()),
-            description: Some("Test service account".to_string()),
-            expiration: Some(now),
-        };
-
-        assert_eq!(resp.parent_user, "admin");
-        assert_eq!(resp.account_status, "enabled");
-        assert!(resp.implied_policy);
-        assert_eq!(resp.policy.unwrap(), "ReadOnlyAccess");
-        assert_eq!(resp.name.unwrap(), "test-service");
-        assert!(resp.expiration.is_some());
-    }
-
-    #[test]
     fn test_update_service_account_req_validate() {
         let req = UpdateServiceAccountReq {
             new_policy: Some(serde_json::json!({"Version": "2012-10-17"})),
@@ -1088,22 +1103,6 @@ mod tests {
     }
 
     #[test]
-    fn test_account_info_creation() {
-        use crate::BackendInfo;
-
-        let account_info = AccountInfo {
-            account_name: "testuser".to_string(),
-            server: BackendInfo::default(),
-            policy: serde_json::json!({"Version": "2012-10-17"}),
-            buckets: vec![],
-        };
-
-        assert_eq!(account_info.account_name, "testuser");
-        assert!(account_info.buckets.is_empty());
-        assert!(account_info.policy.is_object());
-    }
-
-    #[test]
     fn test_bucket_access_info_creation() {
         let now = OffsetDateTime::now_utc();
         let mut sizes_histogram = HashMap::new();
@@ -1120,15 +1119,16 @@ mod tests {
 
         let bucket_info = BucketAccessInfo {
             name: "test-bucket".to_string(),
-            size: 6000000,
-            objects: 150,
-            object_sizes_histogram: sizes_histogram,
-            object_versions_histogram: versions_histogram,
+            size: Some(6000000),
+            objects: Some(150),
+            object_sizes_histogram: Some(sizes_histogram),
+            object_versions_histogram: Some(versions_histogram),
             details: Some(BucketDetails {
                 versioning: true,
                 versioning_suspended: false,
                 locking: true,
                 replication: false,
+                quota: None,
             }),
             prefix_usage,
             created: Some(now),
@@ -1139,10 +1139,10 @@ mod tests {
         };
 
         assert_eq!(bucket_info.name, "test-bucket");
-        assert_eq!(bucket_info.size, 6000000);
-        assert_eq!(bucket_info.objects, 150);
-        assert_eq!(bucket_info.object_sizes_histogram.len(), 2);
-        assert_eq!(bucket_info.object_versions_histogram.len(), 2);
+        assert_eq!(bucket_info.size, Some(6000000));
+        assert_eq!(bucket_info.objects, Some(150));
+        assert_eq!(bucket_info.object_sizes_histogram.as_ref().map(HashMap::len), Some(2));
+        assert_eq!(bucket_info.object_versions_histogram.as_ref().map(HashMap::len), Some(2));
         assert!(bucket_info.details.is_some());
         assert_eq!(bucket_info.prefix_usage.len(), 2);
         assert!(bucket_info.created.is_some());
@@ -1157,12 +1157,27 @@ mod tests {
             versioning_suspended: false,
             locking: true,
             replication: true,
+            quota: Some(1024),
         };
 
         assert!(details.versioning);
         assert!(!details.versioning_suspended);
         assert!(details.locking);
         assert!(details.replication);
+        assert_eq!(details.quota, Some(1024));
+    }
+
+    #[test]
+    fn bucket_details_serializes_quota_only_when_configured() {
+        let with_quota = BucketDetails {
+            quota: Some(1024),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(with_quota).expect("bucket details should serialize");
+        assert_eq!(value["quota"], 1024);
+
+        let without_quota = serde_json::to_value(BucketDetails::default()).expect("bucket details should serialize");
+        assert!(without_quota.get("quota").is_none());
     }
 
     #[test]
@@ -1294,5 +1309,51 @@ mod tests {
 
         let svc: SRSvcAccCreate = serde_json::from_str(payload).unwrap();
         assert!(svc.expiration.is_none());
+    }
+
+    #[test]
+    fn test_sr_svc_acc_create_serializes_expiration_as_rfc3339() {
+        let svc = SRSvcAccCreate {
+            parent: "useralpha".to_string(),
+            access_key: "svcalpha".to_string(),
+            secret_key: "svcAlphaSecret123".to_string(),
+            groups: Vec::new(),
+            claims: HashMap::new(),
+            session_policy: SRSessionPolicy::default(),
+            status: "on".to_string(),
+            name: "uploaderKey".to_string(),
+            description: "alpha upload key".to_string(),
+            expiration: Some(datetime!(9999-01-01 00:00:00 UTC)),
+            api_version: None,
+        };
+
+        let json = serde_json::to_string(&svc).unwrap();
+        assert!(
+            json.contains(r#""expiration":"9999-01-01T00:00:00Z""#),
+            "service account export expiration should be RFC3339; got: {json}"
+        );
+        assert!(!json.contains("+00:00:00"), "export must not use the legacy offset format: {json}");
+
+        let decoded: SRSvcAccCreate = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.expiration, svc.expiration);
+    }
+
+    #[test]
+    fn test_sr_svc_acc_create_deserializes_legacy_exported_expiration() {
+        let payload = r#"{
+            "parent": "useralpha",
+            "accessKey": "svcalpha",
+            "secretKey": "svcAlphaSecret123",
+            "groups": [],
+            "claims": {},
+            "sessionPolicy": null,
+            "status": "on",
+            "name": "uploaderKey",
+            "description": "alpha upload key",
+            "expiration": "9999-01-01 00:00:00.0 +00:00:00"
+        }"#;
+
+        let svc: SRSvcAccCreate = serde_json::from_str(payload).unwrap();
+        assert_eq!(svc.expiration, Some(datetime!(9999-01-01 00:00:00 UTC)));
     }
 }

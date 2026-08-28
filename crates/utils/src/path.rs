@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::borrow::Cow;
+use std::path::Component;
 use std::path::Path;
 use std::path::PathBuf;
 
@@ -43,12 +45,17 @@ pub fn has_suffix(s: &str, suffix: &str) -> bool {
 /// If the object name ends with a slash, it is considered a directory object.
 /// The trailing slash is removed and `GLOBAL_DIR_SUFFIX` is appended.
 /// If it does not end with a slash, the name is returned as is.
-pub fn encode_dir_object(object: &str) -> String {
+pub fn encode_dir_object_ref(object: &str) -> Cow<'_, str> {
     if has_suffix(object, SLASH_SEPARATOR) {
-        format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX)
+        Cow::Owned(format!("{}{}", object.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX))
     } else {
-        object.to_string()
+        Cow::Borrowed(object)
     }
+}
+
+/// Owned compatibility wrapper for callers that retain or mutate the encoded name.
+pub fn encode_dir_object(object: &str) -> String {
+    encode_dir_object_ref(object).into_owned()
 }
 
 /// Checks if the given object name represents a directory object.
@@ -63,7 +70,6 @@ pub fn is_dir_object(object: &str) -> bool {
 ///
 /// If the object name ends with `GLOBAL_DIR_SUFFIX`, it is replaced with a slash.
 /// Otherwise, the name is returned as is.
-#[allow(dead_code)]
 pub fn decode_dir_object(object: &str) -> String {
     if has_suffix(object, GLOBAL_DIR_SUFFIX) {
         format!("{}{}", object.trim_end_matches(GLOBAL_DIR_SUFFIX), SLASH_SEPARATOR)
@@ -437,6 +443,12 @@ impl LazyBuf {
 /// The returned path ends in a slash only if it represents a root directory, such as `/` on Unix or `C:/` on Windows.
 ///
 /// If the result of this process is an empty string, `clean` returns the string `.`.
+///
+/// Note: `crates/policy/src/policy/utils/path.rs` deliberately keeps its own
+/// slash-only Go `path.Clean` port instead of using this function — S3
+/// ARN/resource matching must not treat backslashes as separators, and this
+/// Windows-aware version would change policy evaluation semantics on Windows.
+/// Do not consolidate the two (backlog#1833).
 pub fn clean(path: &str) -> String {
     if path.is_empty() {
         return ".".to_string();
@@ -550,9 +562,67 @@ pub fn trim_etag(etag: &str) -> String {
     etag.trim_matches('"').to_string()
 }
 
+/// Returns `true` if `path` contains a `..` component (parent directory traversal).
+fn contains_parent_dir_component(path: &str) -> bool {
+    path.split(['/', '\\']).any(|component| component == "..")
+}
+
+/// Validates that an archive entry path does not escape the target bucket.
+///
+/// Rejects paths containing `..` components, root prefixes, or device/prefix
+/// components that would allow path traversal outside the extraction root.
+///
+/// Returns `Ok(())` if the path is safe, or `Err(message)` describing the violation.
+pub fn validate_extract_relative_path(path: &str) -> Result<(), String> {
+    let p = Path::new(path);
+    if p.components()
+        .any(|c| matches!(c, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
+        || contains_parent_dir_component(p.to_string_lossy().as_ref())
+    {
+        return Err("archive entry path must stay within the target bucket".to_string());
+    }
+    Ok(())
+}
+
+/// Normalizes an archive entry key by applying a prefix, trimming slashes,
+/// and ensuring directory entries end with `/`.
+///
+/// Validates both the raw path and the final key against path traversal.
+///
+/// Returns `Ok(normalized_key)` or `Err(message)` if the path is unsafe.
+pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> Result<String, String> {
+    validate_extract_relative_path(path)?;
+    let path = path.trim_matches('/');
+    let mut key = match prefix {
+        Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
+        Some(prefix) => prefix.to_string(),
+        None => path.to_string(),
+    };
+
+    if is_dir && !key.ends_with('/') {
+        key.push('/');
+    }
+
+    validate_extract_relative_path(&key)?;
+
+    Ok(key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn encode_dir_object_ref_borrows_objects_and_encodes_directories() {
+        let object = "prefix/object";
+        let encoded = encode_dir_object_ref(object);
+        assert!(matches!(encoded, Cow::Borrowed(value) if value == object));
+
+        let encoded = encode_dir_object_ref("prefix/directory/");
+        assert!(matches!(encoded, Cow::Owned(ref value) if value == "prefix/directory__XLDIR__"));
+        assert_eq!(encode_dir_object("prefix/directory/"), encoded);
+    }
 
     #[test]
     fn test_trim_etag() {
@@ -891,5 +961,62 @@ mod tests {
 
         assert_eq!(bucket, "s3-test-bucket");
         assert_eq!(object, "中文/日本語/한글-9cd5599a-f8eb-4e24-9df7-32ecd8d8ad1f");
+    }
+
+    proptest! {
+        #[test]
+        fn clean_is_idempotent(input in any::<String>()) {
+            let once = clean(&input);
+            let twice = clean(&once);
+            prop_assert_eq!(twice, once);
+        }
+
+        #[test]
+        fn clean_output_has_no_redundant_current_dir_or_empty_segments(input in any::<String>()) {
+            let cleaned = clean(&input);
+
+            prop_assert!(!cleaned.contains("//"), "clean output should not contain doubled separators");
+            prop_assert!(!cleaned.contains("/./"), "clean output should not contain embedded current-dir segments");
+            prop_assert!(!cleaned.ends_with("/."), "clean output should not end with a current-dir segment");
+
+            if cleaned != "/" {
+                prop_assert!(
+                    !cleaned.ends_with('/') || cleaned.is_empty(),
+                    "clean output should not preserve a trailing slash"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_validate_extract_relative_path_accepts_safe_paths() {
+        assert!(validate_extract_relative_path("file.txt").is_ok());
+        assert!(validate_extract_relative_path("dir/file.txt").is_ok());
+        assert!(validate_extract_relative_path("a/b/c").is_ok());
+        assert!(validate_extract_relative_path("").is_ok());
+    }
+
+    #[test]
+    fn test_validate_extract_relative_path_rejects_traversal() {
+        assert!(validate_extract_relative_path("../escape.txt").is_err());
+        assert!(validate_extract_relative_path("dir/../../../escape.txt").is_err());
+        assert!(validate_extract_relative_path("/absolute/path").is_err());
+        assert!(validate_extract_relative_path("dir/..").is_err());
+        assert!(validate_extract_relative_path("..").is_err());
+    }
+
+    #[test]
+    fn test_normalize_extract_entry_key_basic() {
+        assert_eq!(normalize_extract_entry_key("file.txt", None, false).unwrap(), "file.txt");
+        assert_eq!(normalize_extract_entry_key("file.txt", Some("prefix"), false).unwrap(), "prefix/file.txt");
+        assert_eq!(normalize_extract_entry_key("dir", None, true).unwrap(), "dir/");
+        assert_eq!(normalize_extract_entry_key("", Some("prefix"), false).unwrap(), "prefix");
+    }
+
+    #[test]
+    fn test_normalize_extract_entry_key_rejects_traversal() {
+        assert!(normalize_extract_entry_key("../escape.txt", None, false).is_err());
+        assert!(normalize_extract_entry_key("file.txt", Some("../bad"), false).is_err());
+        assert!(normalize_extract_entry_key("/absolute", None, false).is_err());
     }
 }

@@ -53,13 +53,25 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
-use super::object::{ObjectKeyMapper, head_object};
+use super::object::{ObjectKeyMapper, SwiftObjectOptions as ObjectOptions, head_object};
+use super::resolve_swift_object_store_handle;
+use super::storage_api::versioning::{ListOperations as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{ListOperations, ObjectOperations, ObjectOptions};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_VERSIONING: &str = "swift_versioning";
+const EVENT_SWIFT_VERSIONING_ARCHIVE_STATE: &str = "swift_versioning_archive_state";
+const EVENT_SWIFT_VERSIONING_RESTORE_STATE: &str = "swift_versioning_restore_state";
+const EVENT_SWIFT_VERSIONING_LIST_STATE: &str = "swift_versioning_list_state";
+const NANOS_PER_SECOND: u64 = 1_000_000_000;
+const VERSION_TIMESTAMP_MAX_SECONDS: u64 = 9_999_999_999;
+const VERSION_TIMESTAMP_MAX_NANOS: u64 = VERSION_TIMESTAMP_MAX_SECONDS * NANOS_PER_SECOND + (NANOS_PER_SECOND - 1);
+
+static LAST_VERSION_UNIX_NANOS: AtomicU64 = AtomicU64::new(0);
 
 /// Generate a version name for an archived object
 ///
@@ -85,22 +97,37 @@ use tracing::{debug, error};
 /// # Returns
 /// Versioned object name with inverted timestamp prefix
 pub fn generate_version_name(container: &str, object: &str) -> String {
-    // Get current timestamp
+    let unix_nanos = next_version_unix_nanos();
+    let inverted_nanos = VERSION_TIMESTAMP_MAX_NANOS.saturating_sub(unix_nanos);
+    let inverted_seconds = inverted_nanos / NANOS_PER_SECOND;
+    let inverted_subsec_nanos = inverted_nanos % NANOS_PER_SECOND;
+
+    // Format: {inverted_timestamp}/{container}/{object}
+    // 9 decimal places = nanosecond precision (prevents collisions up to 1B ops/sec)
+    format!("{inverted_seconds:010}.{inverted_subsec_nanos:09}/{container}/{object}")
+}
+
+fn current_unix_nanos() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_else(|_| std::time::Duration::from_secs(0));
 
-    let timestamp = now.as_secs_f64();
+    now.as_secs()
+        .saturating_mul(NANOS_PER_SECOND)
+        .saturating_add(u64::from(now.subsec_nanos()))
+}
 
-    // Invert timestamp so newer versions sort first
-    // Max reasonable timestamp: 9999999999 (year 2286)
-    // Using 9 decimal places (nanosecond precision) to prevent collisions
-    // in high-throughput scenarios where objects are uploaded rapidly
-    let inverted = 9999999999.999999999 - timestamp;
+fn next_version_unix_nanos() -> u64 {
+    let now = current_unix_nanos();
+    let mut observed = LAST_VERSION_UNIX_NANOS.load(Ordering::Acquire);
 
-    // Format: {inverted_timestamp}/{container}/{object}
-    // 9 decimal places = nanosecond precision (prevents collisions up to 1B ops/sec)
-    format!("{:.9}/{}/{}", inverted, container, object)
+    loop {
+        let candidate = now.max(observed.saturating_add(1)).min(VERSION_TIMESTAMP_MAX_NANOS);
+        match LAST_VERSION_UNIX_NANOS.compare_exchange_weak(observed, candidate, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return candidate,
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 /// Archive the current version of an object before overwriting
@@ -131,8 +158,15 @@ pub async fn archive_current_version(
     credentials: &Credentials,
 ) -> SwiftResult<()> {
     debug!(
-        "Archiving current version of {}/{}/{} to {}",
-        account, container, object, archive_container
+        event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        state = "started",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        "swift versioning archive state changed"
     );
 
     // Check if object exists
@@ -140,7 +174,18 @@ pub async fn archive_current_version(
         Ok(info) => info,
         Err(SwiftError::NotFound(_)) => {
             // Object doesn't exist - nothing to archive
-            debug!("Object does not exist, nothing to archive");
+            debug!(
+                event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+                result = "skipped",
+                reason = "object_missing",
+                account = %account,
+                container = %container,
+                object = %object,
+                archive_container = %archive_container,
+                "swift versioning archive state changed"
+            );
             return Ok(());
         }
         Err(e) => return Err(e),
@@ -149,7 +194,16 @@ pub async fn archive_current_version(
     // Generate version name
     let version_name = generate_version_name(container, object);
 
-    debug!("Generated version name: {}", version_name);
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        state = "version_name_generated",
+        container = %container,
+        object = %object,
+        version_name = %version_name,
+        "swift versioning archive state changed"
+    );
 
     // Validate account and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -164,7 +218,7 @@ pub async fn archive_current_version(
     let version_key = ObjectKeyMapper::swift_to_s3_key(&version_name)?;
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -174,7 +228,18 @@ pub async fn archive_current_version(
 
     // Get source object info for copy operation
     let mut src_info = store.get_object_info(&source_bucket, &source_key, &opts).await.map_err(|e| {
-        error!("Failed to get source object info: {}", e);
+        error!(
+            event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+            result = "source_info_failed",
+            source_bucket = %source_bucket,
+            source_key = %source_key,
+            archive_bucket = %archive_bucket,
+            version_key = %version_key,
+            error = %e,
+            "swift versioning archive state changed"
+        );
         SwiftError::InternalServerError(format!("Failed to get object info for archiving: {}", e))
     })?;
 
@@ -182,11 +247,33 @@ pub async fn archive_current_version(
         .copy_object(&source_bucket, &source_key, &archive_bucket, &version_key, &mut src_info, &opts, &opts)
         .await
         .map_err(|e| {
-            error!("Failed to copy object to archive: {}", e);
+            error!(
+                event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+                result = "copy_failed",
+                source_bucket = %source_bucket,
+                source_key = %source_key,
+                archive_bucket = %archive_bucket,
+                version_key = %version_key,
+                error = %e,
+                "swift versioning archive state changed"
+            );
             SwiftError::InternalServerError(format!("Failed to archive version: {}", e))
         })?;
 
-    debug!("Successfully archived version to {}/{}", archive_container, version_name);
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_ARCHIVE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        result = "archived",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        version_name = %version_name,
+        "swift versioning archive state changed"
+    );
 
     Ok(())
 }
@@ -220,22 +307,46 @@ pub async fn restore_previous_version(
     credentials: &Credentials,
 ) -> SwiftResult<bool> {
     debug!(
-        "Restoring previous version of {}/{}/{} from {}",
-        account, container, object, archive_container
+        event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        state = "started",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        "swift versioning restore state changed"
     );
 
     // List versions for this object
     let versions = list_object_versions(account, container, object, archive_container, credentials).await?;
 
     if versions.is_empty() {
-        debug!("No versions found to restore");
+        debug!(
+            event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+            result = "not_found",
+            account = %account,
+            container = %container,
+            object = %object,
+            archive_container = %archive_container,
+            "swift versioning restore state changed"
+        );
         return Ok(false);
     }
 
     // Get newest version (first in list, since they're sorted newest-first)
     let newest_version = &versions[0];
 
-    debug!("Restoring version: {}", newest_version);
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        state = "selected",
+        version_name = %newest_version,
+        "swift versioning restore state changed"
+    );
 
     // Validate account and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -250,7 +361,7 @@ pub async fn restore_previous_version(
     let version_key = ObjectKeyMapper::swift_to_s3_key(newest_version)?;
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -261,7 +372,18 @@ pub async fn restore_previous_version(
         .get_object_info(&archive_bucket, &version_key, &opts)
         .await
         .map_err(|e| {
-            error!("Failed to get version object info: {}", e);
+            error!(
+                event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+                result = "version_info_failed",
+                archive_bucket = %archive_bucket,
+                version_key = %version_key,
+                target_bucket = %target_bucket,
+                target_key = %target_key,
+                error = %e,
+                "swift versioning restore state changed"
+            );
             SwiftError::InternalServerError(format!("Failed to get version info for restore: {}", e))
         })?;
 
@@ -278,18 +400,49 @@ pub async fn restore_previous_version(
         )
         .await
         .map_err(|e| {
-            error!("Failed to restore version: {}", e);
+            error!(
+                event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+                result = "copy_failed",
+                archive_bucket = %archive_bucket,
+                version_key = %version_key,
+                target_bucket = %target_bucket,
+                target_key = %target_key,
+                error = %e,
+                "swift versioning restore state changed"
+            );
             SwiftError::InternalServerError(format!("Failed to restore version: {}", e))
         })?;
 
     // Delete the version from archive after successful restore
     store.delete_object(&archive_bucket, &version_key, opts).await.map_err(|e| {
-        error!("Failed to delete archived version after restore: {}", e);
+        error!(
+            event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+            result = "archive_cleanup_failed",
+            archive_bucket = %archive_bucket,
+            version_key = %version_key,
+            error = %e,
+            "swift versioning restore state changed"
+        );
         // Don't fail the restore if deletion fails - object is restored
         SwiftError::InternalServerError(format!("Version restored but cleanup failed: {}", e))
     })?;
 
-    debug!("Successfully restored version from {}", newest_version);
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_RESTORE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        result = "restored",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        version_name = %newest_version,
+        "swift versioning restore state changed"
+    );
 
     Ok(true)
 }
@@ -324,7 +477,17 @@ pub async fn list_object_versions(
     archive_container: &str,
     credentials: &Credentials,
 ) -> SwiftResult<Vec<String>> {
-    debug!("Listing versions of {}/{}/{} in {}", account, container, object, archive_container);
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_LIST_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        state = "started",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        "swift versioning list state changed"
+    );
 
     // Validate account and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -334,7 +497,7 @@ pub async fn list_object_versions(
     let archive_bucket = mapper.swift_to_s3_bucket(archive_container, &project_id);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -359,7 +522,15 @@ pub async fn list_object_versions(
         )
         .await
         .map_err(|e| {
-            error!("Failed to list archive container: {}", e);
+            error!(
+                event = EVENT_SWIFT_VERSIONING_LIST_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+                result = "archive_list_failed",
+                archive_bucket = %archive_bucket,
+                error = %e,
+                "swift versioning list state changed"
+            );
             SwiftError::InternalServerError(format!("Failed to list versions: {}", e))
         })?;
 
@@ -382,7 +553,18 @@ pub async fn list_object_versions(
     // gives us newest first because smaller numbers sort first lexicographically
     versions.sort(); // Ascending sort for inverted timestamps
 
-    debug!("Found {} versions", versions.len());
+    debug!(
+        event = EVENT_SWIFT_VERSIONING_LIST_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_VERSIONING,
+        result = "listed",
+        account = %account,
+        container = %container,
+        object = %object,
+        archive_container = %archive_container,
+        version_count = versions.len(),
+        "swift versioning list state changed"
+    );
 
     Ok(versions)
 }
@@ -516,8 +698,6 @@ mod tests {
             timestamps.insert(ts);
         }
 
-        // Should have at least some unique timestamps
-        // (May not be 100 due to system clock granularity)
-        assert!(timestamps.len() > 1, "Timestamps should be mostly unique");
+        assert_eq!(timestamps.len(), 100, "Version timestamps should be unique");
     }
 }

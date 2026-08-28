@@ -34,6 +34,67 @@ If you want the Kafka-backed HA Tempo path, use `docker-compose-example-for-rust
 - **High Performance**: Optimized configurations for batching, compression, and memory management.
 - **Standardized Protocols**: Built entirely on OpenTelemetry standards.
 
+## GET Performance Optimization Dashboards
+
+Three pre-built Grafana dashboards are included for monitoring RustFS GET performance optimization rollout:
+
+### Available Dashboards
+
+| Dashboard | File | Description |
+|-----------|------|-------------|
+| **GET Rollout Health** | `grafana-get-rollout-health.json` | Monitors optimization rollout: latency by reader path, early-stop hit rate, codec streaming usage, pipeline failures |
+| **GET Data Integrity** | `grafana-get-data-integrity.json` | Monitors data safety: bitrot verify failures, decode errors, short reads, shard read outcomes |
+| **GET Resource Impact** | `grafana-get-resource-impact.json` | Monitors resource usage: concurrent requests, IO queue utilization, disk permit wait, RSS trend |
+| **Object Data Cache** | `grafana-object-data-cache.json` | Monitors the GET body cache (`rustfs_object_data_cache_*`): hit ratio, lookup/plan/fill outcomes, fill duration quantiles, hit vs fill throughput, entries/weighted bytes, inflight fills, memory-pressure skips, invalidations, and size-class breakdowns |
+
+### Prometheus Alert Rules
+
+The file `prometheus-rules/rustfs-get-optimization-alerts.yaml` contains pre-configured alerting rules:
+
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `GetP99Regression` | Critical | GET p99 latency > 2x baseline for 10m |
+| `PipelineFailureSpike` | Critical | Pipeline failure rate > 5x baseline for 5m |
+| `BitrotMismatchSpike` | Critical | Bitrot mismatch rate > 3x baseline for 5m |
+| `EarlyStopInsufficientQuorum` | Warning | Early-stop insufficient quorum rate > 0.1/s for 5m |
+| `CodecStreamingFallbackSpike` | Warning | Codec streaming fallback > 10x baseline for 10m |
+| `IoQueueSaturation` | Warning | IO queue utilization > 90% for 5m |
+
+The file `prometheus-rules/rustfs-kms-alerts.yml` contains alerting rules for the KMS backend operation metrics. Thresholds are conservative defaults pending staging baseline calibration; response procedures live in `docs/operations/kms-observability-runbook.md`, and the matching dashboard is `deploy/observability/grafana/rustfs-kms-observability.json`.
+
+| Alert | Severity | Condition |
+|-------|----------|-----------|
+| `KmsBackendFatalErrors` | Critical | Fatal (non-retryable) attempt failures > 0 for 5m |
+| `KmsBackendHighErrorRate` | Critical | Non-success operation ratio > 5% for 10m (with traffic guard) |
+| `KmsBackendP99LatencyHigh` | Warning | Operation p99 duration (incl. retries) > 2s for 10m |
+| `KmsBackendAttemptFailureSpike` | Warning | Attempt failure rate > 0.5/s for 10m |
+| `KmsBackendRetryBudgetExhausted` | Warning | budget_exhausted / deadline_exceeded outcomes > 0.05/s for 10m |
+
+### Enabling Alert Rules
+
+Add the alert rules file to your Prometheus configuration:
+
+```yaml
+# prometheus.yml
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# Or mount the file in docker-compose.yml:
+# volumes:
+#   - ./prometheus-rules:/etc/prometheus/rules
+```
+
+### Dashboard Usage
+
+The dashboards are automatically provisioned when Grafana starts. They use the `${DS_PROMETHEUS}` datasource variable, so you need a Prometheus datasource configured in Grafana.
+
+Key panels to monitor during optimization rollout:
+
+1. **GET Latency by Reader Path** - Compare `codec_streaming` vs `legacy_duplex` latency
+2. **Early-Stop Hit Rate** - Verify early-stop is triggering effectively
+3. **Pipeline Failure Rate** - Detect any new failure modes introduced by optimizations
+4. **Bitrot Verify Failures** - Ensure data integrity is maintained
+
 ## Quick Start
 
 ### Prerequisites
@@ -89,6 +150,69 @@ docker compose down -v
 - **Prometheus**: Edit `prometheus.yml` to add scrape targets or alerting rules.
 - **Grafana**: Dashboards and datasources are provisioned from the `grafana/` directory.
 - **Collector**: Edit `otel-collector-config.yaml` to modify pipelines, processors, or exporters.
+
+### Verifying RustFS Traces
+
+When RustFS points `RUSTFS_OBS_ENDPOINT` at this stack, treat the value as the
+OTLP/HTTP base URL, for example:
+
+```bash
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+```
+
+RustFS automatically expands that base URL to:
+
+- `/v1/traces`
+- `/v1/metrics`
+- `/v1/logs`
+
+Important behavior notes:
+
+- Logs and metrics usually appear during startup, so seeing those two signals
+  first is expected.
+- The OpenTelemetry bridge sends `tracing` fields as log attributes. Loki stores
+  those attributes as structured metadata, and the Collector also mirrors the
+  common troubleshooting fields into the log line so simple line filters can
+  find them.
+- Visible trace data usually requires real HTTP/S3/gRPC request traffic after
+  startup, because request-path spans are created on demand.
+- `RUSTFS_OBS_LOGGER_LEVEL=info` keeps the top-level request span but filters
+  many nested `debug` spans. If Tempo or Jaeger looks sparse, retry with
+  `RUSTFS_OBS_LOGGER_LEVEL=debug` before suspecting collector or Tempo issues.
+
+Minimal validation flow:
+
+```bash
+# 1. Start this observability stack.
+docker compose up -d
+
+# 2. Start RustFS with OTLP/HTTP export and richer span visibility.
+export RUSTFS_OBS_ENDPOINT=http://host.docker.internal:4318
+export RUSTFS_OBS_LOGGER_LEVEL=debug
+
+# 3. Generate real request traffic.
+curl -I http://127.0.0.1:9000/health
+curl -I http://127.0.0.1:9000/health/ready
+
+# 4. Inspect Grafana or Jaeger.
+# Grafana: http://localhost:3000
+# Jaeger:  http://localhost:16686
+```
+
+For a structured RustFS log such as an inter-node RPC authentication failure,
+the Loki line now includes fields such as `event`, `component`, `subsystem`,
+`failure_reason`, `rpc_service`, `rpc_method`, and `expected_audience`. Useful
+LogQL checks:
+
+```logql
+{service_name="RustFS"} |= "RPC signature verification failed"
+{service_name="RustFS"} |= "failure_reason="
+{service_name="RustFS"} | failure_reason != ""
+```
+
+If logs and metrics are present but traces are sparse, the most common cause is
+"no real request traffic yet" or "`info` level filtered nested spans", not an
+OTLP routing failure.
 
 ## Troubleshooting
 

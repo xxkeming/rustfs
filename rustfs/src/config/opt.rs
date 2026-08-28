@@ -18,7 +18,7 @@
 //! and methods for parsing command line arguments.
 
 use super::Config;
-use super::cli::{Cli, CommandResult, Commands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
+use super::cli::{Cli, CommandResult, Commands, ConnectCommands, ServerOpts, default_server_opts, preprocess_args_for_legacy};
 use crate::apply_external_env_compat;
 use CommandResult::Server;
 use clap::Parser;
@@ -44,10 +44,12 @@ pub struct Opt {
     pub kms_enable: bool,
     pub kms_backend: String,
     pub kms_key_dir: Option<String>,
+    pub kms_local_master_key: Option<String>,
     pub kms_vault_address: Option<String>,
     pub kms_vault_token: Option<String>,
     pub kms_vault_mount_path: Option<String>,
     pub kms_default_key_id: Option<String>,
+    pub kms_allow_insecure_dev_defaults: bool,
     pub buffer_profile_disable: bool,
     pub buffer_profile: String,
 }
@@ -72,10 +74,12 @@ impl Opt {
             kms_enable: o.kms_enable,
             kms_backend: o.kms_backend,
             kms_key_dir: o.kms_key_dir,
+            kms_local_master_key: o.kms_local_master_key,
             kms_vault_address: o.kms_vault_address,
             kms_vault_token: o.kms_vault_token,
             kms_vault_mount_path: o.kms_vault_mount_path,
             kms_default_key_id: o.kms_default_key_id,
+            kms_allow_insecure_dev_defaults: o.kms_allow_insecure_dev_defaults,
             buffer_profile_disable: o.buffer_profile_disable,
             buffer_profile: o.buffer_profile,
         }
@@ -94,10 +98,11 @@ impl Opt {
         let cli = Cli::parse_from(args);
         match cli.command {
             Some(Commands::Server(opts)) => Self::from_server_opts(*opts),
-            Some(Commands::Info(_)) => {
-                // This should not happen in parse_from, as it's handled by parse_command
-                panic!("Info command should be handled by parse_command");
-            }
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Self::from_server_opts(default_server_opts()),
             None => {
                 // Default to server with empty volumes (will be filled from env)
                 Self::from_server_opts(default_server_opts())
@@ -129,6 +134,12 @@ impl Opt {
         };
         match cli.command {
             Some(Commands::Info(opts)) => Ok(CommandResult::Info(opts)),
+            Some(Commands::Tls(opts)) => Ok(CommandResult::Tls(opts)),
+            Some(Commands::Diagnose(opts)) => Ok(CommandResult::Diagnose(opts)),
+            Some(Commands::Inspect(opts)) => Ok(CommandResult::Inspect(opts)),
+            Some(Commands::Connect(opts)) => match opts.command {
+                ConnectCommands::Register(opts) => Ok(CommandResult::ConnectRegister(opts)),
+            },
             Some(Commands::Server(opts)) => Self::server_command_result(Self::from_server_opts(*opts)),
             None => {
                 // Default to server with empty volumes (will be filled from env)
@@ -157,7 +168,11 @@ impl Opt {
         let cli = Cli::try_parse_from(args)?;
         match cli.command {
             Some(Commands::Server(opts)) => Ok(Self::from_server_opts(*opts)),
-            Some(Commands::Info(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
+            Some(Commands::Info(_))
+            | Some(Commands::Tls(_))
+            | Some(Commands::Diagnose(_))
+            | Some(Commands::Inspect(_))
+            | Some(Commands::Connect(_)) => Err(clap::Error::new(clap::error::ErrorKind::DisplayHelp)),
             None => {
                 // Default to server with empty volumes
                 Ok(Self::from_server_opts(default_server_opts()))

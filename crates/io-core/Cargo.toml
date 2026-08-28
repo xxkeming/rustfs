@@ -20,22 +20,29 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 homepage.workspace = true
-description = "Zero-copy core reader and writer implementations for RustFS"
-keywords = ["zero-copy", "reader", "writer", "rustfs"]
+description = "Shared I/O primitives for RustFS (buffer pool, storage profiling, backpressure, deadlock detection)"
+keywords = ["io", "buffer", "pool", "rustfs", "backpressure"]
 categories = ["development-tools", "filesystem"]
 
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-io-metrics/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-io-metrics/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-io-metrics/hotpath-cpu"]
+
 [dependencies]
-bytes = { workspace = true }
+hotpath.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["io-util", "fs", "rt", "sync","io-uring"] }
-memmap2 = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "fs", "sync", "rt-multi-thread"] }
 rustfs-io-metrics = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
 [lib]
 doctest = false

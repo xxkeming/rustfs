@@ -16,7 +16,7 @@ use super::rules_map::RulesMap;
 use super::xml_config::ParseConfigError as BucketNotificationConfigError;
 use crate::rules::NotificationConfiguration;
 use crate::rules::subscriber_snapshot::{BucketRulesSnapshot, DynRulesContainer, RuleEvents, RulesContainer};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use serde::{Deserialize, Serialize};
 use std::io::Read;
@@ -40,7 +40,10 @@ impl RuleEvents for RuleView {
 #[derive(Debug)]
 struct CompiledRules {
     // Keep RulesMap (can be used later if you want to make more complex judgments during the snapshot reading phase)
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "speculative retention: the comment above keeps it for richer snapshot-time judgements that no code performs yet (backlog#1823)"
+    )]
     rules_map: RulesMap,
     // for RulesContainer::iter_rules
     rule_views: Vec<RuleView>,

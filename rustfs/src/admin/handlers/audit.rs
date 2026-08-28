@@ -13,38 +13,145 @@
 // limitations under the License.
 
 use crate::admin::{
-    auth::validate_admin_request,
+    auth::authorize_admin_request,
+    handlers::audit_runtime_config::{load_server_config_from_store, update_audit_config_and_reload},
     handlers::target_descriptor::{
-        AdminTargetSpec, EndpointKey, TargetEndpointSource, admin_target_spec_from_builtin, allowed_target_keys,
-        build_json_response, collect_validated_key_values as shared_collect_validated_key_values,
+        AdminTargetSpec, EndpointKey, RuntimeHealthStatus, TargetEndpointSource, admin_target_spec_from_builtin,
+        build_enabled_target_kvs, build_json_response, collect_runtime_statuses, extract_supported_target_params,
         merge_target_endpoints as shared_merge_target_endpoints, target_module_disabled_reason,
-        target_mutation_block_reason as shared_target_mutation_block_reason, target_service_name, target_spec,
-        validate_target_request,
+        target_mutation_block_reason as shared_target_mutation_block_reason,
     },
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
-    ADMIN_PREFIX, RemoteAddr, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
+    ADMIN_PREFIX, is_audit_module_enabled, refresh_audit_module_enabled, refresh_persisted_module_switches_from_store,
 };
-use futures::stream::{FuturesUnordered, StreamExt};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
-use rustfs_audit::factory::builtin_target_descriptors as builtin_audit_target_descriptors;
-use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
+use rustfs_audit::audit_system;
 use rustfs_config::audit::AUDIT_ROUTE_PREFIX;
-use rustfs_config::{AUDIT_DEFAULT_DIR, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
-use rustfs_ecstore::config::Config;
+use rustfs_config::server_config::Config;
+use rustfs_config::{AUDIT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_targets::catalog::builtin::builtin_audit_target_admin_descriptors;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::LazyLock;
-use tokio::sync::Semaphore;
-use tokio::time::{Duration, timeout};
-use tracing::{Span, warn};
+use tracing::{error, info, warn};
+
+const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
+const LOG_SUBSYSTEM_AUDIT_TARGET: &str = "audit_target";
+const EVENT_ADMIN_REQUEST_REJECTED: &str = "admin_request_rejected";
+const EVENT_ADMIN_REQUEST_FAILED: &str = "admin_request_failed";
+const EVENT_ADMIN_RESPONSE_EMITTED: &str = "admin_response_emitted";
+const EVENT_ADMIN_OPERATION_BLOCKED: &str = "admin_operation_blocked";
+
+macro_rules! log_audit_target_operation_blocked {
+    ($operation:expr, Some($target_type:expr), Some($target_name:expr), $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "blocked",
+            target_type = $target_type,
+            target_name = $target_name,
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+    ($operation:expr, None, None, $reason:expr) => {
+        warn!(
+            event = EVENT_ADMIN_OPERATION_BLOCKED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "blocked",
+            reason = $reason,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_body_read_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = "set_audit_target_config",
+            result = "rejected",
+            reason = "request_body_read_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_body_decode_failed {
+    ($target_type:expr, $target_name:expr, $err:expr) => {
+        warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = "set_audit_target_config",
+            result = "rejected",
+            reason = "request_body_decode_failed",
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request rejected"
+        );
+    };
+}
+
+macro_rules! log_audit_target_config_updated {
+    ($operation:expr, $target_type:expr, $target_name:expr) => {
+        info!(
+            event = EVENT_ADMIN_RESPONSE_EMITTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "success",
+            target_type = $target_type,
+            target_name = $target_name,
+            "admin response emitted"
+        );
+    };
+}
+
+macro_rules! log_audit_target_request_failed {
+    ($operation:expr, $reason:expr, Some($target_type:expr), Some($target_name:expr), $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            target_type = $target_type,
+            target_name = $target_name,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+    ($operation:expr, $reason:expr, None, None, $err:expr) => {
+        error!(
+            event = EVENT_ADMIN_REQUEST_FAILED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = $operation,
+            result = "failed",
+            reason = $reason,
+            error = %$err,
+            "admin request failed"
+        );
+    };
+}
 
 pub fn register_audit_target_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     r.insert(
@@ -84,6 +191,8 @@ struct AuditEndpoint {
     account_id: String,
     service: String,
     status: String,
+    health_state: String,
+    health_reason: String,
     source: TargetEndpointSource,
 }
 
@@ -93,7 +202,7 @@ struct AuditEndpointsResponse {
 }
 
 static AUDIT_TARGET_SPECS: LazyLock<Vec<AdminTargetSpec>> = LazyLock::new(|| {
-    builtin_audit_target_descriptors()
+    builtin_audit_target_admin_descriptors()
         .into_iter()
         .map(|descriptor| admin_target_spec_from_builtin(&descriptor))
         .collect()
@@ -103,29 +212,17 @@ fn audit_target_specs() -> &'static [AdminTargetSpec] {
     &AUDIT_TARGET_SPECS
 }
 
+/// The pre-check keeps these endpoints' historical missing-credentials message;
+/// the shared gate reports "get cred failed".
 async fn authorize_audit_admin_request(req: &S3Request<Body>, action: AdminAction) -> S3Result<()> {
-    let Some(input_cred) = &req.credentials else {
+    if req.credentials.is_none() {
         return Err(s3_error!(InvalidRequest, "credentials not found"));
-    };
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
-    validate_admin_request(&req.headers, &cred, owner, false, vec![Action::AdminAction(action)], remote_addr).await
-}
-
-fn has_any_audit_targets(config: &Config) -> bool {
-    for spec in audit_target_specs() {
-        let Some(targets) = config.0.get(spec.subsystem) else {
-            continue;
-        };
-        if targets.keys().any(|key| key != DEFAULT_DELIMITER) {
-            return true;
-        }
     }
-    false
+    authorize_admin_request(req, vec![Action::AdminAction(action)]).await?;
+    Ok(())
 }
 
-fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> Option<String> {
+fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target_name: &str) -> S3Result<Option<String>> {
     shared_target_mutation_block_reason(
         audit_target_specs(),
         AUDIT_ROUTE_PREFIX,
@@ -139,106 +236,40 @@ fn audit_target_mutation_block_reason(config: &Config, target_type: &str, target
 async fn audit_target_operation_block_reason(action: &str) -> Option<String> {
     if let Err(err) = refresh_persisted_module_switches_from_store().await {
         warn!(
+            event = EVENT_ADMIN_REQUEST_REJECTED,
+            component = LOG_COMPONENT_ADMIN_API,
+            subsystem = LOG_SUBSYSTEM_AUDIT_TARGET,
+            operation = "reload_persisted_module_switches",
+            result = "failed",
             error = %err,
-            "failed to reload persisted module switches before checking audit target operation gating"
+            "admin request rejected"
         );
     }
     refresh_audit_module_enabled();
     target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
 }
 
-fn merge_audit_endpoints(config: &Config, runtime_statuses: HashMap<EndpointKey, String>) -> Vec<AuditEndpoint> {
-    shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)
-        .into_iter()
-        .map(|endpoint| AuditEndpoint {
-            account_id: endpoint.account_id,
-            service: endpoint.service,
-            status: endpoint.status,
-            source: endpoint.source,
-        })
-        .collect()
+fn merge_audit_endpoints(
+    config: &Config,
+    runtime_statuses: HashMap<EndpointKey, RuntimeHealthStatus>,
+) -> S3Result<Vec<AuditEndpoint>> {
+    Ok(
+        shared_merge_target_endpoints(audit_target_specs(), AUDIT_ROUTE_PREFIX, config, runtime_statuses)?
+            .into_iter()
+            .map(|endpoint| AuditEndpoint {
+                account_id: endpoint.account_id,
+                service: endpoint.service,
+                status: endpoint.status,
+                health_state: endpoint.health_state,
+                health_reason: endpoint.health_reason,
+                source: endpoint.source,
+            })
+            .collect(),
+    )
 }
 
 fn extract_target_params<'a>(params: &'a Params<'_, '_>) -> S3Result<(&'a str, &'a str)> {
-    let target_type = params
-        .get("target_type")
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_type'"))?;
-    if target_service_name(audit_target_specs(), target_type).is_none() {
-        return Err(s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type));
-    }
-    let target_name = params
-        .get("target_name")
-        .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'target_name'"))?;
-    Ok((target_type, target_name))
-}
-
-async fn load_server_config_from_store() -> S3Result<Config> {
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-        return Ok(Config::new());
-    };
-
-    rustfs_ecstore::config::com::read_config_without_migrate(store)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))
-}
-
-async fn apply_audit_runtime_config(config: Config) -> S3Result<()> {
-    let has_targets = has_any_audit_targets(&config);
-
-    if let Some(system) = audit_system() {
-        match system.get_state().await {
-            AuditSystemState::Running | AuditSystemState::Paused | AuditSystemState::Starting => {
-                if has_targets {
-                    system
-                        .reload_config(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to reload audit config: {}", e))?;
-                } else {
-                    system
-                        .close()
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to stop audit system: {}", e))?;
-                }
-            }
-            AuditSystemState::Stopped | AuditSystemState::Stopping => {
-                if has_targets {
-                    system
-                        .start(config)
-                        .await
-                        .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
-                }
-            }
-        }
-    } else if has_targets {
-        start_global_audit_system(config)
-            .await
-            .map_err(|e| s3_error!(InternalError, "failed to start audit system: {}", e))?;
-    }
-
-    Ok(())
-}
-
-async fn update_audit_config_and_reload<F>(mut modifier: F) -> S3Result<()>
-where
-    F: FnMut(&mut Config) -> bool,
-{
-    let Some(store) = rustfs_ecstore::global::new_object_layer_fn() else {
-        return Err(s3_error!(InternalError, "server storage not initialized"));
-    };
-
-    let mut config = rustfs_ecstore::config::com::read_config_without_migrate(store.clone())
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to read server config: {}", e))?;
-
-    if !modifier(&mut config) {
-        return Ok(());
-    }
-
-    rustfs_ecstore::config::com::save_server_config(store, &config)
-        .await
-        .map_err(|e| s3_error!(InternalError, "failed to save audit config: {}", e))?;
-
-    apply_audit_runtime_config(config).await
+    extract_supported_target_params(audit_target_specs(), params, "audit")
 }
 
 pub struct AuditTargetConfig {}
@@ -246,59 +277,61 @@ pub struct AuditTargetConfig {}
 #[async_trait::async_trait]
 impl Operation for AuditTargetConfig {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
+            log_audit_target_operation_blocked!("set_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
-        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
+        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
+            log_audit_target_operation_blocked!("set_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
         let mut input = req.input;
         let body_bytes = input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await.map_err(|e| {
-            warn!("failed to read request body: {:?}", e);
+            log_audit_target_body_read_failed!(target_type, target_name, e);
             s3_error!(InvalidRequest, "failed to read request body")
         })?;
 
-        let audit_body: AuditTargetBody = serde_json::from_slice(&body_bytes)
-            .map_err(|e| s3_error!(InvalidArgument, "invalid json body for audit target config: {}", e))?;
+        let audit_body: AuditTargetBody = serde_json::from_slice(&body_bytes).map_err(|e| {
+            log_audit_target_body_decode_failed!(target_type, target_name, e);
+            s3_error!(InvalidArgument, "invalid json body for audit target config: {}", e)
+        })?;
 
         let specs = audit_target_specs();
-        let allowed_keys: HashSet<&str> = allowed_target_keys(specs, target_type);
-
-        let kv_map = shared_collect_validated_key_values(
+        let kvs = build_enabled_target_kvs(
+            specs,
             audit_body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-            &allowed_keys,
             target_type,
+            AUDIT_DEFAULT_DIR,
             "audit target",
-        )?;
+        )
+        .await?;
 
-        let spec = target_spec(specs, target_type)
-            .ok_or_else(|| s3_error!(InvalidArgument, "unsupported audit target type: '{}'", target_type))?;
-        timeout(Duration::from_secs(10), validate_target_request(spec, &kv_map, AUDIT_DEFAULT_DIR))
-            .await
-            .map_err(|_| s3_error!(InvalidArgument, "audit target validation timed out"))??;
-
-        let mut kvs = rustfs_ecstore::config::KVS::new();
-        for (key, value) in kv_map {
-            kvs.insert(key, value);
-        }
-        kvs.insert(ENABLE_KEY.to_string(), EnableState::On.to_string());
-
-        update_audit_config_and_reload(|config| {
+        let mutation_target_type = target_type.to_lowercase();
+        let mutation_target_name = target_name.to_lowercase();
+        update_audit_config_and_reload(audit_target_specs(), move |config| {
             config
                 .0
-                .entry(target_type.to_lowercase())
+                .entry(mutation_target_type.clone())
                 .or_default()
-                .insert(target_name.to_lowercase(), kvs.clone());
+                .insert(mutation_target_name.clone(), kvs.clone());
             true
         })
-        .await?;
+        .await
+        .inspect_err(|e| {
+            log_audit_target_request_failed!(
+                "set_audit_target_config",
+                "update_audit_config_failed",
+                Some(target_type),
+                Some(target_name),
+                e
+            );
+        })?;
+        log_audit_target_config_updated!("set_audit_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -309,37 +342,19 @@ pub struct ListAuditTargets {}
 #[async_trait::async_trait]
 impl Operation for ListAuditTargets {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         authorize_audit_admin_request(&req, AdminAction::GetBucketTargetAction).await?;
 
         let mut runtime_statuses = HashMap::new();
         if let Some(system) = audit_system() {
-            let targets = system.get_target_values().await;
-            let semaphore = Arc::new(Semaphore::new(10));
-            let mut futures = FuturesUnordered::new();
-
-            for target in targets {
-                let sem = Arc::clone(&semaphore);
-                futures.push(async move {
-                    let _permit = sem.acquire().await;
-                    let status = match timeout(Duration::from_secs(3), target.is_active()).await {
-                        Ok(Ok(true)) => "online",
-                        _ => "offline",
-                    };
-                    ((target.id().id, target.id().name), status.to_string())
-                });
-            }
-
-            while let Some((key, status)) = futures.next().await {
-                runtime_statuses.insert(key, status);
-            }
+            runtime_statuses = collect_runtime_statuses(system.get_target_values().await).await;
         }
 
         let config = load_server_config_from_store().await?;
-        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses);
-        let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints })
-            .map_err(|e| s3_error!(InternalError, "failed to serialize audit targets: {}", e))?;
+        let audit_endpoints = merge_audit_endpoints(&config, runtime_statuses)?;
+        let data = serde_json::to_vec(&AuditEndpointsResponse { audit_endpoints }).map_err(|e| {
+            log_audit_target_request_failed!("list_audit_targets", "serialize_audit_targets_failed", None, None, e);
+            s3_error!(InternalError, "failed to serialize audit targets: {}", e)
+        })?;
 
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
@@ -350,32 +365,44 @@ pub struct RemoveAuditTarget {}
 #[async_trait::async_trait]
 impl Operation for RemoveAuditTarget {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let span = Span::current();
-        let _enter = span.enter();
         let (target_type, target_name) = extract_target_params(&params)?;
 
         authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;
         if let Some(reason) = audit_target_operation_block_reason("managing audit targets from the console").await {
+            log_audit_target_operation_blocked!("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
         let config_snapshot = load_server_config_from_store().await?;
-        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name) {
+        if let Some(reason) = audit_target_mutation_block_reason(&config_snapshot, target_type, target_name)? {
+            log_audit_target_operation_blocked!("remove_audit_target_config", Some(target_type), Some(target_name), &reason);
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        update_audit_config_and_reload(|config| {
+        let mutation_target_type = target_type.to_lowercase();
+        let mutation_target_name = target_name.to_lowercase();
+        update_audit_config_and_reload(audit_target_specs(), move |config| {
             let mut changed = false;
-            if let Some(targets) = config.0.get_mut(&target_type.to_lowercase()) {
-                if targets.remove(&target_name.to_lowercase()).is_some() {
+            if let Some(targets) = config.0.get_mut(&mutation_target_type) {
+                if targets.remove(&mutation_target_name).is_some() {
                     changed = true;
                 }
                 if targets.is_empty() {
-                    config.0.remove(&target_type.to_lowercase());
+                    config.0.remove(&mutation_target_type);
                 }
             }
             changed
         })
-        .await?;
+        .await
+        .inspect_err(|e| {
+            log_audit_target_request_failed!(
+                "remove_audit_target_config",
+                "update_audit_config_failed",
+                Some(target_type),
+                Some(target_name),
+                e
+            );
+        })?;
+        log_audit_target_config_updated!("remove_audit_target_config", target_type, target_name);
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -384,10 +411,11 @@ impl Operation for RemoveAuditTarget {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::admin::handlers::target_descriptor::collect_validated_key_values as shared_collect_validated_key_values;
     use matchit::Router;
-    use rustfs_config::ENV_PREFIX;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_WEBHOOK_KEYS, AUDIT_WEBHOOK_SUB_SYS};
-    use rustfs_ecstore::config::{KV, KVS};
+    use rustfs_config::server_config::{KV, KVS};
+    use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX};
     use serial_test::serial;
     use std::collections::{HashMap, HashSet};
     use temp_env::{with_var, with_vars, with_vars_unset};
@@ -398,6 +426,14 @@ mod tests {
             value: value.to_string(),
             hidden_if_empty: false,
         }])
+    }
+
+    fn online_health() -> RuntimeHealthStatus {
+        RuntimeHealthStatus {
+            status: "online".to_string(),
+            state: "online".to_string(),
+            reason: "reachable".to_string(),
+        }
     }
 
     fn with_audit_webhook_target_env_cleared<F>(target_name: &str, f: F)
@@ -444,10 +480,10 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-target".to_string(), "webhook".to_string()), "online".to_string()),
-                    (("env-only".to_string(), "webhook".to_string()), "online".to_string()),
+                    (("mixed-target".to_string(), "webhook".to_string()), online_health()),
+                    (("env-only".to_string(), "webhook".to_string()), online_health()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -487,10 +523,10 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-kafka".to_string(), "kafka".to_string()), "online".to_string()),
-                    (("env-kafka".to_string(), "kafka".to_string()), "online".to_string()),
+                    (("mixed-kafka".to_string(), "kafka".to_string()), online_health()),
+                    (("env-kafka".to_string(), "kafka".to_string()), online_health()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -524,10 +560,10 @@ mod tests {
             ],
             || {
                 let runtime = HashMap::from([
-                    (("mixed-amqp".to_string(), "amqp".to_string()), "online".to_string()),
-                    (("env-amqp".to_string(), "amqp".to_string()), "online".to_string()),
+                    (("mixed-amqp".to_string(), "amqp".to_string()), online_health()),
+                    (("env-amqp".to_string(), "amqp".to_string()), online_health()),
                 ]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
 
                 let mixed = merged
                     .iter()
@@ -554,7 +590,8 @@ mod tests {
             ],
             || {
                 let config = Config(HashMap::new());
-                let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary");
+                let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                    .expect("audit target mutation block reason");
                 assert!(reason.is_some());
                 assert!(reason.unwrap().contains("managed by environment variables"));
             },
@@ -591,7 +628,8 @@ mod tests {
                 AUDIT_WEBHOOK_SUB_SYS.to_string(),
                 HashMap::from([("primary".to_string(), enabled_kvs("on"))]),
             )]));
-            let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary");
+            let reason = audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                .expect("audit target mutation block reason");
             assert!(reason.is_some());
             assert!(reason.unwrap().contains("both persisted config and environment variables"));
         });
@@ -611,7 +649,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_MIXED-DISABLED", Some("https://example.com/hook")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let merged = merge_audit_endpoints(&config, HashMap::new()).expect("merge audit endpoints");
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "mixed-disabled")
@@ -633,7 +671,7 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_ENV-ONLY", Some("https://example.com/env")),
             ],
             || {
-                let merged = merge_audit_endpoints(&config, HashMap::new());
+                let merged = merge_audit_endpoints(&config, HashMap::new()).expect("merge audit endpoints");
                 let env_only = merged
                     .iter()
                     .find(|entry| entry.account_id == "env-only")
@@ -745,8 +783,8 @@ mod tests {
                 ("RUSTFS_AUDIT_WEBHOOK_ENDPOINT_PRIMARYCASE", Some("https://example.com/hook")),
             ],
             || {
-                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), "online".to_string())]);
-                let merged = merge_audit_endpoints(&config, runtime);
+                let runtime = HashMap::from([(("PrimaryCase".to_string(), "webhook".to_string()), online_health())]);
+                let merged = merge_audit_endpoints(&config, runtime).expect("merge audit endpoints");
                 let mixed = merged
                     .iter()
                     .find(|entry| entry.account_id == "PrimaryCase" && entry.service == "webhook")
@@ -765,7 +803,11 @@ mod tests {
         )]));
 
         with_audit_webhook_target_env_cleared("primarycase", || {
-            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase").is_none());
+            assert!(
+                audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primarycase")
+                    .expect("audit target mutation block reason")
+                    .is_none()
+            );
         });
     }
 
@@ -773,8 +815,36 @@ mod tests {
     fn audit_target_mutation_block_reason_allows_runtime_only_target() {
         with_audit_webhook_target_env_cleared("primary", || {
             let config = Config(HashMap::new());
-            assert!(audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary").is_none());
+            assert!(
+                audit_target_mutation_block_reason(&config, AUDIT_WEBHOOK_SUB_SYS, "primary")
+                    .expect("audit target mutation block reason")
+                    .is_none()
+            );
         });
+    }
+
+    /// These endpoints authorize through the shared admin gate, which reports
+    /// "get cred failed" for a credential-less request. The pre-check keeps the
+    /// message they have always returned (rustfs/backlog#1829).
+    #[tokio::test]
+    async fn audit_target_gate_keeps_its_missing_credentials_message() {
+        let req = S3Request {
+            input: Body::from(String::new()),
+            method: Method::PUT,
+            uri: http::Uri::from_static("/rustfs/admin/v3/audit/target"),
+            headers: http::HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+
+        let err = authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction)
+            .await
+            .expect_err("a request without credentials must be rejected");
+        assert_eq!(err.code(), &s3s::S3ErrorCode::InvalidRequest);
+        assert_eq!(err.message(), Some("credentials not found"));
     }
 
     #[test]
@@ -784,6 +854,13 @@ mod tests {
         let list_block =
             extract_block_between_markers(src, "impl Operation for ListAuditTargets", "pub struct RemoveAuditTarget");
         let delete_block = extract_block_between_markers(src, "impl Operation for RemoveAuditTarget", "#[cfg(test)]");
+
+        for block in [put_block, list_block, delete_block] {
+            assert!(
+                !block.contains(".enter()"),
+                "async audit handlers must rely on request-future instrumentation instead of holding span guards across awaits"
+            );
+        }
 
         assert!(
             put_block.contains("authorize_audit_admin_request(&req, AdminAction::SetBucketTargetAction).await?;"),

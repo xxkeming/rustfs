@@ -15,11 +15,25 @@
 pub mod collectors;
 pub mod config;
 pub mod report;
+mod runtime_sources;
 pub mod scheduler;
 pub mod schema;
 pub mod stats_collector;
+mod storage_api;
 
 pub use collectors::*;
 pub use config::*;
 pub use report::{PrometheusMetric, report_metrics};
-pub use scheduler::{init_metrics_collectors, init_metrics_runtime};
+pub use scheduler::{
+    MetricsRuntimeCancellationSource, MetricsRuntimeController, MetricsRuntimeControllerSnapshot, MetricsRuntimeDesiredSnapshot,
+    MetricsRuntimeDesiredState, MetricsRuntimeIntervalsSnapshot, MetricsRuntimeReconcilePlan, MetricsRuntimeServiceState,
+    MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_runtime,
+    metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
+};
+pub(crate) use storage_api::metrics::{
+    BucketOperations, BucketOptions, ObsBucketBandwidthMonitor, ObsBucketReplicationStatsSnapshot, ObsEcstoreResult, ObsStore,
+    StorageAdminApi, obs_bucket_replication_stats_snapshot, obs_expiry_state_handle, obs_get_global_bucket_monitor,
+    obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free, obs_is_disk_compression_enabled,
+    obs_load_compression_total_from_memory, obs_load_data_usage_from_backend, obs_replication_site_stats_snapshot,
+    obs_resolve_object_store_handle, obs_transition_state_handle,
+};

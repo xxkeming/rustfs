@@ -17,6 +17,7 @@ use crate::common::gateway::S3Action;
 use crate::common::gateway::authorize_operation;
 use async_trait::async_trait;
 use futures_util::stream;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
 use s3s::dto::*;
 use std::fmt::Debug;
@@ -24,6 +25,35 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncRead;
 use tracing::{debug, error};
 use unftp_core::storage::{Error, ErrorKind, Fileinfo, Metadata, Result, StorageBackend};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_FTPS_DRIVER: &str = "ftps_driver";
+const EVENT_FTPS_BUCKET_DELETE_FAILED: &str = "ftps_bucket_delete_failed";
+const EVENT_FTPS_METADATA_FAILED: &str = "ftps_metadata_failed";
+const EVENT_FTPS_LIST_FAILED: &str = "ftps_list_failed";
+const EVENT_FTPS_STREAM_READ_FAILED: &str = "ftps_stream_read_failed";
+const EVENT_FTPS_OBJECT_GET_FAILED: &str = "ftps_object_get_failed";
+const EVENT_FTPS_OBJECT_PUT_FAILED: &str = "ftps_object_put_failed";
+const EVENT_FTPS_OBJECT_DELETE_STATE: &str = "ftps_object_delete_state";
+const EVENT_FTPS_DIRECTORY_STATE: &str = "ftps_directory_state";
+const EVENT_FTPS_CWD_FAILED: &str = "ftps_cwd_failed";
+const EVENT_FTPS_RENAME_STATE: &str = "ftps_rename_state";
+
+fn parse_s3_path(path_input: &str) -> std::result::Result<(String, Option<String>), String> {
+    if path_input.chars().any(char::is_control) {
+        return Err("control characters are not allowed in FTPS paths".to_string());
+    }
+
+    let cleaned_path = path::clean(path_input);
+    let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
+
+    if object.contains(path::GLOBAL_DIR_SUFFIX) {
+        return Err("internal directory marker is not allowed in FTPS paths".to_string());
+    }
+
+    let key = if object.is_empty() { None } else { Some(object) };
+    Ok((bucket, key))
+}
 
 /// FTPS metadata implementation
 #[derive(Debug, Clone)]
@@ -134,20 +164,19 @@ where
         }
     }
 
-    fn parse_s3_path(&self, path: &str) -> std::result::Result<(String, Option<String>), String> {
-        let cleaned_path = path::clean(path);
-        let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
-        let key = if object.is_empty() { None } else { Some(object) };
-
-        Ok((bucket, key))
-    }
-
     /// Recursively delete all objects in a bucket, then delete the bucket itself.
     async fn delete_bucket_recursively(
         &self,
         bucket: &str,
         session_context: &crate::common::session::SessionContext,
     ) -> Result<()> {
+        // SECURITY: s3:DeleteBucket does not imply the right to destroy the
+        // bucket contents. Enumerating and deleting each object are separate
+        // authorization boundaries and must be cleared on their own.
+        authorize_operation(session_context, &S3Action::ListBucket, bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -174,6 +203,10 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
+                            authorize_operation(session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                                .await
+                                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
                             let _ = self
                                 .storage
                                 .delete_object(
@@ -210,7 +243,14 @@ where
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
             Err(e) => {
-                error!("Failed to delete bucket '{}': {}", bucket, e);
+                error!(
+                    event = EVENT_FTPS_BUCKET_DELETE_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps bucket delete failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete bucket failed: {}", e)))
             }
         }
@@ -228,11 +268,15 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
+            // Authorize HeadObject
+            authorize_operation(session_context, &S3Action::HeadObject, &bucket, Some(&key))
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
             match self
                 .storage
                 .head_object(
@@ -258,12 +302,26 @@ where
                     })
                 }
                 Err(e) => {
-                    error!("Failed to get metadata for '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "ftps metadata failed"
+                    );
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Metadata failed", e)))
                 }
             }
         } else {
             // Directory metadata - use HeadBucket
+            // Authorize HeadBucket
+            authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+                .await
+                .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
+
             let bucket_clone = bucket.clone();
             match self
                 .storage
@@ -280,7 +338,15 @@ where
                     is_dir: true,
                 }),
                 Err(e) => {
-                    error!("Failed to get bucket metadata for '{}': {}", bucket_clone, e);
+                    error!(
+                        event = EVENT_FTPS_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        path = %path_str,
+                        bucket = %bucket_clone,
+                        error = %e,
+                        "ftps metadata failed"
+                    );
                     Err(Error::new(
                         ErrorKind::PermanentFileNotAvailable,
                         format!("{}: {}", "Bucket metadata failed", e),
@@ -305,8 +371,7 @@ where
             return self.list_buckets(session_context).await;
         }
 
-        let (bucket, prefix) = self
-            .parse_s3_path(&path_str)
+        let (bucket, prefix) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize the operation
@@ -314,9 +379,7 @@ where
             .await
             .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
-        let prefix_with_slash = prefix
-            .clone()
-            .map(|p| if p.ends_with('/') { p.to_string() } else { format!("{}/", p) });
+        let prefix_with_slash = prefix.clone().map(|p| if p.ends_with('/') { p } else { format!("{}/", p) });
 
         let list_input = ListObjectsV2Input::builder()
             .bucket(bucket)
@@ -413,7 +476,15 @@ where
                 Ok(fileinfos)
             }
             Err(e) => {
-                error!("Failed to list '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    path = %path_str,
+                    bucket = %prefix_with_slash.unwrap_or_default(),
+                    error = %e,
+                    "ftps list failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "List failed", e)))
             }
         }
@@ -427,12 +498,17 @@ where
     ) -> Result<Box<dyn AsyncRead + Send + Sync + Unpin>> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
+        let masked_username = MaskedAccessKey(&user.username);
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot get directory"))?;
+
+        // Authorize GetObject
+        authorize_operation(session_context, &S3Action::GetObject, &bucket, Some(&key))
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         match self
             .storage
@@ -457,7 +533,17 @@ where
                     match chunk_result {
                         Ok(bytes) => data.extend_from_slice(&bytes),
                         Err(e) => {
-                            error!("Error reading stream: {}", e);
+                            error!(
+                                event = EVENT_FTPS_STREAM_READ_FAILED,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                                username = %masked_username,
+                                path = %path_str,
+                                bucket = %bucket,
+                                object = %key,
+                                error = %e,
+                                "ftps stream read failed"
+                            );
                             return Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Stream error: {}", e)));
                         }
                     }
@@ -466,7 +552,18 @@ where
                 Ok(Box::new(std::io::Cursor::new(data)))
             }
             Err(e) => {
-                error!("Failed to get '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_OBJECT_GET_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    object = %key,
+                    start_pos,
+                    error = %e,
+                    "ftps object get failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Get failed", e)))
             }
         }
@@ -481,9 +578,9 @@ where
     ) -> Result<u64> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
+        let masked_username = MaskedAccessKey(&user.username);
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         let key = key.ok_or_else(|| Error::new(ErrorKind::PermanentFileNotAvailable, "Cannot put to directory"))?;
@@ -540,7 +637,18 @@ where
                 Ok(file_size as u64) // Return the size of the uploaded object
             }
             Err(e) => {
-                error!("FTPS put - S3 error details: {:?}", e);
+                error!(
+                    event = EVENT_FTPS_OBJECT_PUT_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    object = %key,
+                    file_size,
+                    error = ?e,
+                    "ftps object put failed"
+                );
                 Err(Error::new(
                     ErrorKind::PermanentFileNotAvailable,
                     format!("Failed to upload object: {:?}", e),
@@ -552,10 +660,18 @@ where
     async fn del<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
-        debug!("FTPS delete request for user '{}' path '{}'", user.username, path_str);
+        let masked_username = MaskedAccessKey(&user.username);
+        debug!(
+            event = EVENT_FTPS_OBJECT_DELETE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "requested",
+            username = %masked_username,
+            path = %path_str,
+            "FTPS delete requested"
+        );
 
-        let (bucket, key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         if let Some(key) = key {
@@ -577,7 +693,18 @@ where
             {
                 Ok(_) => Ok(()),
                 Err(e) => {
-                    error!("Failed to delete file '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "delete_failed",
+                        username = %masked_username,
+                        path = %path_str,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "ftps object delete state changed"
+                    );
                     Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Delete failed: {}", e)))
                 }
             }
@@ -600,11 +727,25 @@ where
     async fn mkd<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, path: P) -> Result<()> {
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
-        debug!("FTPS mkdir request for user '{}' path '{}'", user.username, path_str);
+        let masked_username = MaskedAccessKey(&user.username);
+        debug!(
+            event = EVENT_FTPS_DIRECTORY_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "create_requested",
+            username = %masked_username,
+            path = %path_str,
+            "ftps directory state changed"
+        );
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
+
+        // MKD creates a bucket, so it has to clear the same authorization boundary as
+        // an S3 CreateBucket call.
+        authorize_operation(session_context, &S3Action::CreateBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Create bucket for directory
         match self
@@ -617,11 +758,30 @@ where
             .await
         {
             Ok(_) => {
-                debug!("Successfully created directory/bucket '{}'", path_str);
+                debug!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "created",
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    "FTPS directory created"
+                );
                 Ok(())
             }
             Err(e) => {
-                error!("Failed to create directory/bucket '{}': {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "create_failed",
+                    username = %masked_username,
+                    path = %path_str,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps directory state changed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("Mkdir failed: {}", e)))
             }
         }
@@ -631,8 +791,7 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
 
         // Authorize delete bucket
@@ -643,17 +802,41 @@ where
         // Try to delete bucket recursively
         match self.delete_bucket_recursively(&bucket, session_context).await {
             Ok(_) => {
-                debug!("Successfully removed directory/bucket '{}'", path_str);
+                debug!(
+                    event = EVENT_FTPS_DIRECTORY_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    state = "removed",
+                    path = %path_str,
+                    bucket = %bucket,
+                    "FTPS directory removed"
+                );
                 Ok(())
             }
             Err(e) => {
                 // Check if error is NoSuchBucket - treat as success (idempotent)
                 let error_msg = e.to_string();
                 if error_msg.contains("NoSuchBucket") || error_msg.contains("does not exist") {
-                    debug!("Bucket '{}' already deleted", bucket);
+                    debug!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "already_removed",
+                        bucket = %bucket,
+                        "FTPS directory already removed"
+                    );
                     Ok(())
                 } else {
-                    error!("Failed to remove directory/bucket '{}': {}", path_str, e);
+                    error!(
+                        event = EVENT_FTPS_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                        state = "remove_failed",
+                        path = %path_str,
+                        bucket = %bucket,
+                        error = %e,
+                        "ftps directory state changed"
+                    );
                     Err(e)
                 }
             }
@@ -664,9 +847,13 @@ where
         let path_str = path.as_ref().to_string_lossy();
         let session_context = &user.session_context;
 
-        let (bucket, _key) = self
-            .parse_s3_path(&path_str)
+        let (bucket, _key) = parse_s3_path(&path_str)
             .map_err(|e| Error::new(ErrorKind::PermanentFileNotAvailable, format!("{}: {}", "Invalid path", e)))?;
+
+        // Authorize HeadBucket (CWD probes bucket existence)
+        authorize_operation(session_context, &S3Action::HeadBucket, &bucket, None)
+            .await
+            .map_err(|_| Error::new(ErrorKind::PermanentFileNotAvailable, "Access denied"))?;
 
         // Check if bucket exists
         match self
@@ -680,7 +867,15 @@ where
         {
             Ok(_) => Ok(()),
             Err(e) => {
-                error!("CWD to '{}' failed: {}", path_str, e);
+                error!(
+                    event = EVENT_FTPS_CWD_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+                    path = %path_str,
+                    bucket = %bucket,
+                    error = %e,
+                    "ftps cwd failed"
+                );
                 Err(Error::new(ErrorKind::PermanentFileNotAvailable, format!("CWD failed: {}", e)))
             }
         }
@@ -689,11 +884,133 @@ where
     async fn rename<P: AsRef<Path> + Send>(&self, user: &super::server::FtpsUser, from: P, to: P) -> Result<()> {
         let from_str = from.as_ref().to_string_lossy();
         let to_str = to.as_ref().to_string_lossy();
-        debug!("FTPS rename request for user '{}' from '{}' to '{}'", user.username, from_str, to_str);
+        debug!(
+            event = EVENT_FTPS_RENAME_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_FTPS_DRIVER,
+            state = "unsupported",
+            username = %MaskedAccessKey(&user.username),
+            from = %from_str,
+            to = %to_str,
+            "FTPS rename unsupported"
+        );
 
         Err(Error::new(
             ErrorKind::CommandNotImplemented,
             "Rename operation not supported in S3 backend",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_s3_path;
+    use rustfs_utils::path;
+
+    /// GHSA-g3vq-vv42-f647: MKD creates a bucket, so it must clear the
+    /// `s3:CreateBucket` authorization boundary before touching the backend.
+    /// The queued success is what makes this a real guard — an unqueued
+    /// create_bucket would fail on its own and the test would pass even if the
+    /// authorization check were removed again.
+    #[tokio::test]
+    async fn ghsa_g3vq_mkd_denied_before_reaching_backend() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::with_test_auth_override;
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_create_bucket_ok();
+
+        let driver = FtpsDriver::new(backend);
+        let user = super::super::server::FtpsUser {
+            username: "denied-user".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let result = with_test_auth_override(|_, _, _| false, driver.mkd(&user, "/denied-bucket")).await;
+
+        assert!(
+            result.is_err(),
+            "MKD must fail closed when authorization denies s3:CreateBucket, even though the backend was primed to succeed"
+        );
+    }
+
+    /// RMD deletes every object in the bucket, so `s3:DeleteBucket` alone must
+    /// not be enough: each object needs its own `s3:DeleteObject` boundary. The
+    /// backend is primed so that the whole recursive delete would succeed if the
+    /// per-object check were removed again.
+    #[tokio::test]
+    async fn ftps_rmd_denied_per_object_does_not_delete_bucket_contents() {
+        use super::FtpsDriver;
+        use crate::common::dummy_storage::DummyBackend;
+        use crate::common::gateway::{S3Action, with_test_auth_override};
+        use crate::common::session::{Protocol, test_session};
+        use unftp_core::storage::StorageBackend as _;
+
+        let backend = DummyBackend::new();
+        backend.queue_list_objects_v2_ok_with_keys(&["secret.txt"]);
+        backend.queue_delete_object_ok();
+        backend.queue_delete_bucket_ok();
+
+        let driver = FtpsDriver::new(backend.clone());
+        let user = super::super::server::FtpsUser {
+            username: "bucket-only-user".to_string(),
+            name: None,
+            session_context: test_session(Protocol::Ftps),
+        };
+
+        let result = with_test_auth_override(
+            |action, _bucket, _object| !matches!(action, S3Action::DeleteObject),
+            driver.rmd(&user, "/victim-bucket"),
+        )
+        .await;
+
+        assert!(result.is_err(), "RMD must fail closed when s3:DeleteObject is denied for a bucket member");
+        assert!(
+            backend.delete_object_calls().is_empty(),
+            "no object may be deleted once s3:DeleteObject is denied, got {:?}",
+            backend.delete_object_calls()
+        );
+        assert!(
+            backend.delete_bucket_calls().is_empty(),
+            "the bucket must survive when its contents could not be authorized for deletion"
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn parse_s3_path_never_leaks_control_bytes_or_traversal_in_ok_output(
+            input in proptest::prelude::any::<String>(),
+        ) {
+            match parse_s3_path(&input) {
+                Err(_) => {}
+                Ok((bucket, key)) => {
+                    proptest::prop_assert!(!bucket.contains('/'));
+                    proptest::prop_assert!(!bucket.chars().any(char::is_control));
+
+                    if let Some(k) = key.as_deref() {
+                        proptest::prop_assert!(!k.chars().any(char::is_control));
+                        proptest::prop_assert!(!k.starts_with('/'));
+                        proptest::prop_assert!(!k.split('/').any(|segment| segment == ".."));
+                        proptest::prop_assert!(!k.contains(path::GLOBAL_DIR_SUFFIX));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_s3_path_rejects_control_bytes() {
+        assert!(parse_s3_path("/bucket/line\rfeed").is_err());
+        assert!(parse_s3_path("/bucket/line\nfeed").is_err());
+        assert!(parse_s3_path("/bucket/tab\tname").is_err());
+    }
+
+    #[test]
+    fn parse_s3_path_rejects_internal_directory_marker() {
+        assert!(parse_s3_path("/bucket/__XLDIR__").is_err());
     }
 }

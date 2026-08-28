@@ -12,7 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::{
+    Bytes, DATA_MOVEMENT_MULTIPART_PREFIX, DiskError, DiskStore, FileInfo, HashMap, HashSet, OBJECT_OP_IGNORED_ERRS, ObjProps,
+    OffsetDateTime, SetDisks, Sha256, TRANSITION_COMPLETE, Uuid, debug, disk, error, file_info_is_valid_for_metadata, hex,
+    reduce_read_quorum_errs, warn,
+};
+#[cfg(test)]
+use crate::disk::DiskOption;
+#[cfg(test)]
+use crate::disk::endpoint::Endpoint;
+#[cfg(test)]
+use crate::disk::new_disk;
+use rustfs_utils::http;
+use sha2::Digest;
+
+#[derive(Clone, Copy)]
+struct FileInfoIdentityGroup {
+    hash: [u8; 32],
+    count: usize,
+    mod_time: Option<OffsetDateTime>,
+}
 
 impl SetDisks {
     pub(super) fn all_not_found_metadata(errs: &[Option<DiskError>]) -> bool {
@@ -37,10 +56,10 @@ impl SetDisks {
             })
     }
 
-    pub(super) fn reduce_common_data_dir(data_dirs: &Vec<Option<Uuid>>, write_quorum: usize) -> Option<Uuid> {
+    pub(super) fn reduce_common_data_dir(data_dirs: &[Option<Uuid>], write_quorum: usize) -> Option<Uuid> {
         let mut data_dirs_count = HashMap::new();
 
-        for ddir in data_dirs {
+        for ddir in data_dirs.iter().flatten().copied() {
             *data_dirs_count.entry(ddir).or_insert(0) += 1;
         }
 
@@ -49,7 +68,7 @@ impl SetDisks {
         for (ddir, count) in data_dirs_count {
             if count > max {
                 max = count;
-                data_dir = *ddir;
+                data_dir = Some(ddir);
             }
         }
 
@@ -75,6 +94,15 @@ impl SetDisks {
             .unwrap_or_default();
 
         format!("{}/{}", Self::get_multipart_sha_dir(bucket, object), upload_uuid)
+    }
+
+    pub(super) fn get_multipart_upload_dir(bucket: &str, object: &str, upload_id: &str, data_movement: bool) -> String {
+        let upload_dir = Self::get_upload_id_dir(bucket, object, upload_id);
+        if data_movement {
+            format!("{DATA_MOVEMENT_MULTIPART_PREFIX}/{upload_dir}")
+        } else {
+            upload_dir
+        }
     }
 
     pub(super) fn get_multipart_sha_dir(bucket: &str, object: &str) -> String {
@@ -227,7 +255,8 @@ impl SetDisks {
 
     pub(super) fn list_object_parities(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> Vec<i32> {
         let total_shards = parts_metadata.len();
-        let half = total_shards as i32 / 2;
+        let total_shards_i32 = i32::try_from(total_shards).unwrap_or(i32::MAX);
+        let half = total_shards_i32 / 2;
         let mut parities: Vec<i32> = vec![-1; total_shards];
 
         for (index, metadata) in parts_metadata.iter().enumerate() {
@@ -236,18 +265,31 @@ impl SetDisks {
                 continue;
             }
 
-            if !metadata.is_valid() {
+            if !file_info_is_valid_for_metadata(metadata) {
                 parities[index] = -1;
                 continue;
             }
 
-            if metadata.deleted || metadata.size == 0 {
-                parities[index] = half;
-            // } else if metadata.transition_status == "TransitionComplete" {
-            // TODO: metadata.transition_status
-            //     parities[index] = total_shards - (total_shards / 2 + 1);
+            // A parity count outside [0, total_shards] cannot describe a real
+            // layout on this set: it comes from corrupt or foreign metadata
+            // (e.g. stray leftovers, rustfs#5801). Treat the entry as invalid
+            // instead of clamping to i32::MAX, which would poison
+            // `common_parity`'s occurrence counting.
+            let erasure_parity = i32::try_from(metadata.erasure.parity_blocks).unwrap_or(-1);
+            let erasure_parity = if (0..=total_shards_i32).contains(&erasure_parity) {
+                erasure_parity
             } else {
-                parities[index] = metadata.erasure.parity_blocks as i32;
+                -1
+            };
+            if metadata.is_canonical_delete_marker() || metadata.size == 0 {
+                parities[index] = half;
+            } else if erasure_parity < 0 {
+                parities[index] = -1;
+            } else if metadata.transition_status == TRANSITION_COMPLETE {
+                let majority_metadata_parity = total_shards_i32 - (half + 1);
+                parities[index] = majority_metadata_parity.max(erasure_parity);
+            } else {
+                parities[index] = erasure_parity;
             }
         }
         parities
@@ -284,6 +326,19 @@ impl SetDisks {
         let parity_blocks = Self::common_parity(&parities, default_parity_count as i32);
 
         if parity_blocks < 0 {
+            // No parity value reached read quorum. Distinguish two cases:
+            // enough disks answered with valid-looking metadata that simply
+            // cannot be reconciled (corrupt/foreign entries — retrying cannot
+            // help, and heal should see Corrupt, rustfs#5801) versus too few
+            // healthy answers (a genuine quorum condition where retry may
+            // succeed once disks recover).
+            let healthy_replies = errs.iter().filter(|err| err.is_none()).count();
+            if healthy_replies >= expected_rquorum {
+                error!(
+                    "object_quorum_from_meta: irreconcilable parity across {healthy_replies} healthy replies (corrupt metadata), errs={errs:?}"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
             error!("object_quorum_from_meta: parity_blocks < 0, errs={:?}", errs);
             return Err(DiskError::ErasureReadQuorum);
         }
@@ -317,7 +372,7 @@ impl SetDisks {
                 for (i, etag_item) in etags.iter().enumerate() {
                     if let Some(etag_item) = etag_item
                         && etag_item == &etag
-                        && parts_metadata[i].is_valid()
+                        && file_info_is_valid_for_metadata(&parts_metadata[i])
                     {
                         new_disk[i].clone_from(&disks[i]);
                     }
@@ -330,12 +385,96 @@ impl SetDisks {
         let mut new_disk = vec![None; disks.len()];
 
         for (i, &t) in mod_times.iter().enumerate() {
-            if parts_metadata[i].is_valid() && mod_time == t {
+            if file_info_is_valid_for_metadata(&parts_metadata[i]) && mod_time == t {
                 new_disk[i].clone_from(&disks[i]);
             }
         }
 
         (new_disk, mod_time, None)
+    }
+
+    fn usable_fileinfo_count(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> (usize, bool) {
+        let mut has_read_error = false;
+        let mut usable_metadata = 0;
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() {
+                has_read_error = true;
+                continue;
+            }
+
+            if file_info_is_valid_for_metadata(meta) {
+                usable_metadata += 1;
+            }
+        }
+
+        (usable_metadata, has_read_error)
+    }
+
+    pub(super) fn latest_fileinfo_selection_quorum(
+        version_id: &str,
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> usize {
+        if !version_id.is_empty() || write_quorum <= read_quorum {
+            return read_quorum;
+        }
+
+        let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
+
+        if usable_metadata < write_quorum {
+            return read_quorum;
+        }
+
+        if !has_read_error {
+            return write_quorum;
+        }
+
+        let mut identity_counts = HashMap::with_capacity(usable_metadata);
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) {
+                continue;
+            }
+
+            let key = Self::file_info_quorum_hash(meta);
+
+            let count = identity_counts.entry(key).or_insert(0);
+            *count += 1;
+            if *count >= write_quorum {
+                return write_quorum;
+            }
+        }
+
+        read_quorum
+    }
+
+    pub(super) fn select_valid_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        version_id: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo, usize)> {
+        let selection_quorum =
+            Self::latest_fileinfo_selection_quorum(version_id, parts_metadata, errs, read_quorum, write_quorum);
+        let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
+
+        if version_id.is_empty()
+            && write_quorum > read_quorum
+            && has_read_error
+            && usable_metadata >= write_quorum
+            && selection_quorum == read_quorum
+        {
+            let (online_disks, fi) = Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum)?;
+            return Ok((online_disks, fi, read_quorum));
+        }
+
+        let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, selection_quorum);
+        let fi = Self::pick_valid_fileinfo(parts_metadata, mod_time, etag, selection_quorum)?;
+
+        Ok((online_disks, fi, selection_quorum))
     }
 
     pub(super) fn pick_valid_fileinfo(
@@ -345,6 +484,322 @@ impl SetDisks {
         quorum: usize,
     ) -> disk::error::Result<FileInfo> {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
+    }
+
+    pub(crate) fn hydrate_selected_fileinfo_part_checksums(fi: &mut FileInfo) -> disk::error::Result<()> {
+        fi.hydrate_data_movement_part_checksums().map_err(DiskError::from)?;
+        for part in &fi.parts {
+            let Some(checksums) = part.checksums.as_ref() else {
+                continue;
+            };
+            let mut algorithms = HashSet::with_capacity(checksums.len());
+            for (name, value) in checksums {
+                let Some(checksum) = rustfs_rio::Checksum::new_from_string(name, value) else {
+                    return Err(DiskError::FileCorrupt);
+                };
+                if checksum.checksum_type.is(rustfs_rio::ChecksumType::MULTIPART) {
+                    return Err(DiskError::FileCorrupt);
+                }
+                if !algorithms.insert(checksum.checksum_type.base().0) {
+                    return Err(DiskError::FileCorrupt);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(value.len().to_le_bytes());
+        hasher.update(value);
+    }
+
+    fn update_hash_str(hasher: &mut Sha256, value: &str) {
+        Self::update_hash_bytes(hasher, value.as_bytes());
+    }
+
+    fn update_hash_optional_uuid(hasher: &mut Sha256, value: Option<Uuid>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_time(hasher: &mut Sha256, value: Option<OffsetDateTime>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_u32(hasher: &mut Sha256, value: Option<u32>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_bytes(hasher: &mut Sha256, value: Option<&Bytes>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            Self::update_hash_bytes(hasher, value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            Self::update_hash_str(hasher, value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn file_info_has_encryption_metadata(meta: &FileInfo) -> bool {
+        meta.metadata.keys().any(|name| http::is_object_encryption_marker(name))
+    }
+
+    fn internal_metadata_suffix(name: &str) -> Option<&str> {
+        name.get(http::RUSTFS_INTERNAL_PREFIX.len()..)
+            .filter(|_| http::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
+            .or_else(|| {
+                name.get(http::MINIO_INTERNAL_PREFIX.len()..)
+                    .filter(|_| http::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
+            })
+    }
+
+    fn is_replication_quorum_metadata_key(name: &str) -> bool {
+        if name.eq_ignore_ascii_case(http::AMZ_BUCKET_REPLICATION_STATUS) {
+            return true;
+        }
+
+        let Some(suffix) = Self::internal_metadata_suffix(name) else {
+            return false;
+        };
+
+        suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICA_STATUS)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICA_TIMESTAMP)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_STATUS)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+            // Raw compatibility keys are normalized and hashed separately below.
+            || http::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_DELETE_MARKER_VERSION_ARN_PREFIX)
+    }
+
+    fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
+        let mut entries = entries
+            .iter()
+            .filter(|(name, _)| !Self::is_replication_quorum_metadata_key(name))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(entries.len().to_le_bytes());
+        for (name, value) in entries {
+            Self::update_hash_str(hasher, name);
+            Self::update_hash_str(hasher, value);
+        }
+    }
+
+    pub(crate) fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        Self::update_file_info_quorum_hash(&mut hasher, meta);
+        let digest = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(digest.as_slice());
+        key
+    }
+
+    /// Hash the per-target delete-marker versions through their normalized form
+    /// so the dual internal prefixes carrying the same mapping share one
+    /// identity, while a genuine disagreement between disks still changes the
+    /// hash and surfaces as a quorum difference.
+    fn update_hash_target_delete_marker_versions(hasher: &mut Sha256, metadata: &HashMap<String, String>) {
+        let (versions, corrupt) = http::target_delete_marker_versions(metadata);
+        hasher.update([u8::from(corrupt)]);
+        let mut versions = versions.iter().collect::<Vec<_>>();
+        versions.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(versions.len().to_le_bytes());
+        for (arn, version_id) in versions {
+            Self::update_hash_str(hasher, arn);
+            Self::update_hash_str(hasher, version_id);
+        }
+    }
+
+    fn update_file_info_quorum_hash(hasher: &mut Sha256, meta: &FileInfo) {
+        hasher.update(meta.size.to_le_bytes());
+        hasher.update([u8::from(meta.deleted), u8::from(meta.mark_deleted)]);
+        hasher.update([u8::from(meta.expire_restored)]);
+        hasher.update([
+            u8::from(meta.is_remote()),
+            u8::from(Self::file_info_has_encryption_metadata(meta)),
+            u8::from(meta.is_compressed()),
+        ]);
+        Self::update_hash_optional_time(hasher, meta.mod_time);
+        Self::update_hash_str(hasher, &meta.transition_status);
+        Self::update_hash_str(hasher, &meta.transition_tier);
+        Self::update_hash_str(hasher, &meta.transitioned_objname);
+        Self::update_hash_optional_uuid(hasher, meta.transition_version_id);
+        Self::update_hash_optional_str(hasher, meta.transition_version.as_deref());
+        hasher.update([match meta.transition_version_state {
+            rustfs_filemeta::TransitionVersionState::Unknown => 0,
+            rustfs_filemeta::TransitionVersionState::KnownDisabled => 1,
+            rustfs_filemeta::TransitionVersionState::SuspendedNull => 2,
+            rustfs_filemeta::TransitionVersionState::Exact => 3,
+        }]);
+        Self::update_hash_optional_u32(hasher, meta.mode);
+        Self::update_hash_optional_u64(hasher, meta.written_by_version);
+
+        Self::update_hash_optional_uuid(hasher, meta.version_id);
+        Self::update_hash_optional_uuid(hasher, meta.data_dir);
+
+        Self::update_hash_optional_bytes(hasher, meta.checksum.as_ref());
+
+        Self::update_hash_quorum_metadata_map(hasher, &meta.metadata);
+        Self::update_hash_target_delete_marker_versions(hasher, &meta.metadata);
+
+        hasher.update(meta.parts.len().to_le_bytes());
+        for part in meta.parts.iter() {
+            hasher.update(part.number.to_le_bytes());
+            hasher.update(part.size.to_le_bytes());
+            hasher.update(part.actual_size.to_le_bytes());
+            Self::update_hash_str(hasher, &part.etag);
+
+            Self::update_hash_optional_time(hasher, part.mod_time);
+
+            Self::update_hash_optional_bytes(hasher, part.index.as_ref());
+            Self::update_hash_optional_str(hasher, part.error.as_deref());
+
+            if let Some(checksums) = &part.checksums {
+                let mut checksum_entries = checksums.iter().collect::<Vec<_>>();
+                checksum_entries.sort_by(|left, right| left.0.cmp(right.0));
+                hasher.update(checksum_entries.len().to_le_bytes());
+                for (name, value) in checksum_entries {
+                    Self::update_hash_str(hasher, name);
+                    Self::update_hash_str(hasher, value);
+                }
+            } else {
+                hasher.update(0usize.to_le_bytes());
+            }
+        }
+
+        if !meta.is_canonical_delete_marker() && meta.size != 0 {
+            hasher.update(meta.erasure.data_blocks.to_le_bytes());
+            hasher.update(meta.erasure.parity_blocks.to_le_bytes());
+            hasher.update(meta.erasure.distribution.len().to_le_bytes());
+            for disk_index in meta.erasure.distribution.iter() {
+                hasher.update(disk_index.to_le_bytes());
+            }
+        }
+    }
+
+    fn latest_fileinfo_identity_groups(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> Vec<FileInfoIdentityGroup> {
+        let mut groups: Vec<FileInfoIdentityGroup> = Vec::with_capacity(parts_metadata.len());
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) {
+                continue;
+            }
+
+            let hash = Self::file_info_quorum_hash(meta);
+            if let Some(group) = groups.iter_mut().find(|group| group.hash == hash) {
+                group.count += 1;
+                continue;
+            }
+
+            groups.push(FileInfoIdentityGroup {
+                hash,
+                count: 1,
+                mod_time: meta.mod_time,
+            });
+        }
+
+        groups
+    }
+
+    fn pick_fileinfo_identity(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        hash: [u8; 32],
+        quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let mut online_disks = vec![None; disks.len()];
+        let mut selected = None;
+        let mut count = 0;
+
+        for (i, ((meta, err), disk)) in parts_metadata.iter().zip(errs.iter()).zip(disks.iter()).enumerate() {
+            if err.is_some() || !file_info_is_valid_for_metadata(meta) || Self::file_info_quorum_hash(meta) != hash {
+                continue;
+            }
+
+            count += 1;
+            online_disks[i].clone_from(disk);
+            if selected.is_none() {
+                selected = Some(meta.clone());
+            }
+        }
+
+        if count < quorum {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        selected
+            .map(|mut fi| {
+                fi.is_latest = fi.successor_mod_time.is_none();
+                (online_disks, fi)
+            })
+            .ok_or(DiskError::ErasureReadQuorum)
+    }
+
+    fn pick_degraded_latest_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let mut groups = Self::latest_fileinfo_identity_groups(parts_metadata, errs);
+        if groups.is_empty() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        groups.sort_by(|left, right| right.mod_time.cmp(&left.mod_time).then_with(|| right.count.cmp(&left.count)));
+        let latest_mod_time = groups[0].mod_time;
+
+        let mut older_start = 0;
+        while older_start < groups.len() && groups[older_start].mod_time == latest_mod_time {
+            if groups[older_start].count >= write_quorum {
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, groups[older_start].hash, write_quorum);
+            }
+            older_start += 1;
+        }
+
+        if older_start > 1 {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        for group in groups.iter().skip(older_start) {
+            if group.count >= read_quorum {
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, group.hash, read_quorum);
+            }
+        }
+
+        Err(DiskError::ErasureReadQuorum)
     }
 
     pub(super) fn find_file_info_in_quorum(
@@ -359,10 +814,9 @@ impl SetDisks {
         }
 
         let mut meta_hashes = vec![None; metas.len()];
-        let mut hasher = Sha256::new();
 
         for (i, meta) in metas.iter().enumerate() {
-            if !meta.is_valid() {
+            if !file_info_is_valid_for_metadata(meta) {
                 debug!(
                     index = i,
                     valid = false,
@@ -383,31 +837,15 @@ impl SetDisks {
                 "find_file_info_in_quorum: inspecting meta"
             );
 
-            let etag_only = mod_time.is_none() && etag.is_some() && meta.get_etag().is_some_and(|v| &v == etag.as_ref().unwrap());
+            let etag_only = mod_time.is_none()
+                && etag.is_some()
+                && meta
+                    .get_etag()
+                    .is_some_and(|v| &v == etag.as_ref().expect("operation should succeed"));
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
-                for part in meta.parts.iter() {
-                    hasher.update(format!("part.{}", part.number).as_bytes());
-                    hasher.update(format!("part.{}", part.size).as_bytes());
-                }
-
-                if !meta.deleted && meta.size != 0 {
-                    hasher.update(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes());
-                    hasher.update(format!("{:?}", meta.erasure.distribution).as_bytes());
-                }
-
-                if meta.is_remote() {
-                    // TODO:
-                }
-
-                // TODO: IsEncrypted
-
-                // TODO: IsCompressed
-
-                meta_hashes[i] = Some(hex(hasher.clone().finalize().as_slice()));
-
-                hasher.reset();
+                meta_hashes[i] = Some(Self::file_info_quorum_hash(meta));
             } else {
                 debug!(
                     index = i,
@@ -420,7 +858,7 @@ impl SetDisks {
 
         let mut count_map = HashMap::new();
 
-        for hash in meta_hashes.iter().flatten() {
+        for hash in meta_hashes.iter().flatten().copied() {
             *count_map.entry(hash).or_insert(0) += 1;
         }
 
@@ -435,7 +873,13 @@ impl SetDisks {
         }
 
         if max_count < quorum {
-            warn!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
+            warn!(
+                quorum,
+                max_count,
+                max_val = ?max_val,
+                count_map = ?count_map,
+                "find_file_info_in_quorum: fileinfo content identity did not reach quorum"
+            );
             return Err(DiskError::ErasureReadQuorum);
         }
 
@@ -447,8 +891,8 @@ impl SetDisks {
         for (i, op_hash) in meta_hashes.iter().enumerate() {
             if let Some(hash) = op_hash
                 && let Some(max_hash) = max_val
-                && hash == max_hash
-                && metas[i].is_valid()
+                && *hash == max_hash
+                && file_info_is_valid_for_metadata(&metas[i])
             {
                 if !found {
                     found_fi = Some(metas[i].clone());
@@ -456,7 +900,7 @@ impl SetDisks {
                 }
 
                 let props = ObjProps {
-                    mod_time: metas[i].mod_time,
+                    successor_mod_time: metas[i].successor_mod_time,
                     num_versions: metas[i].num_versions,
                 };
 
@@ -465,13 +909,13 @@ impl SetDisks {
         }
 
         if found {
-            let mut fi = found_fi.unwrap();
+            let mut fi = found_fi.expect("operation should succeed");
 
             for (val, &count) in &valid_obj_map {
                 if count >= quorum {
-                    fi.mod_time = val.mod_time;
+                    fi.successor_mod_time = val.successor_mod_time;
                     fi.num_versions = val.num_versions;
-                    fi.is_latest = val.mod_time.is_none();
+                    fi.is_latest = val.successor_mod_time.is_none();
 
                     break;
                 }
@@ -483,6 +927,63 @@ impl SetDisks {
         warn!("find_file_info_in_quorum: fileinfo not found");
 
         Err(DiskError::ErasureReadQuorum)
+    }
+
+    /// Ownership-taking variant of `shuffle_disks_and_parts_metadata_by_index`
+    /// (backlog#873): callers that already own the vectors avoid one deep
+    /// `FileInfo` clone per disk by moving entries into their shuffled slots.
+    ///
+    /// Semantics match the borrowing variant, including the fallback to the
+    /// mod-time based placement when `parity_blocks` or more sources are
+    /// inconsistent; the consistency check runs as a read-only first pass so
+    /// the fallback still sees the untouched inputs.
+    pub(super) fn shuffle_disks_and_parts_metadata_by_index_owned(
+        mut disks: Vec<Option<DiskStore>>,
+        mut parts_metadata: Vec<FileInfo>,
+        fi: &FileInfo,
+    ) -> (Vec<Option<DiskStore>>, Vec<FileInfo>) {
+        let distribution = &fi.erasure.distribution;
+
+        let mut inconsistent = 0;
+        for (k, v) in parts_metadata.iter().enumerate() {
+            if disks[k].is_none() || !v.has_valid_erasure_geometry() || distribution[k] != v.erasure.index {
+                inconsistent += 1;
+            }
+        }
+
+        let use_by_index = inconsistent < fi.erasure.parity_blocks;
+        let init = fi.mod_time.is_none();
+
+        let mut shuffled_disks = vec![None; disks.len()];
+        let mut shuffled_parts_metadata = vec![FileInfo::default(); parts_metadata.len()];
+
+        for k in 0..parts_metadata.len() {
+            if disks[k].is_none() {
+                continue;
+            }
+            let eligible = if use_by_index {
+                parts_metadata[k].has_valid_erasure_geometry() && distribution[k] == parts_metadata[k].erasure.index
+            } else {
+                init || parts_metadata[k].has_valid_erasure_geometry()
+            };
+            if !eligible {
+                continue;
+            }
+
+            // Defensive: a corrupt/adversarial `distribution` value of `0` would
+            // underflow `block_idx - 1`, and a value `> N` would index out of
+            // bounds. Skip such entries instead of panicking (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = std::mem::take(&mut parts_metadata[k]);
+            shuffled_disks[slot] = disks[k].take();
+        }
+
+        (shuffled_disks, shuffled_parts_metadata)
     }
 
     pub(super) fn shuffle_disks_and_parts_metadata_by_index(
@@ -501,7 +1002,7 @@ impl SetDisks {
                 continue;
             }
 
-            if !v.is_valid() {
+            if !v.has_valid_erasure_geometry() {
                 inconsistent += 1;
                 continue;
             }
@@ -511,9 +1012,17 @@ impl SetDisks {
                 continue;
             }
 
-            let block_idx = distribution[k];
-            shuffled_parts_metadata[block_idx - 1] = parts_metadata[k].clone();
-            shuffled_disks[block_idx - 1].clone_from(&disks[k]);
+            // Defensive: reject out-of-range distribution values instead of
+            // underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                inconsistent += 1;
+                continue;
+            };
+            shuffled_parts_metadata[slot] = parts_metadata[k].clone();
+            shuffled_disks[slot].clone_from(&disks[k]);
         }
 
         if inconsistent < fi.erasure.parity_blocks {
@@ -539,7 +1048,7 @@ impl SetDisks {
                 continue;
             }
 
-            if !init && !parts_metadata[k].is_valid() {
+            if !init && !parts_metadata[k].has_valid_erasure_geometry() {
                 continue;
             }
 
@@ -547,9 +1056,16 @@ impl SetDisks {
             //     continue;
             // }
 
-            let block_idx = distribution[k];
-            shuffled_parts_metadata[block_idx - 1] = parts_metadata[k].clone();
-            shuffled_disks[block_idx - 1].clone_from(&disks[k]);
+            // Defensive: reject out-of-range distribution values instead of
+            // underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution[k]
+                .checked_sub(1)
+                .filter(|slot| *slot < shuffled_parts_metadata.len() && *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = parts_metadata[k].clone();
+            shuffled_disks[slot].clone_from(&disks[k]);
         }
 
         (shuffled_disks, shuffled_parts_metadata)
@@ -561,9 +1077,17 @@ impl SetDisks {
         }
         let mut shuffled_parts_metadata = vec![FileInfo::default(); parts_metadata.len()];
         // Shuffle slice xl metadata for expected distribution.
-        for index in 0..parts_metadata.len() {
-            let block_index = distribution[index];
-            shuffled_parts_metadata[block_index - 1] = parts_metadata[index].clone();
+        for (index, part) in parts_metadata.iter().enumerate() {
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(index)
+                .and_then(|block_index| block_index.checked_sub(1))
+                .filter(|slot| *slot < shuffled_parts_metadata.len())
+            else {
+                continue;
+            };
+            shuffled_parts_metadata[slot] = part.clone();
         }
         shuffled_parts_metadata
     }
@@ -576,10 +1100,37 @@ impl SetDisks {
         let mut shuffled_disks = vec![None; disks.len()];
 
         for (i, v) in disks.iter().enumerate() {
-            let idx = distribution[i];
-            shuffled_disks[idx - 1].clone_from(v);
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(i)
+                .and_then(|idx| idx.checked_sub(1))
+                .filter(|slot| *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_disks[slot].clone_from(v);
         }
 
+        shuffled_disks
+    }
+
+    pub(super) fn shuffle_disks_owned(mut disks: Vec<Option<DiskStore>>, distribution: &[usize]) -> Vec<Option<DiskStore>> {
+        if distribution.is_empty() {
+            return disks;
+        }
+
+        let mut shuffled_disks = vec![None; disks.len()];
+        for (index, disk) in disks.iter_mut().enumerate() {
+            let Some(slot) = distribution
+                .get(index)
+                .and_then(|block_index| block_index.checked_sub(1))
+                .filter(|slot| *slot < shuffled_disks.len())
+            else {
+                continue;
+            };
+            shuffled_disks[slot] = disk.take();
+        }
         shuffled_disks
     }
 
@@ -589,9 +1140,533 @@ impl SetDisks {
         }
         let mut shuffled_parts_errs = vec![0; parts_errs.len()];
         for (i, v) in parts_errs.iter().enumerate() {
-            let idx = distribution[i];
-            shuffled_parts_errs[idx - 1] = *v;
+            // Defensive: skip missing or out-of-range distribution values
+            // instead of underflowing/indexing out of bounds (backlog#949).
+            let Some(slot) = distribution
+                .get(i)
+                .and_then(|idx| idx.checked_sub(1))
+                .filter(|slot| *slot < shuffled_parts_errs.len())
+            else {
+                continue;
+            };
+            shuffled_parts_errs[slot] = *v;
         }
         shuffled_parts_errs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn metadata_quorum_test_fileinfo(mod_time: OffsetDateTime, erasure_index: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 2, 2);
+        fi.name = "bucket/object".to_string();
+        fi.size = 8 * 1024 * 1024;
+        fi.mod_time = Some(mod_time);
+        fi.data_dir = Some(Uuid::new_v4());
+        fi.metadata.insert("etag".to_string(), "object-etag".to_string());
+        fi.add_object_part(1, "part-etag".to_string(), 8 * 1024 * 1024, Some(mod_time), 8 * 1024 * 1024, None, None);
+        fi.erasure.index = erasure_index;
+        fi
+    }
+
+    fn transition_metadata_quorum_fileinfo(erasure_index: usize) -> FileInfo {
+        let mut fi = FileInfo::new("bucket/object", 5, 1);
+        fi.name = "bucket/object".to_string();
+        fi.size = 8 * 1024 * 1024;
+        fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.metadata.insert("etag".to_string(), "object-etag".to_string());
+        fi.transition_status = TRANSITION_COMPLETE.to_string();
+        fi.transition_tier = "WARM".to_string();
+        fi.transitioned_objname = "remote/object".to_string();
+        fi.transition_version_id = Some(Uuid::new_v4());
+        fi.erasure.index = erasure_index;
+        fi
+    }
+
+    fn expect_metadata_quorum_error(metas: Vec<FileInfo>, mod_time: OffsetDateTime, message: &str) {
+        let err = SetDisks::find_file_info_in_quorum(&metas, &Some(mod_time), &None, 3).expect_err(message);
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn metadata_quorum_covers_etag_fallback_and_object_quorum_failures() {
+        let mut parts_metadata = (1..=3)
+            .map(|index| {
+                let mut fi = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), index);
+                fi.mod_time = None;
+                fi
+            })
+            .collect::<Vec<_>>();
+        parts_metadata[2]
+            .metadata
+            .insert("etag".to_string(), "minority-etag".to_string());
+        let errs = vec![None; parts_metadata.len()];
+        let disks = vec![None; parts_metadata.len()];
+
+        let (_online, mod_time, etag) = SetDisks::list_online_disks(&disks, &parts_metadata, &errs, 2);
+        assert!(mod_time.is_none());
+        assert_eq!(etag.as_deref(), Some("object-etag"));
+
+        let zero_parity = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 0)
+            .expect("zero default parity should require all metadata shards");
+        assert_eq!(zero_parity, (3, 3));
+
+        let invalid = vec![FileInfo::default(); 4];
+        let err = SetDisks::object_quorum_from_meta(&invalid, &vec![None; 4], 2)
+            .expect_err("invalid metadata without a common parity must fail closed");
+        // A full set of healthy replies whose metadata cannot be reconciled is
+        // corrupt (heal-actionable), not a retryable quorum outage (rustfs#5801).
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    #[test]
+    fn fileinfo_quorum_hash_includes_optional_checksums_and_ignores_replication_noise() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut left = metadata_quorum_test_fileinfo(mod_time, 1);
+        left.mode = Some(0o640);
+        left.written_by_version = Some(42);
+        left.checksum = Some(Bytes::from_static(b"object-checksum"));
+        left.parts[0].index = Some(Bytes::from_static(b"part-index"));
+        left.parts[0].error = Some("repair-pending".to_string());
+        left.parts[0].checksums = Some(HashMap::from([
+            ("sha256".to_string(), "left".to_string()),
+            ("crc32".to_string(), "right".to_string()),
+        ]));
+        left.metadata.insert(
+            format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, http::SUFFIX_REPLICATION_STATUS),
+            "replica-a".to_string(),
+        );
+
+        let mut right = left.clone();
+        right.parts[0].checksums = Some(HashMap::from([
+            ("crc32".to_string(), "right".to_string()),
+            ("sha256".to_string(), "left".to_string()),
+        ]));
+        right.metadata.insert(
+            format!("{}{}", http::MINIO_INTERNAL_PREFIX, http::SUFFIX_REPLICATION_STATUS),
+            "replica-b".to_string(),
+        );
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&right),
+            "checksum map ordering and replication metadata must not split quorum identity"
+        );
+
+        right.parts[0]
+            .checksums
+            .as_mut()
+            .expect("checksums should exist")
+            .insert("sha256".to_string(), "changed".to_string());
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+    }
+
+    #[test]
+    fn purge_pending_quorum_hash_keeps_erasure_layouts_separate() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let version_id = Uuid::new_v4();
+        let data_dir = Uuid::new_v4();
+        let mut honest = FileInfo::new("bucket/object", 5, 1);
+        honest.name = "bucket/object".to_string();
+        honest.version_id = Some(version_id);
+        honest.data_dir = Some(data_dir);
+        honest.mod_time = Some(mod_time);
+        honest.size = 1;
+        honest.deleted = true;
+        honest.add_object_part(1, "part-etag".to_string(), 1, Some(mod_time), 1, None, None);
+
+        let mut parts_metadata = (1..=6)
+            .map(|index| {
+                let mut metadata = honest.clone();
+                metadata.erasure.index = index;
+                metadata
+            })
+            .collect::<Vec<_>>();
+        let mut tampered_layout = FileInfo::new("bucket/object", 3, 3).erasure;
+        tampered_layout.index = 1;
+        parts_metadata[0].erasure = tampered_layout;
+        let errs = vec![None; 6];
+
+        assert_eq!(
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 3)
+                .expect("five honest EC:1 payload copies should determine object quorum"),
+            (5, 5)
+        );
+        let selected = SetDisks::find_file_info_in_quorum(&parts_metadata, &Some(mod_time), &None, 5)
+            .expect("the five matching EC:1 payload copies should determine metadata identity");
+        assert_eq!(selected.erasure.data_blocks, 5);
+        assert_eq!(selected.erasure.parity_blocks, 1);
+    }
+
+    #[test]
+    fn quorum_helpers_reject_zero_quorum_and_shuffle_check_parts_by_distribution() {
+        let err = SetDisks::find_file_info_in_quorum(&[], &None, &None, 0).expect_err("zero quorum cannot select metadata");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+
+        assert_eq!(SetDisks::shuffle_check_parts(&[2, 1, 0], &[]), vec![2, 1, 0]);
+        assert_eq!(SetDisks::shuffle_check_parts(&[2, 1, 0], &[3, 1, 2]), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn metadata_quorum_uses_simple_majority_for_transitioned_objects() {
+        let parts_metadata = (1..=6).map(transition_metadata_quorum_fileinfo).collect::<Vec<_>>();
+        let errs = vec![None; parts_metadata.len()];
+
+        let parities = SetDisks::list_object_parities(&parts_metadata, &errs);
+        let quorum = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 1)
+            .expect("transitioned metadata should resolve object quorum");
+
+        assert_eq!(parities, vec![2; 6]);
+        assert_eq!(quorum, (4, 4));
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_encrypted_plain_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut encrypted_a = metadata_quorum_test_fileinfo(mod_time, 1);
+        let mut encrypted_b = metadata_quorum_test_fileinfo(mod_time, 2);
+        let plain = metadata_quorum_test_fileinfo(mod_time, 3);
+        encrypted_a
+            .metadata
+            .insert("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string());
+        encrypted_b
+            .metadata
+            .insert("x-rustfs-encryption-key".to_string(), "encrypted-key".to_string());
+
+        expect_metadata_quorum_error(
+            vec![encrypted_a, encrypted_b, plain],
+            mod_time,
+            "mixed encrypted and plain metadata must not reach quorum",
+        );
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_compressed_plain_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut compressed_a = metadata_quorum_test_fileinfo(mod_time, 1);
+        let mut compressed_b = metadata_quorum_test_fileinfo(mod_time, 2);
+        let plain = metadata_quorum_test_fileinfo(mod_time, 3);
+        http::insert_str(&mut compressed_a.metadata, http::SUFFIX_COMPRESSION, "lz4".to_string());
+        http::insert_str(&mut compressed_b.metadata, http::SUFFIX_COMPRESSION, "lz4".to_string());
+
+        expect_metadata_quorum_error(
+            vec![compressed_a, compressed_b, plain],
+            mod_time,
+            "mixed compressed and plain metadata must not reach quorum",
+        );
+    }
+
+    #[test]
+    fn find_file_info_in_quorum_rejects_remote_local_metadata_split() {
+        let mod_time = OffsetDateTime::now_utc();
+        let mut remote = metadata_quorum_test_fileinfo(mod_time, 1);
+        let local_a = metadata_quorum_test_fileinfo(mod_time, 2);
+        let local_b = metadata_quorum_test_fileinfo(mod_time, 3);
+        remote.transition_status = TRANSITION_COMPLETE.to_string();
+        remote.transition_tier = "WARM".to_string();
+        remote.transitioned_objname = "remote/object".to_string();
+        remote.transition_version_id = Some(Uuid::new_v4());
+
+        expect_metadata_quorum_error(
+            vec![remote, local_a, local_b],
+            mod_time,
+            "mixed remote and local metadata must not reach quorum",
+        );
+    }
+
+    async fn shuffle_test_disks(tempdir: &tempfile::TempDir, count: usize) -> Vec<Option<DiskStore>> {
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+        // The shuffle only inspects Some/None and clones the Arc handle, so
+        // one shared disk handle per slot is sufficient.
+        (0..count).map(|_| Some(disk.clone())).collect()
+    }
+
+    fn shuffle_fixture(consistent: bool) -> (FileInfo, Vec<FileInfo>) {
+        let mut fi = FileInfo::new("bucket/object", 2, 1);
+        fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.size = 1;
+        fi.add_object_part(1, String::new(), 1, None, 1, None, None);
+
+        let slots = fi.erasure.distribution.len();
+        let parts = (0..slots)
+            .map(|k| {
+                let mut part_fi = fi.clone();
+                part_fi.erasure.index = if consistent {
+                    fi.erasure.distribution[k]
+                } else {
+                    // Misplace every source so the by-index pass is rejected
+                    // and the mod-time fallback placement runs instead.
+                    fi.erasure.distribution[(k + 1) % slots]
+                };
+                part_fi
+            })
+            .collect();
+        (fi, parts)
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_matches_borrowing_variant_when_consistent() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, parts) = shuffle_fixture(true);
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+
+        assert_eq!(owned_parts, expected_parts, "owned shuffle must place identical metadata");
+        let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
+        let owned_slots: Vec<bool> = owned_disks.iter().map(Option::is_some).collect();
+        assert_eq!(owned_slots, expected_slots, "owned shuffle must fill identical disk slots");
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_matches_borrowing_variant_on_fallback() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, parts) = shuffle_fixture(false);
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (expected_disks, expected_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+
+        assert_eq!(owned_parts, expected_parts, "fallback placement must match the borrowing variant");
+        let expected_slots: Vec<bool> = expected_disks.iter().map(Option::is_some).collect();
+        let owned_slots: Vec<bool> = owned_disks.iter().map(Option::is_some).collect();
+        assert_eq!(owned_slots, expected_slots, "fallback disk slots must match the borrowing variant");
+    }
+
+    #[tokio::test]
+    async fn owned_shuffle_preserves_fresh_put_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let fi = FileInfo::new("bucket/object", 2, 1);
+        let parts = vec![fi.clone(); fi.erasure.distribution.len()];
+        let disks = shuffle_test_disks(&tempdir, parts.len()).await;
+
+        let (owned_disks, owned_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+
+        assert!(owned_disks.iter().all(Option::is_some), "fresh PUT must retain every online disk");
+        assert_eq!(
+            owned_parts,
+            vec![fi; owned_disks.len()],
+            "fresh PUT metadata with pending shard indexes must survive init fallback"
+        );
+    }
+
+    // backlog#949: corrupt/adversarial distribution values (0 or > N) must not
+    // trigger a `usize` underflow / out-of-bounds panic in the shuffle helpers.
+    #[test]
+    fn shuffle_parts_metadata_survives_corrupt_distribution() {
+        let parts = vec![FileInfo::default(); 4];
+        // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
+        let result = SetDisks::shuffle_parts_metadata(&parts, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), parts.len(), "output length must be preserved");
+    }
+
+    #[test]
+    fn shuffle_check_parts_survives_corrupt_distribution() {
+        let errs = vec![10usize, 20, 30, 40];
+        let result = SetDisks::shuffle_check_parts(&errs, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), errs.len(), "output length must be preserved");
+        // In-range entries are still placed; corrupt ones are safely skipped.
+        assert_eq!(result[2], 30, "distribution[2]=3 places errs[2] into slot 2");
+        assert_eq!(result[3], 40, "distribution[3]=4 places errs[3] into slot 3");
+    }
+
+    #[tokio::test]
+    async fn shuffle_disks_survives_corrupt_distribution() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let disks = shuffle_test_disks(&tempdir, 4).await;
+        // distribution[0] = 0 underflows; distribution[1] = 9 is out of range.
+        let result = SetDisks::shuffle_disks(&disks, &[0, 9, 3, 4]);
+        assert_eq!(result.len(), disks.len(), "output length must be preserved");
+    }
+
+    #[tokio::test]
+    async fn owned_disk_shuffle_matches_borrowing_variant() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let mut disks = shuffle_test_disks(&tempdir, 4).await;
+        disks[1] = None;
+        disks[3] = None;
+        let distribution = [3, 1, 4, 2];
+
+        let expected = SetDisks::shuffle_disks(&disks, &distribution);
+        let actual = SetDisks::shuffle_disks_owned(disks, &distribution);
+
+        let expected_slots = expected.iter().map(Option::is_some).collect::<Vec<_>>();
+        let actual_slots = actual.iter().map(Option::is_some).collect::<Vec<_>>();
+        assert_eq!(actual_slots, expected_slots, "owned shuffle must preserve disk placement");
+    }
+
+    #[tokio::test]
+    async fn shuffle_disks_and_parts_metadata_survives_corrupt_distribution() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (mut fi, parts) = shuffle_fixture(true);
+        let slots = parts.len();
+
+        // Corrupt the selected FileInfo's distribution: a `0` (underflow) and an
+        // out-of-range value. Length and `erasure.index` stay well-formed so the
+        // corruption is only in the distribution values.
+        fi.erasure.distribution = vec![0; slots];
+        fi.erasure.distribution[0] = slots + 5;
+
+        let disks = shuffle_test_disks(&tempdir, slots).await;
+
+        // None of these must panic on the corrupt distribution.
+        let (d1, _) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
+        assert_eq!(d1.len(), disks.len());
+        let (d2, _) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        assert_eq!(d2.len(), disks.len());
+        let (d3, _) = SetDisks::shuffle_disks_and_parts_metadata_by_index_owned(disks, parts, &fi);
+        assert_eq!(d3.len(), slots);
+    }
+
+    #[tokio::test]
+    async fn shuffle_variants_skip_missing_disks_and_invalid_metadata() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let (fi, mut parts) = shuffle_fixture(true);
+        let mut disks = shuffle_test_disks(&tempdir, parts.len()).await;
+        disks[0] = None;
+        parts[1] = FileInfo::default();
+
+        let (by_index_disks, by_index_parts) = SetDisks::shuffle_disks_and_parts_metadata_by_index(&disks, &parts, &fi);
+        assert!(
+            by_index_disks.iter().filter(|disk| disk.is_some()).count() <= disks.iter().filter(|disk| disk.is_some()).count()
+        );
+        assert!(by_index_parts.iter().any(|part| !part.is_valid()));
+
+        let (fallback_disks, fallback_parts) = SetDisks::shuffle_disks_and_parts_metadata(&disks, &parts, &fi);
+        assert!(fallback_disks.iter().any(Option::is_none));
+        assert!(fallback_parts.iter().any(|part| !part.is_valid()));
+    }
+
+    #[test]
+    fn target_delete_marker_version_metadata_is_included_in_quorum_hash() {
+        let suffix = "replication-delete-marker-version-arn:rustfs:replication::target:bucket";
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::RUSTFS_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(SetDisks::is_replication_quorum_metadata_key(&format!(
+            "{}{}",
+            http::MINIO_INTERNAL_PREFIX,
+            suffix
+        )));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-unrelated"));
+
+        let mut left = metadata_quorum_test_fileinfo(OffsetDateTime::now_utc(), 1);
+        let mut right = left.clone();
+        left.metadata
+            .insert(format!("{}{}", http::RUSTFS_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        right
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-b".to_string());
+        assert_ne!(SetDisks::file_info_quorum_hash(&left), SetDisks::file_info_quorum_hash(&right));
+
+        let mut dual_prefixed = left.clone();
+        dual_prefixed
+            .metadata
+            .insert(format!("{}{}", http::MINIO_INTERNAL_PREFIX, suffix), "target-version-a".to_string());
+        assert_eq!(
+            SetDisks::file_info_quorum_hash(&left),
+            SetDisks::file_info_quorum_hash(&dual_prefixed),
+            "compatible prefixes carrying the same mapping must share one identity"
+        );
+    }
+
+    /// Guards the switch to `rustfs_utils::http::starts_with_ignore_ascii_case`:
+    /// internal prefixes must keep matching case-insensitively, and keys shorter
+    /// than the prefix must keep being rejected. Misclassifying either way leaks
+    /// internal metadata into the quorum hash (or drops it out of it).
+    #[test]
+    fn internal_metadata_suffix_is_prefix_case_insensitive_and_rejects_short_keys() {
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-RustFS-Internal-Replica-Status"),
+            Some("Replica-Status"),
+            "mixed-case RustFS prefix must match and preserve the suffix casing"
+        );
+        assert_eq!(
+            SetDisks::internal_metadata_suffix("X-MINIO-INTERNAL-replica-status"),
+            Some("replica-status"),
+            "mixed-case MinIO prefix must match"
+        );
+        assert_eq!(SetDisks::internal_metadata_suffix(http::RUSTFS_INTERNAL_PREFIX), Some(""));
+
+        // Keys shorter than either prefix, and non-internal keys, stay unmatched.
+        assert_eq!(SetDisks::internal_metadata_suffix(""), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-rustfs-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-minio-interna"), None);
+        assert_eq!(SetDisks::internal_metadata_suffix("x-amz-meta-custom"), None);
+
+        // The suffix-prefix comparisons behind the classifier follow the same rules.
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-RustFS-Internal-Replication-Reset-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(SetDisks::is_replication_quorum_metadata_key(
+            "X-Minio-Internal-Replication-Delete-Marker-Version-arn:rustfs:replication::target:bucket"
+        ));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-interna"));
+        assert!(!SetDisks::is_replication_quorum_metadata_key("x-rustfs-internal-replication-res"));
+    }
+
+    /// rustfs#5801: parity counts outside [0, total_shards] come from corrupt
+    /// or foreign metadata and must be treated as invalid entries instead of
+    /// clamped values that poison `common_parity`'s occurrence counting.
+    #[test]
+    fn out_of_range_parity_is_treated_as_invalid_entry() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let parities = SetDisks::list_object_parities(&metas, &errs);
+        assert_eq!(parities, vec![-1; 4], "garbage parity must not survive as a candidate");
+    }
+
+    /// rustfs#5801: when a read quorum of healthy disks answers but their
+    /// parity values are irreconcilable, the object metadata is corrupt —
+    /// return `FileCorrupt` (heal-actionable, non-retryable) instead of the
+    /// retryable-looking `ErasureReadQuorum`.
+    #[test]
+    fn irreconcilable_parity_with_healthy_quorum_is_file_corrupt() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        for fi in &mut metas {
+            fi.erasure.parity_blocks = usize::MAX;
+        }
+        let errs: Vec<Option<DiskError>> = vec![None; 4];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("garbage parity cannot form a quorum");
+        assert_eq!(err, DiskError::FileCorrupt);
+    }
+
+    /// Too few healthy replies remains a genuine quorum condition where a
+    /// retry may succeed once disks recover.
+    #[test]
+    fn insufficient_healthy_replies_stays_erasure_read_quorum() {
+        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut metas: Vec<FileInfo> = (0..4).map(|i| metadata_quorum_test_fileinfo(mod_time, i)).collect();
+        metas[0].erasure.parity_blocks = usize::MAX;
+        let errs: Vec<Option<DiskError>> = vec![
+            None,
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+            Some(DiskError::DiskNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&metas, &errs, 2).expect_err("one healthy reply is below quorum");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 }

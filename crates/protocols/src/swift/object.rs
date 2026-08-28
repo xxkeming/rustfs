@@ -51,35 +51,81 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
-use super::{SwiftError, SwiftResult};
+use super::expiration_worker::{track_object_expiration, untrack_object_expiration};
+use super::storage_api::object::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle, validate_metadata};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader};
 use rustfs_rio::HashReader;
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
 
-/// Maximum number of metadata headers allowed per object (Swift standard)
-const MAX_METADATA_COUNT: usize = 90;
+pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
 
-/// Maximum size in bytes for a single metadata value (Swift standard)
-const MAX_METADATA_VALUE_SIZE: usize = 256;
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_OBJECT: &str = "swift_object";
+const EVENT_SWIFT_OBJECT_STORAGE_STATE: &str = "swift_object_storage_state";
+const SWIFT_DELETE_AT_METADATA: &str = "x-delete-at";
+const USER_METADATA_PREFIX: &str = "x-amz-meta-";
 
 /// Maximum object size in bytes (5GB - Swift default)
 const MAX_OBJECT_SIZE: i64 = 5 * 1024 * 1024 * 1024;
+
+fn stored_swift_user_metadata_key(key: &str) -> String {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-amz-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        format!("{USER_METADATA_PREFIX}{key}")
+    } else {
+        key.to_string()
+    }
+}
+
+pub(super) fn swift_response_user_metadata_key(key: &str) -> Option<&str> {
+    if rustfs_utils::http::is_internal_key(key)
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-rustfs-encryption-")
+        || rustfs_utils::http::starts_with_ignore_ascii_case(key, "x-minio-encryption-")
+    {
+        return None;
+    }
+    if let Some(unescaped) = key.strip_prefix(USER_METADATA_PREFIX)
+        && (rustfs_utils::http::is_internal_key(unescaped)
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-amz-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-rustfs-encryption-")
+            || rustfs_utils::http::starts_with_ignore_ascii_case(unescaped, "x-minio-encryption-"))
+    {
+        return Some(unescaped);
+    }
+    Some(key)
+}
+
+fn swift_user_metadata(headers: &HeaderMap) -> Option<HashMap<String, String>> {
+    let mut metadata = HashMap::new();
+    let mut present = false;
+    for (header_name, header_value) in headers.iter() {
+        let header_name = header_name.as_str().to_lowercase();
+        let Some(key) = header_name.strip_prefix("x-object-meta-") else {
+            continue;
+        };
+        present = true;
+        if let Ok(value) = header_value.to_str() {
+            metadata.insert(stored_swift_user_metadata_key(key), value.to_string());
+        }
+    }
+    present.then_some(metadata)
+}
 
 /// Object key translator for Swift object names
 ///
 /// Handles URL encoding/decoding and path normalization for Swift object keys.
 /// Swift object names can contain any UTF-8 characters except null bytes.
-#[allow(dead_code)] // Used in: object operations
 pub struct ObjectKeyMapper;
 
 impl ObjectKeyMapper {
     /// Create a new object key mapper
-    #[allow(dead_code)] // Used in: object operations
     pub fn new() -> Self {
         Self
     }
@@ -92,7 +138,6 @@ impl ObjectKeyMapper {
     /// - Not contain null bytes
     /// - Not contain '..' path segments (directory traversal)
     /// - Not start with '/' (leading slash handled by routing)
-    #[allow(dead_code)] // Used in: object operations
     pub fn validate_object_name(object: &str) -> SwiftResult<()> {
         if object.is_empty() {
             return Err(SwiftError::BadRequest("Object name cannot be empty".to_string()));
@@ -104,6 +149,14 @@ impl ObjectKeyMapper {
 
         if object.contains('\0') {
             return Err(SwiftError::BadRequest("Object name cannot contain null bytes".to_string()));
+        }
+
+        if object.chars().any(char::is_control) {
+            return Err(SwiftError::BadRequest("Object name cannot contain control characters".to_string()));
+        }
+
+        if object.starts_with('/') {
+            return Err(SwiftError::BadRequest("Object name cannot start with '/'".to_string()));
         }
 
         // Check for directory traversal attempts
@@ -127,7 +180,6 @@ impl ObjectKeyMapper {
     /// Example:
     /// - Swift: "photos/vacation/beach photo.jpg"
     /// - S3: "photos/vacation/beach photo.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn swift_to_s3_key(object: &str) -> SwiftResult<String> {
         Self::validate_object_name(object)?;
         Ok(object.to_string())
@@ -137,7 +189,6 @@ impl ObjectKeyMapper {
     ///
     /// This is essentially an identity transformation since we store
     /// Swift object names as-is in S3.
-    #[allow(dead_code)] // Used in: object operations
     pub fn s3_to_swift_name(key: &str) -> String {
         key.to_string()
     }
@@ -152,7 +203,6 @@ impl ObjectKeyMapper {
     /// - Object: "vacation/beach.jpg"
     /// - Bucket: "abc123:photos"
     /// - Key: "vacation/beach.jpg"
-    #[allow(dead_code)] // Used in: object operations
     pub fn build_s3_key(object: &str) -> SwiftResult<String> {
         Self::swift_to_s3_key(object)
     }
@@ -164,7 +214,6 @@ impl ObjectKeyMapper {
     ///
     /// Example URL: /v1/AUTH_abc/container/path%2Fto%2Ffile.txt
     /// Decoded: "path/to/file.txt"
-    #[allow(dead_code)] // Used in: object operations
     pub fn decode_object_from_url(encoded: &str) -> SwiftResult<String> {
         // Decode percent-encoding
         let decoded = urlencoding::decode(encoded).map_err(|e| SwiftError::BadRequest(format!("Invalid URL encoding: {}", e)))?;
@@ -177,7 +226,6 @@ impl ObjectKeyMapper {
     ///
     /// When constructing URLs (e.g., for redirect responses), we need to
     /// percent-encode object names.
-    #[allow(dead_code)] // Used in: object operations
     pub fn encode_object_for_url(object: &str) -> String {
         urlencoding::encode(object).to_string()
     }
@@ -185,7 +233,6 @@ impl ObjectKeyMapper {
     /// Check if object name represents a directory (pseudo-directory)
     ///
     /// In Swift, objects ending with '/' are treated as directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn is_directory_marker(object: &str) -> bool {
         object.ends_with('/')
     }
@@ -194,13 +241,11 @@ impl ObjectKeyMapper {
     ///
     /// Removes redundant slashes and normalizes the path while preserving
     /// trailing slashes for directory markers.
-    #[allow(dead_code)] // Used in: object operations
     pub fn normalize_path(object: &str) -> String {
         // Split by '/', filter out empty segments (except if it's the end)
-        let segments: Vec<&str> = object.split('/').collect();
         let has_trailing_slash = object.ends_with('/');
 
-        let normalized_segments: Vec<&str> = segments.into_iter().filter(|s| !s.is_empty()).collect();
+        let normalized_segments: Vec<&str> = object.split('/').filter(|s| !s.is_empty()).collect();
 
         let mut result = normalized_segments.join("/");
 
@@ -219,36 +264,18 @@ impl Default for ObjectKeyMapper {
     }
 }
 
-/// Validate metadata against Swift limits
-///
-/// Checks that:
-/// - Total number of metadata entries doesn't exceed MAX_METADATA_COUNT
-/// - Individual metadata values don't exceed MAX_METADATA_VALUE_SIZE
-///
-/// Returns error if limits are exceeded.
-fn validate_metadata(metadata: &HashMap<String, String>) -> SwiftResult<()> {
-    // Check total metadata count
-    if metadata.len() > MAX_METADATA_COUNT {
-        return Err(SwiftError::BadRequest(format!(
-            "Too many metadata headers: {} (max: {})",
-            metadata.len(),
-            MAX_METADATA_COUNT
-        )));
-    }
+fn metadata_delete_at(metadata: &HashMap<String, String>) -> Option<u64> {
+    metadata
+        .get(SWIFT_DELETE_AT_METADATA)
+        .and_then(|value| value.parse::<u64>().ok())
+}
 
-    // Check individual value sizes
-    for (key, value) in metadata.iter() {
-        if value.len() > MAX_METADATA_VALUE_SIZE {
-            return Err(SwiftError::BadRequest(format!(
-                "Metadata value for '{}' too large: {} bytes (max: {} bytes)",
-                key,
-                value.len(),
-                MAX_METADATA_VALUE_SIZE
-            )));
-        }
+async fn update_object_expiration_tracking(account: &str, container: &str, object: &str, delete_at: Option<u64>) {
+    if let Some(delete_at) = delete_at {
+        track_object_expiration(account, container, object, delete_at).await;
+    } else {
+        untrack_object_expiration(account, container, object).await;
     }
-
-    Ok(())
 }
 
 /// Sanitize storage layer errors for client responses
@@ -257,7 +284,15 @@ fn validate_metadata(metadata: &HashMap<String, String>) -> SwiftResult<()> {
 /// This prevents information disclosure vulnerabilities.
 fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> SwiftError {
     // Log detailed error server-side
-    error!("Storage operation '{}' failed: {}", operation, error);
+    error!(
+        event = EVENT_SWIFT_OBJECT_STORAGE_STATE,
+        component = LOG_COMPONENT_PROTOCOLS,
+        subsystem = LOG_SUBSYSTEM_SWIFT_OBJECT,
+        operation = %operation,
+        error = %error,
+        result = "failed",
+        "swift object storage state changed"
+    );
 
     // Return generic error to client
     SwiftError::InternalServerError(format!("{} operation failed", operation))
@@ -279,7 +314,6 @@ fn sanitize_storage_error<E: std::fmt::Display>(operation: &str, error: E) -> Sw
 /// # Returns
 /// * `Ok(etag)` - Object ETag on success
 /// * `Err(SwiftError)` - Error if validation fails or upload fails
-#[allow(dead_code)] // Handler integration: PUT object
 pub async fn put_object<R>(
     account: &str,
     container: &str,
@@ -305,15 +339,7 @@ where
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Extract Swift metadata from X-Object-Meta-* headers
-    let mut user_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            user_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut user_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 6. Extract Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -323,9 +349,10 @@ where
     }
 
     // 7. Extract and validate expiration headers (X-Delete-At / X-Delete-After)
-    if let Some(delete_at) = super::expiration::extract_expiration(headers)? {
+    let delete_at = super::expiration::extract_expiration(headers)?;
+    if let Some(delete_at) = delete_at {
         super::expiration::validate_expiration(delete_at)?;
-        user_metadata.insert("x-delete-at".to_string(), delete_at.to_string());
+        user_metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), delete_at.to_string());
     }
 
     // 8. Extract symlink target if creating a symlink
@@ -333,7 +360,14 @@ where
         // Store the fully qualified target (container/object)
         let target_value = symlink_target.to_header_value(container);
         user_metadata.insert("x-object-symlink-target".to_string(), target_value);
-        debug!("Creating symlink to target: {}", user_metadata.get("x-object-symlink-target").unwrap());
+        debug!(
+            event = EVENT_SWIFT_OBJECT_STORAGE_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_OBJECT,
+            state = "symlink_target_recorded",
+            target = %user_metadata.get("x-object-symlink-target").unwrap(),
+            "swift object storage state changed"
+        );
     }
 
     // 9. Validate metadata limits
@@ -355,7 +389,7 @@ where
     }
 
     // 12. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -369,7 +403,7 @@ where
     })?;
 
     // 12. Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: user_metadata,
         ..Default::default()
     };
@@ -382,13 +416,15 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // 15. Wrap in PutObjReader as expected by storage layer
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // 16. Upload object to storage
     let obj_info = store
         .put_object(&bucket, &s3_key, &mut put_reader, &opts)
         .await
         .map_err(|e| sanitize_storage_error("Object upload", e))?;
+
+    update_object_expiration_tracking(account, container, object, delete_at).await;
 
     // 17. Return ETag (MD5 hash in hex format)
     Ok(obj_info.etag.unwrap_or_default())
@@ -398,7 +434,6 @@ where
 ///
 /// Similar to put_object, but allows directly specifying metadata instead of extracting from headers.
 /// This is used internally for storing SLO manifests and marker objects.
-#[allow(dead_code)] // Used by SLO implementation
 pub async fn put_object_with_metadata<R>(
     account: &str,
     container: &str,
@@ -433,9 +468,10 @@ where
 
     // Validate metadata limits
     validate_metadata(metadata)?;
+    let delete_at = metadata_delete_at(metadata);
 
     // Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
@@ -449,7 +485,7 @@ where
     })?;
 
     // Prepare object options with metadata
-    let opts = ObjectOptions {
+    let opts = SwiftObjectOptions {
         user_defined: metadata.clone(),
         ..Default::default()
     };
@@ -465,13 +501,15 @@ where
         .map_err(|e| sanitize_storage_error("Hash reader creation", e))?;
 
     // Wrap in PutObjReader
-    let mut put_reader = PutObjReader::new(hash_reader);
+    let mut put_reader = SwiftPutObjReader::new(hash_reader);
 
     // Upload object to storage
     let obj_info = store
         .put_object(&bucket, &s3_key, &mut put_reader, &opts)
         .await
         .map_err(|e| sanitize_storage_error("Object upload", e))?;
+
+    update_object_expiration_tracking(account, container, object, delete_at).await;
 
     // Return ETag
     Ok(obj_info.etag.unwrap_or_default())
@@ -499,16 +537,13 @@ where
 /// - `bytes=1000-1999` - Bytes 1000-1999
 /// - `bytes=1000-` - From byte 1000 to end
 /// - `bytes=-500` - Last 500 bytes
-#[allow(dead_code)] // Handler integration: GET object
 pub async fn get_object(
     account: &str,
     container: &str,
     object: &str,
     credentials: &Credentials,
-    range: Option<rustfs_ecstore::store_api::HTTPRangeSpec>,
-) -> SwiftResult<rustfs_ecstore::store_api::GetObjectReader> {
-    use rustfs_ecstore::store_api::GetObjectReader;
-
+    range: Option<HTTPRangeSpec>,
+) -> SwiftResult<SwiftGetObjectReader> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -523,15 +558,15 @@ pub async fn get_object(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object reader from storage with range support
-    let reader: GetObjectReader = store
+    let reader: SwiftGetObjectReader = store
         .get_object_reader(&bucket, &s3_key, range, HeaderMap::new(), &opts)
         .await
         .map_err(|e| {
@@ -560,15 +595,12 @@ pub async fn get_object(
 /// # Returns
 /// * `Ok(object_info)` - Object metadata (ObjectInfo)
 /// * `Err(SwiftError)` - Error if validation fails or object not found
-#[allow(dead_code)] // Handler integration: HEAD object
 pub async fn head_object(
     account: &str,
     container: &str,
     object: &str,
     credentials: &Credentials,
-) -> SwiftResult<rustfs_ecstore::store_api::ObjectInfo> {
-    use rustfs_ecstore::store_api::ObjectInfo;
-
+) -> SwiftResult<SwiftObjectInfo> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
 
@@ -583,15 +615,15 @@ pub async fn head_object(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Get object info (metadata only) from storage
-    let info: ObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
+    let info: SwiftObjectInfo = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
             SwiftError::NotFound(format!("Object '{}' not found in container '{}'", object, container))
@@ -625,7 +657,6 @@ pub async fn head_object(
 /// # Returns
 /// * `Ok(())` - Object deleted successfully (or didn't exist)
 /// * `Err(SwiftError)` - Error if validation fails or deletion fails
-#[allow(dead_code)] // Handler integration: DELETE object
 pub async fn delete_object(account: &str, container: &str, object: &str, credentials: &Credentials) -> SwiftResult<()> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -641,17 +672,20 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. Prepare object options for deletion
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
 
     // 7. Delete object from storage
     // Swift DELETE is idempotent - returns success even if object doesn't exist
     match store.delete_object(&bucket, &s3_key, opts).await {
-        Ok(_) => Ok(()),
+        Ok(_) => {
+            untrack_object_expiration(account, container, object).await;
+            Ok(())
+        }
         Err(e) => {
             let err_str = e.to_string();
             // Only fail if the container (bucket) doesn't exist
@@ -659,6 +693,7 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
                 Err(SwiftError::NotFound(format!("Container '{}' not found", container)))
             } else if err_str.contains("Object not found") || err_str.contains("does not exist") {
                 // Object already gone - this is success for idempotent DELETE
+                untrack_object_expiration(account, container, object).await;
                 Ok(())
             } else {
                 Err(sanitize_storage_error("Object deletion", e))
@@ -682,7 +717,6 @@ pub async fn delete_object(account: &str, container: &str, object: &str, credent
 /// # Returns
 /// * `Ok(())` - Metadata updated successfully
 /// * `Err(SwiftError)` - Error if validation fails, object not found, or update fails
-#[allow(dead_code)] // Handler integration: POST object
 pub async fn update_object_metadata(
     account: &str,
     container: &str,
@@ -704,12 +738,12 @@ pub async fn update_object_metadata(
     let bucket = mapper.swift_to_s3_bucket(container, &project_id);
 
     // 5. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 6. First, get the existing object info to verify it exists
-    let opts = ObjectOptions::default();
+    let opts = SwiftObjectOptions::default();
     let existing_info = store.get_object_info(&bucket, &s3_key, &opts).await.map_err(|e| {
         let err_str = e.to_string();
         if err_str.contains("does not exist") || err_str.contains("not found") {
@@ -728,15 +762,7 @@ pub async fn update_object_metadata(
     }
 
     // 8. Extract new metadata from X-Object-Meta-* headers
-    let mut new_metadata = HashMap::new();
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-")
-            && let Ok(value_str) = header_value.to_str()
-        {
-            new_metadata.insert(meta_key.to_string(), value_str.to_string());
-        }
-    }
+    let mut new_metadata = swift_user_metadata(headers).unwrap_or_default();
 
     // 9. Also update Content-Type if provided
     if let Some(content_type) = headers.get("content-type")
@@ -745,12 +771,18 @@ pub async fn update_object_metadata(
         new_metadata.insert("content-type".to_string(), ct_str.to_string());
     }
 
+    let delete_at = super::expiration::extract_expiration(headers)?;
+    if let Some(delete_at) = delete_at {
+        super::expiration::validate_expiration(delete_at)?;
+        new_metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), delete_at.to_string());
+    }
+
     // 10. Validate metadata limits
     validate_metadata(&new_metadata)?;
 
     // 11. Prepare options for metadata update
     // Swift POST replaces all custom metadata, not merges
-    let update_opts = ObjectOptions {
+    let update_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         mod_time: existing_info.mod_time,
         version_id: existing_info.version_id.map(|v| v.to_string()),
@@ -762,6 +794,8 @@ pub async fn update_object_metadata(
         .put_object_metadata(&bucket, &s3_key, &update_opts)
         .await
         .map_err(|e| sanitize_storage_error("Metadata update", e))?;
+
+    update_object_expiration_tracking(account, container, object, delete_at).await;
 
     Ok(())
 }
@@ -796,7 +830,6 @@ pub async fn update_object_metadata(
 /// # Handler Integration Note
 /// The current handler architecture needs to be updated to pass headers through
 /// to support COPY method and X-Copy-From header detection. See handler.rs for details.
-#[allow(dead_code)] // Handler integration: COPY object
 #[allow(clippy::too_many_arguments)] // Necessary for full copy functionality
 pub async fn copy_object(
     src_account: &str,
@@ -828,12 +861,12 @@ pub async fn copy_object(
     let dst_bucket = mapper.swift_to_s3_bucket(dst_container, &dst_project_id);
 
     // 6. Get storage layer
-    let Some(store) = new_object_layer_fn() else {
+    let Some(store) = resolve_swift_object_store_handle() else {
         return Err(SwiftError::InternalServerError("Storage layer not initialized".to_string()));
     };
 
     // 7. First, verify source object exists and get its info
-    let src_opts = ObjectOptions::default();
+    let src_opts = SwiftObjectOptions::default();
     let mut src_info = store
         .get_object_info(&src_bucket, &src_s3_key, &src_opts)
         .await
@@ -867,22 +900,11 @@ pub async fn copy_object(
 
     // 10. Prepare metadata for destination object
     // Start with source metadata
-    let mut new_metadata = src_info.user_defined.clone();
+    let mut new_metadata = (*src_info.user_defined).clone();
 
     // 11. If custom metadata headers provided, use those instead (Swift behavior)
-    let mut has_custom_meta = false;
-    for (header_name, header_value) in headers.iter() {
-        let header_str = header_name.as_str().to_lowercase();
-        if let Some(meta_key) = header_str.strip_prefix("x-object-meta-") {
-            if !has_custom_meta {
-                // First custom meta header - clear source metadata
-                new_metadata.clear();
-                has_custom_meta = true;
-            }
-            if let Ok(value_str) = header_value.to_str() {
-                new_metadata.insert(meta_key.to_string(), value_str.to_string());
-            }
-        }
+    if let Some(custom_metadata) = swift_user_metadata(headers) {
+        new_metadata = custom_metadata;
     }
 
     // 12. Also check for Content-Type override
@@ -900,7 +922,7 @@ pub async fn copy_object(
     validate_metadata(&new_metadata)?;
 
     // 14. Prepare destination options
-    let dst_opts = ObjectOptions {
+    let dst_opts = SwiftObjectOptions {
         user_defined: new_metadata,
         ..Default::default()
     };
@@ -940,7 +962,6 @@ pub async fn copy_object(
 /// assert_eq!(container, "my-container");
 /// assert_eq!(object, "path/to/file.txt");
 /// ```
-#[allow(dead_code)] // Handler integration: COPY method
 pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, String)> {
     let destination = destination.trim_start_matches('/');
     let parts: Vec<&str> = destination.splitn(2, '/').collect();
@@ -974,7 +995,6 @@ pub fn parse_destination_header(destination: &str) -> SwiftResult<(String, Strin
 /// # Returns
 /// * `Ok((container, object))` - Parsed container and object names
 /// * `Err(SwiftError)` - Error if format is invalid
-#[allow(dead_code)] // Handler integration: X-Copy-From
 pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> {
     // Same parsing logic as Destination header
     parse_destination_header(copy_from)
@@ -1003,10 +1023,7 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.start, 0);
 /// assert_eq!(range.end, 1023);
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
-pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_api::HTTPRangeSpec> {
-    use rustfs_ecstore::store_api::HTTPRangeSpec;
-
+pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
     }
@@ -1087,7 +1104,6 @@ pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_ecstore::store_
 /// let header = format_content_range(0, 1023, 5000);
 /// assert_eq!(header, "bytes 0-1023/5000");
 /// ```
-#[allow(dead_code)] // Handler integration: Range header
 pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
     format!("bytes {}-{}/{}", start, end, total)
 }
@@ -1095,6 +1111,7 @@ pub fn format_content_range(start: i64, end: i64, total: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn test_validate_object_name_valid() {
@@ -1103,6 +1120,36 @@ mod tests {
         assert!(ObjectKeyMapper::validate_object_name("file with spaces.pdf").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("special-chars_@#$.txt").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("unicode-文件.txt").is_ok());
+    }
+
+    #[test]
+    fn swift_user_metadata_cannot_materialize_internal_storage_keys() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-object-meta-x-rustfs-internal-actual-size", "1".parse().expect("valid metadata value"));
+        headers.insert("x-object-meta-description", "safe".parse().expect("valid metadata value"));
+        let metadata = swift_user_metadata(&headers).expect("custom metadata should be detected");
+
+        assert_eq!(metadata.get("x-amz-meta-x-rustfs-internal-actual-size").map(String::as_str), Some("1"));
+        assert_eq!(metadata.get("description").map(String::as_str), Some("safe"));
+        assert!(!metadata.contains_key("x-rustfs-internal-actual-size"));
+        assert_eq!(
+            stored_swift_user_metadata_key("x-minio-encryption-original-size"),
+            "x-amz-meta-x-minio-encryption-original-size"
+        );
+        assert_eq!(stored_swift_user_metadata_key("description"), "description");
+    }
+
+    #[test]
+    fn swift_user_metadata_response_mapping_is_reversible_and_filters_internal_keys() {
+        assert_eq!(
+            swift_response_user_metadata_key("x-amz-meta-x-rustfs-internal-actual-size"),
+            Some("x-rustfs-internal-actual-size")
+        );
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-x-amz-checksum"), Some("x-amz-checksum"));
+        assert_eq!(swift_response_user_metadata_key("x-amz-meta-description"), Some("x-amz-meta-description"));
+        assert_eq!(swift_response_user_metadata_key("description"), Some("description"));
+        assert_eq!(swift_response_user_metadata_key("x-rustfs-internal-actual-size"), None);
+        assert_eq!(swift_response_user_metadata_key("x-minio-internal-actual-size"), None);
     }
 
     #[test]
@@ -1143,6 +1190,30 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_object_name_control_character() {
+        let result = ObjectKeyMapper::validate_object_name("file\nname.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("control"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_validate_object_name_leading_slash() {
+        let result = ObjectKeyMapper::validate_object_name("/file.txt");
+        assert!(result.is_err());
+        match result {
+            Err(SwiftError::BadRequest(msg)) => {
+                assert!(msg.contains("start with '/'"));
+            }
+            _ => panic!("Expected BadRequest error"),
+        }
+    }
+
+    #[test]
     fn test_validate_object_name_directory_traversal() {
         // ".." as a path segment should be rejected
         assert!(ObjectKeyMapper::validate_object_name("path/../file.txt").is_err());
@@ -1152,6 +1223,22 @@ mod tests {
         // But ".." in a filename should be allowed
         assert!(ObjectKeyMapper::validate_object_name("file..txt").is_ok());
         assert!(ObjectKeyMapper::validate_object_name("my..file.txt").is_ok());
+    }
+
+    #[test]
+    fn test_metadata_delete_at_parses_valid_timestamp() {
+        let mut metadata = HashMap::new();
+        metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), "1740000000".to_string());
+
+        assert_eq!(metadata_delete_at(&metadata), Some(1740000000));
+    }
+
+    #[test]
+    fn test_metadata_delete_at_ignores_invalid_timestamp() {
+        let mut metadata = HashMap::new();
+        metadata.insert(SWIFT_DELETE_AT_METADATA.to_string(), "invalid".to_string());
+
+        assert_eq!(metadata_delete_at(&metadata), None);
     }
 
     #[test]
@@ -1218,6 +1305,41 @@ mod tests {
 
         // Empty segments
         assert_eq!(ObjectKeyMapper::normalize_path("path///to/file.txt"), "path/to/file.txt");
+    }
+
+    proptest! {
+        #[test]
+        fn validate_object_name_ok_outputs_are_safe(input in any::<String>()) {
+            if let Ok(()) = ObjectKeyMapper::validate_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(input.len() <= 1024);
+                prop_assert!(!input.starts_with('/'));
+                prop_assert!(!input.chars().any(char::is_control));
+                prop_assert!(!input.split('/').any(|segment| segment == ".."));
+            }
+        }
+
+        #[test]
+        fn decode_object_from_url_round_trips_valid_input(input in any::<String>()) {
+            let encoded = ObjectKeyMapper::encode_object_for_url(&input);
+
+            match ObjectKeyMapper::decode_object_from_url(&encoded) {
+                Ok(decoded) => {
+                    prop_assert_eq!(decoded.as_str(), input.as_str());
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&decoded).is_ok());
+                }
+                Err(_) => {
+                    prop_assert!(ObjectKeyMapper::validate_object_name(&input).is_err());
+                }
+            }
+        }
+
+        #[test]
+        fn normalize_path_is_idempotent(input in any::<String>()) {
+            let once = ObjectKeyMapper::normalize_path(&input);
+            let twice = ObjectKeyMapper::normalize_path(&once);
+            prop_assert_eq!(twice, once);
+        }
     }
 
     #[test]

@@ -13,15 +13,16 @@
 // limitations under the License.
 
 use crate::admin::{
-    handlers::{
-        audit, bucket_meta, heal, health, kms, module_switch, oidc, pools, profile_admin, quota, rebalance, replication,
-        site_replication, sts, system, tier, user,
-    },
+    handlers::health,
     router::{AdminOperation, S3Router},
 };
-use crate::server::{ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH};
+use crate::server::{
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
+    TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX,
+};
 use hyper::Method;
 use serial_test::serial;
+use std::collections::BTreeSet;
 use temp_env::with_var;
 
 fn admin_path(path: &str) -> String {
@@ -30,6 +31,70 @@ fn admin_path(path: &str) -> String {
 
 fn compat_admin_alias_path(path: &str) -> String {
     format!("{}{}", MINIO_ADMIN_PREFIX, path)
+}
+
+fn table_catalog_path(path: &str) -> String {
+    format!("{}{}", TABLE_CATALOG_PREFIX, path)
+}
+
+fn compat_table_catalog_path(path: &str) -> String {
+    format!("{}{}", TABLE_CATALOG_COMPAT_PREFIX, path)
+}
+
+#[derive(Debug)]
+struct RouteMatrixEntry {
+    method: Method,
+    pattern: String,
+    sample: String,
+}
+
+fn route(method: Method, pattern: impl Into<String>) -> RouteMatrixEntry {
+    let pattern = pattern.into();
+    RouteMatrixEntry {
+        method,
+        sample: pattern.clone(),
+        pattern,
+    }
+}
+
+fn route_sample(method: Method, pattern: impl Into<String>, sample: impl Into<String>) -> RouteMatrixEntry {
+    RouteMatrixEntry {
+        method,
+        pattern: pattern.into(),
+        sample: sample.into(),
+    }
+}
+
+fn admin_route(method: Method, pattern: &str) -> RouteMatrixEntry {
+    route(method, admin_path(pattern))
+}
+
+fn admin_route_sample(method: Method, pattern: &str, sample: &str) -> RouteMatrixEntry {
+    route_sample(method, admin_path(pattern), admin_path(sample))
+}
+
+fn table_route(method: Method, pattern: &str) -> RouteMatrixEntry {
+    route(method, table_catalog_path(pattern))
+}
+
+fn table_route_sample(method: Method, pattern: &str, sample: &str) -> RouteMatrixEntry {
+    route_sample(method, table_catalog_path(pattern), table_catalog_path(sample))
+}
+
+fn compat_table_route(method: Method, pattern: &str) -> RouteMatrixEntry {
+    route(method, compat_table_catalog_path(pattern))
+}
+
+fn compat_table_route_sample(method: Method, pattern: &str, sample: &str) -> RouteMatrixEntry {
+    route_sample(method, compat_table_catalog_path(pattern), compat_table_catalog_path(sample))
+}
+
+fn route_key(method: &Method, path: &str) -> String {
+    format!("{}|{}", method.as_str(), path)
+}
+
+fn route_key_set(routes: &[RouteMatrixEntry]) -> BTreeSet<String> {
+    routes.iter().map(|route| route_key(&route.method, &route.pattern)).collect()
 }
 
 fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
@@ -41,34 +106,738 @@ fn assert_route(router: &S3Router<AdminOperation>, method: Method, path: &str) {
     );
 }
 
-fn register_admin_routes(router: &mut S3Router<AdminOperation>) {
-    health::register_health_route(router).expect("register health route");
-    sts::register_admin_auth_route(router).expect("register sts route");
-    user::register_user_route(router).expect("register user route");
-    system::register_system_route(router).expect("register system route");
-    pools::register_pool_route(router).expect("register pool route");
-    rebalance::register_rebalance_route(router).expect("register rebalance route");
-    heal::register_heal_route(router).expect("register heal route");
-    tier::register_tier_route(router).expect("register tier route");
-    quota::register_quota_route(router).expect("register quota route");
-    bucket_meta::register_bucket_meta_route(router).expect("register bucket meta route");
-    audit::register_audit_target_route(router).expect("register audit target route");
-    module_switch::register_module_switch_route(router).expect("register module switch route");
-    replication::register_replication_route(router).expect("register replication route");
-    site_replication::register_site_replication_route(router).expect("register site replication route");
-    profile_admin::register_profiling_route(router).expect("register profile route");
-    kms::register_kms_route(router).expect("register kms route");
-    oidc::register_oidc_route(router).expect("register oidc route");
+fn registered_admin_router() -> S3Router<AdminOperation> {
+    with_var(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"), || {
+        let mut router = S3Router::new(false);
+        super::register_admin_routes(&mut router).expect("register production admin routes");
+        router
+    })
 }
 
-// register_admin_routes reads ENV_HEALTH_ENDPOINT_ENABLE to decide whether
-// to register /health; serialise with the env-mutating test below to avoid
-// cross-thread leakage of that override.
+fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
+    vec![
+        route(Method::GET, HEALTH_PREFIX),
+        route(Method::HEAD, HEALTH_PREFIX),
+        route(Method::GET, HEALTH_READY_PATH),
+        route(Method::HEAD, HEALTH_READY_PATH),
+        route(Method::GET, PROFILE_CPU_PATH),
+        route(Method::GET, PROFILE_MEMORY_PATH),
+        route(Method::POST, "/"),
+        admin_route(Method::GET, "/v3/is-admin"),
+        admin_route(Method::GET, "/v3/accountinfo"),
+        admin_route(Method::GET, "/v3/account/info"),
+        admin_route(Method::POST, "/v3/account/password"),
+        admin_route(Method::GET, "/v3/list-users"),
+        admin_route(Method::GET, "/v3/user-info"),
+        admin_route(Method::DELETE, "/v3/remove-user"),
+        admin_route(Method::PUT, "/v3/add-user"),
+        admin_route(Method::PUT, "/v3/set-user-status"),
+        admin_route(Method::PUT, "/v3/set-user-secret-key"),
+        admin_route(Method::GET, "/v3/account/mfa"),
+        admin_route(Method::POST, "/v3/account/mfa/enroll"),
+        admin_route(Method::POST, "/v3/account/mfa/activate"),
+        admin_route(Method::POST, "/v3/account/mfa/disable"),
+        admin_route(Method::POST, "/v3/account/mfa/recovery-codes"),
+        admin_route(Method::GET, "/v3/mfa/challenge"),
+        admin_route(Method::GET, "/v3/user/mfa"),
+        admin_route(Method::DELETE, "/v3/user/mfa"),
+        admin_route(Method::GET, "/v3/groups"),
+        admin_route(Method::GET, "/v3/group"),
+        admin_route_sample(Method::DELETE, "/v3/group/{group}", "/v3/group/test-group"),
+        admin_route(Method::PUT, "/v3/set-group-status"),
+        admin_route(Method::PUT, "/v3/update-group-members"),
+        admin_route(Method::POST, "/v3/update-service-account"),
+        admin_route(Method::GET, "/v3/info-service-account"),
+        admin_route(Method::GET, "/v3/temporary-account-info"),
+        admin_route(Method::GET, "/v3/info-access-key"),
+        admin_route(Method::GET, "/v3/list-service-accounts"),
+        admin_route(Method::GET, "/v3/list-access-keys-bulk"),
+        admin_route(Method::DELETE, "/v3/delete-service-accounts"),
+        admin_route(Method::DELETE, "/v3/delete-service-account"),
+        admin_route(Method::PUT, "/v3/add-service-accounts"),
+        admin_route(Method::PUT, "/v3/add-service-account"),
+        admin_route(Method::GET, "/v3/export-iam"),
+        admin_route(Method::PUT, "/v3/import-iam"),
+        admin_route(Method::GET, "/v3/list-canned-policies"),
+        admin_route(Method::GET, "/v3/info-canned-policy"),
+        admin_route(Method::PUT, "/v3/add-canned-policy"),
+        admin_route(Method::DELETE, "/v3/remove-canned-policy"),
+        admin_route(Method::PUT, "/v3/set-user-or-group-policy"),
+        admin_route(Method::PUT, "/v3/set-policy"),
+        admin_route(Method::POST, "/v3/idp/builtin/policy/attach"),
+        admin_route(Method::POST, "/v3/idp/builtin/policy/detach"),
+        admin_route(Method::GET, "/v3/idp/builtin/policy-entities"),
+        admin_route(Method::GET, "/v3/target/list"),
+        admin_route_sample(Method::PUT, "/v3/target/{target_type}/{target_name}", "/v3/target/webhook/test-target"),
+        admin_route_sample(
+            Method::DELETE,
+            "/v3/target/{target_type}/{target_name}/reset",
+            "/v3/target/webhook/test-target/reset",
+        ),
+        admin_route(Method::GET, "/v3/target/arns"),
+        admin_route(Method::POST, "/v3/service"),
+        admin_route(Method::POST, "/v3/update"),
+        admin_route(Method::GET, "/v3/info"),
+        admin_route(Method::GET, "/v3/inspect-data"),
+        admin_route(Method::POST, "/v3/inspect-data"),
+        admin_route(Method::POST, "/v4/inspect/archive"),
+        admin_route(Method::GET, "/v3/storageinfo"),
+        admin_route(Method::GET, "/v3/datausageinfo"),
+        admin_route_sample(Method::GET, "/v3/usage/{bucket}", "/v3/usage/test-bucket"),
+        admin_route(Method::GET, "/v3/metrics"),
+        admin_route(Method::GET, "/v3/object-data-cache/stats"),
+        admin_route(Method::POST, "/v3/object-data-cache/flush"),
+        admin_route(Method::GET, "/v3/pools/list"),
+        admin_route(Method::GET, "/v3/pools/status"),
+        admin_route(Method::GET, "/v3/decommission/status"),
+        admin_route(Method::POST, "/v3/pools/decommission"),
+        admin_route(Method::POST, "/v3/pools/cancel"),
+        admin_route(Method::POST, "/v3/pools/clear"),
+        admin_route(Method::POST, "/v3/rebalance/start"),
+        admin_route(Method::GET, "/v3/rebalance/status"),
+        admin_route(Method::POST, "/v3/rebalance/stop"),
+        admin_route(Method::POST, "/v3/heal/"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}", "/v3/heal/test-bucket"),
+        admin_route_sample(Method::POST, "/v3/heal/{bucket}/{prefix}", "/v3/heal/test-bucket/prefix"),
+        admin_route(Method::POST, "/v3/background-heal/status"),
+        admin_route(Method::GET, "/v4/heal/replacement-recovery"),
+        admin_route(Method::GET, "/v3/tier"),
+        admin_route(Method::GET, "/v3/tier-stats"),
+        admin_route_sample(Method::GET, "/v3/tier/{tier}", "/v3/tier/HOT"),
+        admin_route_sample(Method::DELETE, "/v3/tier/{tiername}", "/v3/tier/HOT"),
+        admin_route(Method::PUT, "/v3/tier"),
+        admin_route_sample(Method::POST, "/v3/tier/{tiername}", "/v3/tier/HOT"),
+        admin_route(Method::POST, "/v3/tier/clear"),
+        admin_route(Method::GET, "/v3/ilm/expiry/status"),
+        admin_route(Method::POST, "/v3/ilm/transition/run"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/transition/jobs/{job_id}",
+            "/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::GET,
+            "/v3/ilm/transition/reconcile/{transaction_id}",
+            "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::POST,
+            "/v3/ilm/transition/reconcile/{transaction_id}",
+            "/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route_sample(
+            Method::DELETE,
+            "/v3/ilm/transition/jobs/{job_id}",
+            "/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111",
+        ),
+        admin_route(Method::PUT, "/v3/set-bucket-quota"),
+        admin_route(Method::GET, "/v3/get-bucket-quota"),
+        admin_route_sample(Method::PUT, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/quota/{bucket}", "/v3/quota/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/quota-stats/{bucket}", "/v3/quota-stats/test-bucket"),
+        admin_route_sample(Method::POST, "/v3/quota-check/{bucket}", "/v3/quota-check/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/bucket-durability/{bucket}", "/v3/bucket-durability/test-bucket"),
+        admin_route(Method::GET, "/export-bucket-metadata"),
+        admin_route(Method::GET, "/v3/export-bucket-metadata"),
+        admin_route(Method::PUT, "/import-bucket-metadata"),
+        admin_route(Method::PUT, "/v3/import-bucket-metadata"),
+        admin_route(Method::GET, "/v3/get-config-kv"),
+        admin_route(Method::PUT, "/v3/set-config-kv"),
+        admin_route(Method::DELETE, "/v3/del-config-kv"),
+        admin_route(Method::GET, "/v3/help-config-kv"),
+        admin_route(Method::GET, "/v3/list-config-history-kv"),
+        admin_route(Method::DELETE, "/v3/clear-config-history-kv"),
+        admin_route(Method::PUT, "/v3/restore-config-history-kv"),
+        admin_route(Method::GET, "/v3/config"),
+        admin_route(Method::PUT, "/v3/config"),
+        admin_route(Method::GET, "/v3/scanner/status"),
+        admin_route(Method::POST, "/v3/scanner/cycle-state/reset"),
+        admin_route(Method::GET, "/v3/audit/target/list"),
+        admin_route_sample(
+            Method::PUT,
+            "/v3/audit/target/{target_type}/{target_name}",
+            "/v3/audit/target/audit_webhook/test-audit",
+        ),
+        admin_route_sample(
+            Method::DELETE,
+            "/v3/audit/target/{target_type}/{target_name}/reset",
+            "/v3/audit/target/audit_webhook/test-audit/reset",
+        ),
+        admin_route(Method::GET, "/v3/module-switches"),
+        admin_route(Method::PUT, "/v3/module-switches"),
+        admin_route(Method::GET, "/v4/cluster/snapshot"),
+        admin_route(Method::GET, "/v4/extensions/catalog"),
+        admin_route(Method::GET, "/v4/extensions/instances"),
+        admin_route(Method::GET, "/v4/runtime/capabilities"),
+        admin_route(Method::POST, "/v3/object-zip-downloads"),
+        admin_route_sample(
+            Method::GET,
+            "/v3/object-zip-downloads/{id}.zip",
+            "/v3/object-zip-downloads/example-id.zip",
+        ),
+        admin_route(Method::GET, "/v4/plugins/catalog"),
+        admin_route(Method::GET, "/v4/plugins/instances"),
+        admin_route_sample(Method::GET, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route_sample(Method::PUT, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route_sample(Method::DELETE, "/v4/plugins/instances/{id}", "/v4/plugins/instances/example-id"),
+        admin_route(Method::GET, "/v3/list-remote-targets"),
+        admin_route(Method::GET, "/v3/replicationmetrics"),
+        admin_route(Method::PUT, "/v3/set-remote-target"),
+        admin_route(Method::DELETE, "/v3/remove-remote-target"),
+        admin_route(Method::POST, "/v3/replication/diff"),
+        admin_route(Method::GET, "/v3/replication/mrf"),
+        admin_route(Method::POST, "/v3/start-job"),
+        admin_route(Method::GET, "/v3/list-jobs"),
+        admin_route(Method::GET, "/v3/status-job"),
+        admin_route(Method::GET, "/v3/describe-job"),
+        admin_route(Method::DELETE, "/v3/cancel-job"),
+        admin_route(Method::PUT, "/v3/site-replication/add"),
+        admin_route(Method::PUT, "/v3/site-replication/remove"),
+        admin_route(Method::GET, "/v3/site-replication/info"),
+        admin_route(Method::GET, "/v3/site-replication/metainfo"),
+        admin_route(Method::GET, "/v3/site-replication/status"),
+        admin_route(Method::POST, "/v3/site-replication/devnull"),
+        admin_route(Method::POST, "/v3/site-replication/netperf"),
+        admin_route(Method::POST, "/v3/site-replication/rotate-svc-acct"),
+        admin_route(Method::PUT, "/v3/site-replication/join"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/join"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/bucket-ops"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/iam-item"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/bucket-meta"),
+        admin_route(Method::GET, "/v3/site-replication/peer/idp-settings"),
+        admin_route(Method::PUT, "/v3/site-replication/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/edit-capabilities"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/peer/remove"),
+        admin_route(Method::PUT, "/v3/site-replication/resync/op"),
+        admin_route(Method::PUT, "/v3/site-replication/state/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/repair"),
+        admin_route(Method::GET, "/v3/site-replication/repair/status"),
+        admin_route(Method::GET, "/debug/pprof/profile"),
+        admin_route(Method::GET, "/debug/pprof/status"),
+        admin_route(Method::POST, "/v3/profiling/start"),
+        admin_route(Method::GET, "/v3/profiling/download"),
+        admin_route(Method::POST, "/v3/profile"),
+        admin_route(Method::GET, "/v3/trace"),
+        admin_route(Method::GET, "/v3/top/locks"),
+        admin_route(Method::POST, "/v3/force-unlock"),
+        admin_route(Method::GET, "/v3/healthinfo"),
+        admin_route(Method::GET, "/v3/obdinfo"),
+        admin_route(Method::GET, "/v3/log"),
+        admin_route(Method::POST, "/v3/speedtest"),
+        admin_route(Method::POST, "/v3/speedtest/object"),
+        admin_route(Method::POST, "/v3/speedtest/drive"),
+        admin_route(Method::POST, "/v3/speedtest/net"),
+        admin_route(Method::POST, "/v3/speedtest/site"),
+        admin_route(Method::POST, "/v3/speedtest/client/devnull"),
+        admin_route(Method::GET, "/debug/tls/status"),
+        admin_route(Method::POST, "/v3/kms/create-key"),
+        admin_route(Method::POST, "/v3/kms/key/create"),
+        admin_route(Method::GET, "/v3/kms/describe-key"),
+        admin_route(Method::GET, "/v3/kms/key/status"),
+        admin_route(Method::GET, "/v3/kms/list-keys"),
+        admin_route(Method::POST, "/v3/kms/generate-data-key"),
+        admin_route(Method::GET, "/v3/kms/status"),
+        admin_route(Method::POST, "/v3/kms/status"),
+        admin_route(Method::GET, "/v3/kms/config"),
+        admin_route(Method::POST, "/v3/kms/clear-cache"),
+        admin_route(Method::POST, "/v3/kms/configure"),
+        admin_route(Method::POST, "/v3/kms/start"),
+        admin_route(Method::POST, "/v3/kms/stop"),
+        admin_route(Method::GET, "/v3/kms/service-status"),
+        admin_route(Method::POST, "/v3/kms/reconfigure"),
+        admin_route(Method::POST, "/v3/kms/keys"),
+        admin_route(Method::DELETE, "/v3/kms/keys/delete"),
+        admin_route(Method::POST, "/v3/kms/keys/cancel-deletion"),
+        admin_route(Method::GET, "/v3/kms/keys"),
+        admin_route_sample(Method::GET, "/v3/kms/keys/{key_id}", "/v3/kms/keys/test-key"),
+        admin_route(Method::POST, "/v3/kms/keys/enable"),
+        admin_route(Method::POST, "/v3/kms/keys/disable"),
+        admin_route(Method::POST, "/v3/kms/keys/rotate"),
+        admin_route(Method::POST, "/v3/kms/keys/rekey"),
+        admin_route(Method::GET, "/v3/kms/keys/rekey/status"),
+        admin_route(Method::POST, "/v3/kms/keys/rekey/cancel"),
+        admin_route(Method::GET, "/v3/kms/backup"),
+        admin_route(Method::POST, "/v3/kms/backup"),
+        admin_route(Method::POST, "/v3/kms/restore/dry-run"),
+        admin_route(Method::POST, "/v3/kms/restore"),
+        admin_route(Method::POST, "/v3/kms/restore/abort"),
+        admin_route(Method::POST, "/v3/kms/keys/update-description"),
+        admin_route(Method::POST, "/v3/kms/keys/tag"),
+        admin_route(Method::POST, "/v3/kms/keys/untag"),
+        admin_route(Method::GET, "/v3/oidc/providers"),
+        admin_route_sample(Method::GET, "/v3/oidc/authorize/{provider_id}", "/v3/oidc/authorize/default"),
+        admin_route_sample(Method::GET, "/v3/oidc/callback/{provider_id}", "/v3/oidc/callback/default"),
+        admin_route(Method::GET, "/v3/oidc/logout"),
+        admin_route(Method::GET, "/v3/oidc/config"),
+        admin_route_sample(Method::PUT, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
+        admin_route_sample(Method::DELETE, "/v3/oidc/config/{provider_id}", "/v3/oidc/config/default"),
+        admin_route(Method::POST, "/v3/oidc/validate"),
+        // idp_compat (rustfs/backlog#609 #610 #616)
+        admin_route(Method::PUT, "/v3/import-iam-v2"),
+        admin_route_sample(Method::POST, "/v3/revoke-tokens/{user_provider}", "/v3/revoke-tokens/builtin"),
+        admin_route_sample(Method::GET, "/v3/idp-config/{idp_type}", "/v3/idp-config/openid"),
+        admin_route_sample(Method::GET, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::PUT, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::POST, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route_sample(Method::DELETE, "/v3/idp-config/{idp_type}/{name}", "/v3/idp-config/openid/default"),
+        admin_route(Method::PUT, "/v3/idp/ldap/add-service-account"),
+        admin_route(Method::GET, "/v3/idp/ldap/list-access-keys"),
+        admin_route(Method::GET, "/v3/idp/ldap/list-access-keys-bulk"),
+        admin_route(Method::GET, "/v3/idp/ldap/policy-entities"),
+        admin_route_sample(Method::POST, "/v3/idp/ldap/policy/{operation}", "/v3/idp/ldap/policy/attach"),
+        admin_route(Method::GET, "/v3/idp/openid/list-access-keys-bulk"),
+        table_route(Method::GET, "/config"),
+        table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
+        table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/properties",
+            "/analytics/namespaces/sales/properties",
+        ),
+        table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/register",
+            "/analytics/namespaces/sales/register",
+        ),
+        table_route_sample(Method::POST, "/{warehouse}/tables/rename", "/analytics/tables/rename"),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/views",
+            "/analytics/namespaces/sales/views",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/views",
+            "/analytics/namespaces/sales/views",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+            "/analytics/namespaces/sales/tables/orders/refs",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            "/analytics/namespaces/sales/tables/orders/refs/audit",
+        ),
+        table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            "/analytics/namespaces/sales/tables/orders/refs/audit",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            "/analytics/namespaces/sales/tables/orders/maintenance/metadata",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/worker/run",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+            "/analytics/namespaces/sales/tables/orders/catalog/export",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            "/analytics/namespaces/sales/tables/orders/catalog/import",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            "/analytics/namespaces/sales/tables/orders/catalog/external/sync",
+        ),
+        table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+            "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
+        ),
+        table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            "/analytics/namespaces/sales/tables/orders/catalog/rollback",
+        ),
+        compat_table_route(Method::GET, "/config"),
+        compat_table_route_sample(Method::PUT, "/buckets/{warehouse}", "/buckets/analytics"),
+        compat_table_route_sample(Method::GET, "/buckets/{warehouse}", "/buckets/analytics"),
+        compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::GET, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/namespaces", "/analytics/namespaces"),
+        compat_table_route_sample(Method::GET, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        compat_table_route_sample(Method::HEAD, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/properties",
+            "/analytics/namespaces/sales/properties",
+        ),
+        compat_table_route_sample(Method::DELETE, "/{warehouse}/namespaces/{namespace}", "/analytics/namespaces/sales"),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables",
+            "/analytics/namespaces/sales/tables",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/register",
+            "/analytics/namespaces/sales/register",
+        ),
+        compat_table_route_sample(Method::POST, "/{warehouse}/tables/rename", "/analytics/tables/rename"),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/views",
+            "/analytics/namespaces/sales/views",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/views",
+            "/analytics/namespaces/sales/views",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/credentials",
+            "/analytics/namespaces/sales/tables/orders/credentials",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}",
+            "/analytics/namespaces/sales/tables/orders",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        compat_table_route_sample(
+            Method::HEAD,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        compat_table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/views/{view}",
+            "/analytics/namespaces/sales/views/recent_orders",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs",
+            "/analytics/namespaces/sales/tables/orders/refs",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            "/analytics/namespaces/sales/tables/orders/refs/audit",
+        ),
+        compat_table_route_sample(
+            Method::DELETE,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/refs/{ref}",
+            "/analytics/namespaces/sales/tables/orders/refs/audit",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata",
+            "/analytics/namespaces/sales/tables/orders/maintenance/metadata",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/metadata-location",
+            "/analytics/namespaces/sales/tables/orders/metadata-location",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
+            "/analytics/namespaces/sales/tables/orders/maintenance/config",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
+            "/analytics/namespaces/sales/tables/orders/maintenance/worker/run",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
+            "/analytics/namespaces/sales/tables/orders/catalog/export",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
+            "/analytics/namespaces/sales/tables/orders/catalog/import",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        compat_table_route_sample(
+            Method::PUT,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
+            "/analytics/namespaces/sales/tables/orders/catalog/external",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external/sync",
+            "/analytics/namespaces/sales/tables/orders/catalog/external/sync",
+        ),
+        compat_table_route_sample(
+            Method::GET,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/diagnostics",
+            "/analytics/namespaces/sales/tables/orders/catalog/diagnostics",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/recovery",
+            "/analytics/namespaces/sales/tables/orders/catalog/recovery",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/rollback",
+            "/analytics/namespaces/sales/tables/orders/catalog/rollback",
+        ),
+    ]
+}
+
+// registered_admin_router pins ENV_HEALTH_ENDPOINT_ENABLE because the
+// production registration helper intentionally honors that environment switch.
+#[test]
+#[serial]
+fn test_admin_route_matrix_matches_registered_routes() {
+    let router = registered_admin_router();
+
+    let matrix = expected_admin_route_matrix();
+    let actual_routes = router.registered_routes();
+    assert_eq!(
+        actual_routes.len(),
+        matrix.len(),
+        "admin route matrix must account for every registered route"
+    );
+
+    let actual = actual_routes.iter().cloned().collect::<BTreeSet<_>>();
+    let expected = route_key_set(&matrix);
+    assert_eq!(actual, expected, "admin route registration changed without updating the matrix");
+
+    for route in matrix {
+        assert_route(&router, route.method, &route.sample);
+    }
+}
+
+#[test]
+#[serial]
+fn test_admin_route_matrix_preserves_minio_admin_aliases() {
+    let router = registered_admin_router();
+
+    for route in expected_admin_route_matrix()
+        .into_iter()
+        .filter(|route| route.sample.starts_with(ADMIN_PREFIX))
+    {
+        let suffix = route
+            .sample
+            .strip_prefix(ADMIN_PREFIX)
+            .expect("matrix route is already filtered by admin prefix");
+        let alias = compat_admin_alias_path(suffix);
+        assert!(
+            router.contains_compatible_route(route.method.clone(), &alias),
+            "expected MinIO admin alias path to match: {} {}",
+            route.method.as_str(),
+            alias
+        );
+    }
+}
+
 #[test]
 #[serial]
 fn test_register_routes_cover_representative_admin_paths() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
     assert_route(&router, Method::GET, HEALTH_PREFIX);
     assert_route(&router, Method::HEAD, HEALTH_PREFIX);
     assert_route(&router, Method::GET, HEALTH_READY_PATH);
@@ -101,9 +870,368 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
+    assert_route(&router, Method::GET, &admin_path("/v4/cluster/snapshot"));
+    assert_route(&router, Method::GET, &admin_path("/v4/extensions/catalog"));
+    assert_route(&router, Method::GET, &admin_path("/v4/extensions/instances"));
+    assert_route(&router, Method::GET, &admin_path("/v4/runtime/capabilities"));
+    assert_route(&router, Method::POST, &admin_path("/v3/object-zip-downloads"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/catalog"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances"));
+    assert_route(&router, Method::GET, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::PUT, &admin_path("/v4/plugins/instances/example-id"));
+    assert_route(&router, Method::DELETE, &admin_path("/v4/plugins/instances/example-id"));
     assert_route(&router, Method::PUT, &admin_path("/v3/audit/target/audit_webhook/test-audit"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/audit/target/audit_webhook/test-audit/reset"));
     assert_route(&router, Method::GET, &admin_path("/v3/accountinfo"));
+
+    assert_route(&router, Method::GET, &admin_path("/v3/get-config-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/set-config-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/del-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/help-config-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-config-history-kv"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/clear-config-history-kv"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/restore-config-history-kv"));
+    assert_route(&router, Method::GET, &admin_path("/v3/config"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/config"));
+    assert_route(&router, Method::GET, &admin_path("/v3/scanner/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/scanner/cycle-state/reset"));
+    assert_route(&router, Method::GET, &admin_path("/v3/ilm/expiry/status"));
+    assert_route(&router, Method::POST, &admin_path("/v3/ilm/transition/run"));
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &admin_path("/v3/ilm/transition/jobs/11111111-1111-4111-8111-111111111111"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &admin_path("/v3/ilm/transition/reconcile/11111111-1111-4111-8111-111111111111"),
+    );
+
+    assert_route(&router, Method::GET, &table_catalog_path("/config"));
+    assert_route(&router, Method::PUT, &table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/tables/rename"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/views"));
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/views"));
+    assert_route(&router, Method::GET, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
+    );
+    assert_route(&router, Method::POST, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(&router, Method::DELETE, &table_catalog_path("/analytics/namespaces/sales/tables/orders"));
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::HEAD,
+        &table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/refs"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/refs/audit"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/refs/audit"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/metadata"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/worker/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/import"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external/sync"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
+    );
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/config"));
+    assert_route(&router, Method::PUT, &compat_table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/buckets/analytics"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::DELETE, &compat_table_catalog_path("/analytics/namespaces/sales"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/tables"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/register"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/tables/rename"));
+    assert_route(&router, Method::GET, &compat_table_catalog_path("/analytics/namespaces/sales/views"));
+    assert_route(&router, Method::POST, &compat_table_catalog_path("/analytics/namespaces/sales/views"));
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/credentials"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::HEAD,
+        &compat_table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &compat_table_catalog_path("/analytics/namespaces/sales/views/recent_orders"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/refs"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/refs/audit"),
+    );
+    assert_route(
+        &router,
+        Method::DELETE,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/refs/audit"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/metadata"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/metadata-location"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/config"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/scheduler/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/worker/run"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/import"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::PUT,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/external/sync"),
+    );
+    assert_route(
+        &router,
+        Method::GET,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/diagnostics"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/recovery"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/rollback"),
+    );
 
     assert_route(&router, Method::POST, &admin_path("/v3/service"));
     assert_route(&router, Method::GET, &admin_path("/v3/info"));
@@ -111,12 +1239,14 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/rebalance/start"));
     assert_route(&router, Method::GET, &admin_path("/v3/rebalance/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/test-bucket/prefix"));
     assert_route(&router, Method::POST, &admin_path("/v3/background-heal/status"));
+    assert_route(&router, Method::GET, &admin_path("/v4/heal/replacement-recovery"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/tier"));
     assert_route(&router, Method::GET, &admin_path("/v3/tier/HOT"));
@@ -125,6 +1255,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/get-bucket-quota"));
     assert_route(&router, Method::PUT, &admin_path("/v3/quota/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/quota-stats/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/bucket-durability/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-durability/test-bucket"));
 
     assert_route(&router, Method::GET, &admin_path("/export-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/export-bucket-metadata"));
@@ -132,6 +1265,13 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/import-bucket-metadata"));
     assert_route(&router, Method::GET, &admin_path("/v3/list-remote-targets"));
     assert_route(&router, Method::PUT, &admin_path("/v3/set-remote-target"));
+    assert_route(&router, Method::POST, &admin_path("/v3/replication/diff"));
+    assert_route(&router, Method::GET, &admin_path("/v3/replication/mrf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/start-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/list-jobs"));
+    assert_route(&router, Method::GET, &admin_path("/v3/status-job"));
+    assert_route(&router, Method::GET, &admin_path("/v3/describe-job"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/cancel-job"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/add"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/remove"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/info"));
@@ -139,17 +1279,23 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
+    assert_route(&router, Method::POST, &admin_path("/v3/site-replication/rotate-svc-acct"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-meta"));
     assert_route(&router, Method::GET, &admin_path("/v3/site-replication/peer/idp-settings"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit-capabilities"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/edit"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/repair"));
+    assert_route(&router, Method::GET, &admin_path("/v3/site-replication/repair/status"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
+    assert_route(&router, Method::GET, &admin_path("/debug/tls/status"));
 
     assert_route(&router, Method::POST, &admin_path("/v3/kms/create-key"));
     assert_route(&router, Method::POST, &admin_path("/v3/kms/key/create"));
@@ -178,8 +1324,7 @@ fn test_register_routes_cover_representative_admin_paths() {
 #[test]
 #[serial]
 fn test_admin_alias_paths_match_existing_admin_routes() {
-    let mut router: S3Router<AdminOperation> = S3Router::new(false);
-    register_admin_routes(&mut router);
+    let router = registered_admin_router();
 
     for (method, path) in [
         (Method::GET, compat_admin_alias_path("/v3/is-admin")),
@@ -228,6 +1373,18 @@ fn test_admin_alias_paths_match_existing_admin_routes() {
         (Method::GET, compat_admin_alias_path("/v3/kms/status")),
         (Method::POST, compat_admin_alias_path("/v3/kms/status")),
         (Method::GET, compat_admin_alias_path("/v3/kms/key/status")),
+        (Method::GET, compat_admin_alias_path("/v3/get-config-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/set-config-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/del-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/help-config-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/list-config-history-kv")),
+        (Method::DELETE, compat_admin_alias_path("/v3/clear-config-history-kv")),
+        (Method::PUT, compat_admin_alias_path("/v3/restore-config-history-kv")),
+        (Method::GET, compat_admin_alias_path("/v3/config")),
+        (Method::PUT, compat_admin_alias_path("/v3/config")),
+        (Method::GET, compat_admin_alias_path("/v3/scanner/status")),
+        (Method::POST, compat_admin_alias_path("/v3/scanner/cycle-state/reset")),
+        (Method::GET, compat_admin_alias_path("/v3/ilm/expiry/status")),
     ] {
         assert!(
             router.contains_compatible_route(method.clone(), &path),
@@ -272,23 +1429,6 @@ fn test_health_routes_not_registered_when_disabled_by_env() {
     });
 }
 
-#[test]
-fn test_phase5_admin_info_contract() {
-    let system_src = include_str!("handlers/system.rs");
-
-    let server_info_impl_marker = "impl Operation for ServerInfoHandler";
-    let server_info_impl_start = system_src
-        .find(server_info_impl_marker)
-        .expect("Expected impl Operation for ServerInfoHandler in handlers/system.rs");
-    let server_info_impl_block = &system_src[server_info_impl_start..];
-
-    assert!(
-        server_info_impl_block.contains("DefaultAdminUsecase::from_global()")
-            && server_info_impl_block.contains("execute_query_server_info(QueryServerInfoRequest { include_pools: true })"),
-        "admin server info path must be served through DefaultAdminUsecase::execute_query_server_info"
-    );
-}
-
 fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {
     let start = src
         .find(start_marker)
@@ -322,5 +1462,31 @@ fn test_replication_set_remote_target_compat_contract() {
     assert!(
         !handler_block.contains("encode_compatible_admin_payload("),
         "set-remote-target should not re-encrypt ARN success responses"
+    );
+}
+
+#[test]
+fn test_replication_diff_body_read_errors_are_not_ignored() {
+    let replication_src = include_str!("handlers/replication.rs");
+    let handler_block = extract_block_between_markers(
+        replication_src,
+        "impl Operation for ReplicationDiffHandler",
+        "/// Failed-replication totals for one remote target",
+    );
+
+    assert!(
+        handler_block.contains("read_compatible_admin_body("),
+        "replication diff must read the optional body through the compatible admin payload reader"
+    );
+
+    let body_read_block =
+        extract_block_between_markers(handler_block, "let body = read_compatible_admin_body(", "if prefix.is_empty()");
+    assert!(
+        body_read_block.contains(".await?;"),
+        "replication diff must fail closed when body read or MinIO-compatible decryption fails"
+    );
+    assert!(
+        !body_read_block.contains(".unwrap_or_default()"),
+        "replication diff must not silently treat body read/decryption failures as an empty request"
     );
 }

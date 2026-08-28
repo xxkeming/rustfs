@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::{
-    bucket::metadata_sys,
-    disk::endpoint::Endpoint,
-    endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-    store::ECStore,
-    store_api::{BucketOperations, BucketOptions, HealOperations, MakeBucketOptions, ObjectIO, ObjectOptions, PutObjReader},
-};
+use super::storage_api::test::bucket::metadata_sys;
+use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+use super::storage_api::test::contract::heal::HealOperations as _;
+use super::storage_api::test::contract::object::ObjectIO as _;
+use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
 use std::{
@@ -33,6 +31,8 @@ use tempfile::TempDir;
 use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
+
+use super::storage_api::test::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 
 static CAPACITY_DIRTY_SCOPE_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
 static CAPACITY_DIRTY_SCOPE_INIT: Once = Once::new();
@@ -80,7 +80,9 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    rustfs_ecstore::store::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -148,7 +150,6 @@ async fn data_movement_put_object_marks_dirty_disks_for_capacity_manager() {
         .expect("data movement put_object should succeed");
 
     let dirty_disks = manager.get_dirty_disks().await;
-    assert_eq!(dirty_disks.len(), disk_paths.len());
 
     let actual_paths: HashSet<_> = dirty_disks
         .into_iter()
@@ -158,7 +159,12 @@ async fn data_movement_put_object_marks_dirty_disks_for_capacity_manager() {
         .iter()
         .map(|path| stdfs::canonicalize(path).unwrap().to_string_lossy().into_owned())
         .collect();
-    assert_eq!(actual_paths, expected_paths);
+    // The global dirty scope registry is process-wide; concurrent tests may
+    // add extra entries, so we only verify that our expected paths are present.
+    assert!(
+        expected_paths.is_subset(&actual_paths),
+        "expected dirty disks {expected_paths:?} to be a subset of {actual_paths:?}"
+    );
 }
 
 #[tokio::test]
@@ -187,8 +193,13 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
 
     let _ = manager.get_dirty_disks().await;
 
-    let object_root = disk_paths[0].join(&bucket_name).join("test").join("heal.bin");
-    let missing_part = find_part_file(&object_root, "part.1").expect("part file on first disk");
+    let (missing_disk, missing_part) = disk_paths
+        .iter()
+        .find_map(|disk_path| {
+            let object_root = disk_path.join(&bucket_name).join("test").join("heal.bin");
+            find_part_file(&object_root, "part.1").map(|part| (disk_path, part))
+        })
+        .expect("part file on an erasure disk");
     fs::remove_file(&missing_part).await.expect("remove shard to force heal");
 
     let heal_opts = HealOpts {
@@ -213,7 +224,7 @@ async fn heal_object_marks_missing_shard_disk_dirty_for_capacity_manager() {
         .into_iter()
         .map(|disk| stdfs::canonicalize(&disk.drive_path).unwrap().to_string_lossy().into_owned())
         .collect();
-    let expected_missing_disk = stdfs::canonicalize(&disk_paths[0]).unwrap().to_string_lossy().into_owned();
+    let expected_missing_disk = stdfs::canonicalize(missing_disk).unwrap().to_string_lossy().into_owned();
 
     assert!(
         error.is_none() || actual_paths.contains(&expected_missing_disk),

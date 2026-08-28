@@ -25,27 +25,63 @@ keywords = ["file-system", "notification", "real-time", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-notify/latest/rustfs_notify/"
 
+[features]
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-config/hotpath",
+    "rustfs-ecstore/hotpath",
+    "rustfs-s3-ops/hotpath",
+    "rustfs-s3-types/hotpath",
+    "rustfs-targets/hotpath",
+    "rustfs-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-ecstore/hotpath-alloc",
+    "rustfs-s3-ops/hotpath-alloc",
+    "rustfs-s3-types/hotpath-alloc",
+    "rustfs-targets/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-ecstore/hotpath-cpu",
+    "rustfs-s3-ops/hotpath-cpu",
+    "rustfs-s3-types/hotpath-cpu",
+    "rustfs-targets/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+]
+demo-examples = []
+
 [dependencies]
-rustfs-config = { workspace = true, features = ["notify", "constants"] }
+hotpath.workspace = true
+rustfs-config = { workspace = true, features = ["notify", "server-config-model"] }
 rustfs-ecstore = { workspace = true }
-rustfs-s3-common = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-s3-ops = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-utils = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true, features = ["serde"] }
 form_urlencoded = { workspace = true }
-hashbrown = { workspace = true }
+hashbrown = { workspace = true, features = ["serde", "rayon"] }
+jiff = { workspace = true, features = ["serde"] }
 percent-encoding = { workspace = true }
 rayon = { workspace = true }
 rustc-hash = { workspace = true }
-serde = { workspace = true }
-starshard = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+starshard = { workspace = true, features = ["rayon", "async", "serde"] }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time", "fs"] }
+tokio-util = { workspace = true }
 tracing = { workspace = true }
 url = { workspace = true }
-wildmatch = { workspace = true, features = ["serde"] }
+metrics = { workspace = true }
 
 # quick-xml dependencies for custom S3KeyFilter XML deserialization
 # Custom deserializer implemented for S3KeyFilter to handle both XML structures:
@@ -55,15 +91,33 @@ wildmatch = { workspace = true, features = ["serde"] }
 quick-xml = { workspace = true, features = ["serialize", "serde-types", "encoding"] }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util"] }
-tracing-subscriber = { workspace = true, features = ["env-filter"] }
+rustfs-targets = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["test-util", "fs", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
 axum = { workspace = true }
 rustfs-utils = { workspace = true, features = ["path"] }
-serde_json = { workspace = true }
-time = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
+criterion = { workspace = true, features = ["html_reports"] }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true
 
 [lib]
 doctest = false
+
+[[example]]
+name = "full_demo"
+required-features = ["demo-examples"]
+
+[[example]]
+name = "full_demo_one"
+required-features = ["demo-examples"]
+
+[[example]]
+name = "webhook"
+required-features = ["demo-examples"]
+
+[[bench]]
+name = "snapshot_mode_scan"
+harness = false

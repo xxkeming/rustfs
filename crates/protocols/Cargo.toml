@@ -25,9 +25,61 @@ description = "Protocol implementations for RustFS (FTPS, SFTP, etc.)"
 keywords = ["ftp", "sftp", "protocol", "storage", "rustfs"]
 categories = ["network-programming", "filesystem"]
 
+[lints]
+workspace = true
+
 [features]
 default = []
-ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls"]
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-ecstore?/hotpath",
+    "rustfs-iam/hotpath",
+    "rustfs-keystone?/hotpath",
+    "rustfs-policy/hotpath",
+    "rustfs-rio?/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-tls-runtime?/hotpath",
+    "rustfs-trusted-proxies?/hotpath",
+    "rustfs-utils/hotpath",
+    "rustfs-test-utils/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-ecstore?/hotpath-alloc",
+    "rustfs-iam/hotpath-alloc",
+    "rustfs-keystone?/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
+    "rustfs-rio?/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-tls-runtime?/hotpath-alloc",
+    "rustfs-trusted-proxies?/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+    "rustfs-test-utils/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-ecstore?/hotpath-cpu",
+    "rustfs-iam/hotpath-cpu",
+    "rustfs-keystone?/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-rio?/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-tls-runtime?/hotpath-cpu",
+    "rustfs-trusted-proxies?/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+    "rustfs-test-utils/hotpath-cpu",
+]
+ftps = ["dep:libunftp", "dep:unftp-core", "dep:rustls", "dep:rustfs-tls-runtime", "dep:subtle"]
 swift = [
     "dep:rustfs-keystone",
     "dep:rustfs-ecstore",
@@ -44,28 +96,32 @@ swift = [
     "dep:tokio-util",
     "dep:serde",
     "dep:urlencoding",
-    "dep:md5",
-    "dep:quick-xml",
+    "dep:md-5",
     "dep:hmac",
     "dep:sha1",
-    "dep:hex",
+    "dep:hex-simd",
+    "dep:ipnetwork",
+    "dep:rustfs-trusted-proxies",
     "dep:astral-tokio-tar",
-    "dep:base64",
+    "dep:base64-simd",
     "dep:async-compression",
 ]
-webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http-body-util", "dep:tokio-rustls", "dep:base64", "dep:rustls", "dep:percent-encoding"]
+webdav = ["dep:dav-server", "dep:hyper", "dep:hyper-util", "dep:http", "dep:http-body-util", "dep:tokio-rustls", "dep:base64-simd", "dep:rustls", "dep:percent-encoding", "dep:rustfs-tls-runtime", "dep:subtle"]
 sftp = ["dep:russh", "dep:russh-sftp", "dep:uuid", "dep:subtle", "dep:tokio-util", "dep:socket2"]
 
 [dependencies]
+hotpath.workspace = true
 # Core RustFS dependencies
 rustfs-iam = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-policy = { workspace = true }
 rustfs-utils = { workspace = true }
 rustfs-config = { workspace = true }
+rustfs-storage-api = { workspace = true }
+rustfs-tls-runtime = { workspace = true, optional = true }
 
 # Async dependencies
-tokio = { workspace = true, features = ["fs", "io-util", "sync", "time","io-uring"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "sync", "time"] }
 tracing = { workspace = true }
 futures-util = { workspace = true }
 
@@ -73,20 +129,20 @@ futures-util = { workspace = true }
 thiserror = { workspace = true }
 
 # Serialization
-serde_json = { workspace = true }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 # Utilities
 async-trait = { workspace = true }
-time = { workspace = true }
-bytes = { workspace = true }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
+bytes = { workspace = true, features = ["serde"] }
 
 # S3 API dependencies
-s3s = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
 
 # FTPS specific dependencies (optional)
-libunftp = { workspace = true, optional = true }
+libunftp = { workspace = true, optional = true, features = ["experimental"] }
 unftp-core = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, default-features = false, optional = true, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 
 # Swift specific dependencies (optional)
 rustfs-keystone = { workspace = true, optional = true }
@@ -94,42 +150,45 @@ rustfs-ecstore = { workspace = true, optional = true }
 rustfs-rio = { workspace = true, optional = true }
 axum = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-tower = { workspace = true, optional = true }
+tower = { workspace = true, optional = true, features = ["timeout"] }
 regex = { workspace = true, optional = true }
 percent-encoding = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
-uuid = { workspace = true, optional = true }
+uuid = { workspace = true, optional = true, features = ["v4", "fast-rng", "macro-diagnostics"] }
 futures = { workspace = true, optional = true }
 http-body-util = { workspace = true, optional = true }
-tokio-util = { workspace = true, optional = true, features = ["rt"] }
-serde = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true, features = ["rt", "io", "compat"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
 urlencoding = { workspace = true, optional = true }
-md5 = { workspace = true, optional = true }
-quick-xml = { workspace = true, optional = true, features = ["serialize"] }
+md-5 = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 sha1 = { workspace = true, optional = true }
-hex = { workspace = true, optional = true }
+hex-simd = { workspace = true, optional = true }
+ipnetwork = { workspace = true, optional = true }
+rustfs-trusted-proxies = { workspace = true, optional = true }
 astral-tokio-tar = { workspace = true, optional = true }
-base64 = { workspace = true, optional = true }
+base64-simd = { workspace = true, optional = true }
 async-compression = { workspace = true, optional = true, features = ["tokio", "gzip", "bzip2"] }
 
 # WebDAV specific dependencies (optional)
 dav-server = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-hyper-util = { workspace = true, optional = true }
-tokio-rustls = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, optional = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+tokio-rustls = { workspace = true, default-features = false, optional = true, features = ["logging", "tls12", "aws-lc-rs"] }
 
 # SFTP specific dependencies (optional)
-russh = { workspace = true, optional = true }
+russh = { workspace = true, optional = true, features = ["serde"] }
 russh-sftp = { workspace = true, optional = true }
 subtle = { workspace = true, optional = true }
-socket2 = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true, features = ["all"] }
 
 [dev-dependencies]
+http = { workspace = true }
 tempfile = { workspace = true }
 proptest = "1"
-rcgen = { workspace = true }
-tracing-subscriber = { workspace = true }
+rustfs-test-utils = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "time"] }
+tokio = { workspace = true, features = ["test-util", "macros", "fs"] }
 
 [package.metadata.docs.rs]
 all-features = true

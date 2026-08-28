@@ -23,6 +23,12 @@ export no_proxy="${NO_PROXY}"
 # Ensure user-level Python scripts are discoverable (awscurl/tox installed via --user)
 PYTHON_VERSION=$(python3 -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')" 2>/dev/null || echo "3.14")
 export PATH="$HOME/Library/Python/${PYTHON_VERSION}/bin:$HOME/.local/bin:$PATH"
+if command -v uv >/dev/null 2>&1; then
+    UV_TOOL_BIN="$(uv tool dir --bin 2>/dev/null || true)"
+    if [ -n "${UV_TOOL_BIN}" ]; then
+        export PATH="${UV_TOOL_BIN}:$PATH"
+    fi
+fi
 
 # Configuration
 S3_ACCESS_KEY="${S3_ACCESS_KEY:-rustfsadmin}"
@@ -33,10 +39,44 @@ S3_REGION="${S3_REGION:-us-east-1}"
 S3_HOST="${S3_HOST:-127.0.0.1}"
 S3_PORT="${S3_PORT:-9000}"
 
+# Keep the compatibility harness focused on foreground S3 API behavior.
+# The background scanner can race short-lived test buckets and add avoidable
+# metacache/listing pressure on small CI runners.
+export RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED:-false}"
+export RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS:-3600}"
+export RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE:-3600}"
+
 # Test parameters
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
+# Test scope:
+#   "implemented" (default) - run only the implemented_tests.txt whitelist (PR gate)
+#   "all"                   - run the entire upstream suite (scheduled full sweep)
+TEST_SCOPE="${TEST_SCOPE:-implemented}"
+if [[ "${TEST_SCOPE}" != "implemented" && "${TEST_SCOPE}" != "all" ]]; then
+    echo "[ERROR] Invalid TEST_SCOPE: ${TEST_SCOPE} (must be \"implemented\" or \"all\")" >&2
+    exit 1
+fi
+S3_SHARD_COUNT="${S3_SHARD_COUNT:-1}"
+S3_SHARD_INDEX="${S3_SHARD_INDEX:-0}"
+TEST_TIMEOUT="${TEST_TIMEOUT:-300}"
+if [[ ! "${S3_SHARD_COUNT}" =~ ^[1-9][0-9]*$ ]] \
+    || [[ ! "${S3_SHARD_INDEX}" =~ ^[0-9]+$ ]] \
+    || (( S3_SHARD_INDEX >= S3_SHARD_COUNT )); then
+    echo "[ERROR] Invalid S3 shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT}" >&2
+    exit 1
+fi
+if [[ ! "${TEST_TIMEOUT}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] Invalid TEST_TIMEOUT: ${TEST_TIMEOUT}" >&2
+    exit 1
+fi
+
+# Upstream ceph/s3-tests suite, pinned for reproducible runs.
+# Bump S3TESTS_REV deliberately: upstream changes can rename tests or change
+# assertions, so a bump usually requires reclassifying the test list files.
+S3TESTS_REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
+S3TESTS_REV="${S3TESTS_REV:-5522d1c351f75bc00ae0f64f742f3f095f5939d9}"
 
 # Compatibility default for the s3-tests harness:
 # this script provisions multiple local export directories on the same physical disk.
@@ -83,7 +123,10 @@ log_error() {
 
 # Test list files location
 TEST_LISTS_DIR="${SCRIPT_DIR}"
-IMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/implemented_tests.txt"
+# IMPLEMENTED_TESTS_FILE may be overridden to run an alternate exact-node-id
+# whitelist (e.g. lifecycle_behavior_tests.txt for the dedicated lifecycle
+# behavior lane, which needs RUSTFS_ILM_DEBUG_DAY_SECS + the scanner enabled).
+IMPLEMENTED_TESTS_FILE="${IMPLEMENTED_TESTS_FILE:-${TEST_LISTS_DIR}/implemented_tests.txt}"
 UNIMPLEMENTED_TESTS_FILE="${TEST_LISTS_DIR}/unimplemented_tests.txt"
 EXCLUDED_TESTS_FILE="${TEST_LISTS_DIR}/excluded_tests.txt"
 S3_TEST_FILE="s3tests/functional/test_s3.py"
@@ -140,7 +183,12 @@ fi
 #   2. Easy maintenance - edit txt files to add/remove tests
 #   3. Separation of concerns - test classification vs test execution
 # =============================================================================
-if [[ -z "${TESTEXPR:-}" ]]; then
+TESTEXPR="${TESTEXPR:-}"
+if [[ -n "${TESTEXPR}" ]]; then
+    log_info "Using custom TESTEXPR selection: ${TESTEXPR}"
+elif [[ "${TEST_SCOPE}" == "all" ]]; then
+    log_info "TEST_SCOPE=all: running the entire upstream test suite (no whitelist)"
+else
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
         load_testnodes_from_file "${IMPLEMENTED_TESTS_FILE}"
@@ -190,14 +238,25 @@ S3TESTS_CONF="${S3TESTS_CONF:-s3tests.conf}"
 DEPLOY_MODE="${DEPLOY_MODE:-build}"
 RUSTFS_BINARY="${RUSTFS_BINARY:-}"
 NO_CACHE="${NO_CACHE:-false}"
+S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT="MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY="
 
 # Additional directories (SCRIPT_DIR and PROJECT_ROOT defined earlier)
 ARTIFACTS_DIR="${PROJECT_ROOT}/artifacts/s3tests-${TEST_MODE}"
 CONTAINER_NAME="rustfs-${TEST_MODE}"
 NETWORK_NAME="rustfs-net"
 DATA_ROOT="${DATA_ROOT:-target}"
-DATA_DIR="${PROJECT_ROOT}/${DATA_ROOT}/test-data/${CONTAINER_NAME}"
+if [[ "${DATA_ROOT}" = /* ]]; then
+    DATA_BASE="${DATA_ROOT}"
+else
+    DATA_BASE="${PROJECT_ROOT}/${DATA_ROOT}"
+fi
+DATA_DIR="${DATA_BASE}/test-data/${CONTAINER_NAME}"
 RUSTFS_PID=""
+
+if [ "${DEPLOY_MODE}" != "existing" ] && [ -z "${RUSTFS_SSE_S3_MASTER_KEY:-}" ]; then
+    export RUSTFS_SSE_S3_MASTER_KEY="${S3TESTS_LOCAL_SSE_MASTER_KEY_DEFAULT}"
+    log_info "Using deterministic local SSE-S3 master key for the s3-tests harness"
+fi
 
 show_usage() {
     cat << EOF
@@ -222,8 +281,16 @@ Environment Variables:
   S3_SECRET_KEY          - Main user secret key (default: rustfsadmin)
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
-  MAXFAIL                - Stop after N failures (default: 1)
+  RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
+  RUSTFS_SCANNER_ENABLED - Enable background scanner for harness service (default: false)
+  MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
+  TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
+  S3_SHARD_COUNT         - Number of deterministic exact-node-ID shards (default: 1)
+  S3_SHARD_INDEX         - Zero-based shard index (default: 0)
+  TEST_TIMEOUT           - Per-test timeout in seconds (default: 300)
+  S3TESTS_REPO           - s3-tests repository URL (default: https://github.com/ceph/s3-tests.git)
+  S3TESTS_REV            - Pinned s3-tests commit; bump deliberately and reclassify test lists
   MARKEXPR               - pytest marker expression (default: no marker filtering)
   TESTEXPR               - pytest -k expression (overrides implemented_tests.txt node list)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
@@ -438,6 +505,10 @@ elif [ "${DEPLOY_MODE}" = "docker" ]; then
         -e RUSTFS_ADDRESS=0.0.0.0:9000 \
         -e RUSTFS_ACCESS_KEY="${S3_ACCESS_KEY}" \
         -e RUSTFS_SECRET_KEY="${S3_SECRET_KEY}" \
+        -e RUSTFS_SSE_S3_MASTER_KEY="${RUSTFS_SSE_S3_MASTER_KEY}" \
+        -e RUSTFS_SCANNER_ENABLED="${RUSTFS_SCANNER_ENABLED}" \
+        -e RUSTFS_SCANNER_START_DELAY_SECS="${RUSTFS_SCANNER_START_DELAY_SECS}" \
+        -e RUSTFS_SCANNER_CYCLE="${RUSTFS_SCANNER_CYCLE}" \
         -e RUSTFS_VOLUMES="/data/rustfs0 /data/rustfs1 /data/rustfs2 /data/rustfs3" \
         -v "/tmp/${CONTAINER_NAME}:/data" \
         rustfs-ci || {
@@ -513,19 +584,17 @@ check_server_ready_from_log() {
 
 # Test S3 API readiness
 test_s3_api_ready() {
-    # Step 1: Check if server is responding using /health endpoint
-    # /health is a probe path that bypasses readiness gate, so it can be used
-    # to check if the server is up and running, even if readiness gate is not ready yet
-    HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+    # Step 1: Require the dependency-aware readiness endpoint.
+    READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
         -X GET \
-        "http://${S3_HOST}:${S3_PORT}/health" \
+        "http://${S3_HOST}:${S3_PORT}/health/ready" \
         --max-time 5 2>/dev/null || echo "000")
 
-    if [ "${HEALTH_CODE}" = "000" ]; then
+    if [ "${READY_CODE}" = "000" ]; then
         # Connection failed - server might not be running or not listening yet
         return 1
-    elif [ "${HEALTH_CODE}" != "200" ]; then
-        # Health endpoint returned non-200 status, server might have issues
+    elif [ "${READY_CODE}" != "200" ]; then
+        # The service is live but its storage/IAM dependencies are not ready.
         return 1
     fi
 
@@ -546,16 +615,11 @@ test_s3_api_ready() {
         if echo "${RESPONSE}" | grep -q "503\|Service not ready"; then
             return 1  # Not ready yet (readiness gate is blocking S3 API)
         fi
-        # Other errors from awscurl - might be auth issues or other problems
-        # But server is up, so we'll consider it ready (S3 API might have other issues)
-        return 0
+        # Authentication, server, and transport failures are not readiness.
+        return 1
     fi
 
-    # Step 3: Fallback - if /health returns 200, server is up and readiness gate is ready
-    # Since /health is a probe path and returns 200, and we don't have awscurl to test S3 API,
-    # we can assume the server is ready. The readiness gate would have blocked /health if not ready.
-    # Note: Root path "/" with HEAD method returns 501 Not Implemented (S3 doesn't support HEAD on root),
-    # so we can't use it as a reliable test. Since /health already confirmed readiness, we return success.
+    # /health/ready is authoritative when the optional signed probe is absent.
     return 0
 }
 
@@ -655,8 +719,16 @@ log_info "Generating s3tests config..."
 mkdir -p "${ARTIFACTS_DIR}"
 
 # Resolve template and output paths (relative to PROJECT_ROOT)
-TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF_TEMPLATE}" = /* ]]; then
+    TEMPLATE_PATH="${S3TESTS_CONF_TEMPLATE}"
+else
+    TEMPLATE_PATH="${PROJECT_ROOT}/${S3TESTS_CONF_TEMPLATE}"
+fi
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
 
 # Check if template exists
 if [ ! -f "${TEMPLATE_PATH}" ]; then
@@ -681,9 +753,10 @@ fi
 
 log_info "Using template: ${TEMPLATE_PATH}"
 log_info "Generating config: ${CONF_OUTPUT_PATH}"
+mkdir -p "$(dirname "${CONF_OUTPUT_PATH}")"
 
 # Export all required variables for envsubst
-export S3_HOST S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
+export S3_HOST S3_PORT S3_ACCESS_KEY S3_SECRET_KEY S3_ALT_ACCESS_KEY S3_ALT_SECRET_KEY
 envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
     log_error "Failed to generate s3tests config"
     exit 1
@@ -694,9 +767,48 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
 log_info "Provisioning s3-tests alt user..."
 
 # Helper function to install Python packages with fallback for externally-managed environments
+ensure_python_pip() {
+    if python3 -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info "Installing pip for Python package setup..."
+    if python3 -m ensurepip --upgrade >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y python3-pip || {
+            log_warn "Failed to install python3-pip via apt-get"
+        }
+    elif command -v brew >/dev/null 2>&1; then
+        brew install python || {
+            log_warn "Failed to install Python via brew"
+        }
+    fi
+
+    python3 -m pip --version >/dev/null 2>&1
+}
+
 install_python_package() {
     local package=$1
     local error_output
+
+    if command -v uv >/dev/null 2>&1; then
+        if uv tool install --upgrade "${package}"; then
+            UV_TOOL_BIN="$(uv tool dir --bin 2>/dev/null || true)"
+            if [ -n "${UV_TOOL_BIN}" ]; then
+                export PATH="${UV_TOOL_BIN}:$PATH"
+            fi
+            return 0
+        fi
+        log_warn "Failed to install ${package} with uv, falling back to python3 -m pip"
+    fi
+
+    ensure_python_pip || {
+        log_error "python3 -m pip is unavailable"
+        return 1
+    }
 
     # Try --user first (works on most Linux systems)
     error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)
@@ -780,13 +892,34 @@ awscurl \
 
 log_info "Alt user provisioned successfully"
 
-# Step 8: Prepare s3-tests
-log_info "Preparing s3-tests..."
-if [ ! -d "${PROJECT_ROOT}/s3-tests" ]; then
-    git clone --depth 1 https://github.com/ceph/s3-tests.git "${PROJECT_ROOT}/s3-tests" || {
-        log_error "Failed to clone s3-tests"
+# Step 8: Prepare s3-tests, pinned to S3TESTS_REV for reproducible runs
+log_info "Preparing s3-tests at ${S3TESTS_REV}..."
+if [ ! -d "${PROJECT_ROOT}/s3-tests/.git" ]; then
+    git init -q "${PROJECT_ROOT}/s3-tests"
+    git -C "${PROJECT_ROOT}/s3-tests" remote add origin "${S3TESTS_REPO}"
+fi
+if ! git -C "${PROJECT_ROOT}/s3-tests" cat-file -e "${S3TESTS_REV}^{commit}" 2>/dev/null; then
+    git -C "${PROJECT_ROOT}/s3-tests" fetch --depth 1 origin "${S3TESTS_REV}" || {
+        log_error "Failed to fetch s3-tests revision ${S3TESTS_REV} from ${S3TESTS_REPO}"
         exit 1
     }
+fi
+# -f discards local edits left by previous runs (e.g. pytest-xdist appended to requirements.txt)
+git -C "${PROJECT_ROOT}/s3-tests" checkout -qf --detach "${S3TESTS_REV}" || {
+    log_error "Failed to checkout s3-tests revision ${S3TESTS_REV}"
+    exit 1
+}
+
+S3TESTS_PATCH_DIR="${SCRIPT_DIR}/patches"
+if [ -d "${S3TESTS_PATCH_DIR}" ]; then
+    for patch_file in "${S3TESTS_PATCH_DIR}"/*.patch; do
+        [ -e "${patch_file}" ] || continue
+        log_info "Applying s3-tests patch: ${patch_file##*/}"
+        git -C "${PROJECT_ROOT}/s3-tests" apply "${patch_file}" || {
+            log_error "Failed to apply s3-tests patch: ${patch_file}"
+            exit 1
+        }
+    done
 fi
 
 cd "${PROJECT_ROOT}/s3-tests"
@@ -809,25 +942,92 @@ mkdir -p "${ARTIFACTS_DIR}"
 XDIST_ARGS=""
 if [ "${XDIST}" != "0" ]; then
     # Add pytest-xdist to requirements.txt so tox installs it inside its virtualenv
-    echo "pytest-xdist" >> requirements.txt
+    grep -qxF "pytest-xdist" requirements.txt || echo "pytest-xdist" >> requirements.txt
     XDIST_ARGS="-n ${XDIST} --dist=loadgroup"
 fi
+grep -qxF "pytest-timeout" requirements.txt || echo "pytest-timeout" >> requirements.txt
 
 # Resolve config path (absolute path for tox)
-CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+if [[ "${S3TESTS_CONF}" = /* ]]; then
+    CONF_OUTPUT_PATH="${S3TESTS_CONF}"
+else
+    CONF_OUTPUT_PATH="${PROJECT_ROOT}/${S3TESTS_CONF}"
+fi
 
 PYTEST_SELECTION_ARGS=()
 if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then
     PYTEST_SELECTION_ARGS=("${TEST_NODE_ARGS[@]}")
-else
+elif [[ -n "${TESTEXPR}" ]]; then
     PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}" -k "${TESTEXPR}")
+else
+    # TEST_SCOPE=all: the whole upstream suite
+    PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}")
+fi
+
+collect_nodeids() {
+    local output_path="$1"
+    shift
+    local collect_log="${output_path%.txt}.log"
+    local collect_rc=0
+    local node_prefix="${S3_TEST_FILE//./\\.}::"
+
+    set +e
+    S3TEST_CONF="${CONF_OUTPUT_PATH}" tox -- -q --collect-only "$@" 2>&1 | tee "${collect_log}"
+    collect_rc=${PIPESTATUS[0]}
+    set -e
+    if [ "${collect_rc}" -ne 0 ]; then
+        log_error "pytest collection failed with exit code ${collect_rc}"
+        return "${collect_rc}"
+    fi
+    grep -E "^${node_prefix}" "${collect_log}" > "${output_path}" || true
+    if [ ! -s "${output_path}" ]; then
+        log_error "pytest collection produced no S3 test node IDs"
+        return 1
+    fi
+}
+
+ALL_COLLECTED_NODEIDS="${ARTIFACTS_DIR}/all-collected-nodeids.txt"
+UNSHARDED_SELECTED_NODEIDS="${ARTIFACTS_DIR}/unsharded-selected-nodeids.txt"
+SELECTED_NODEIDS="${ARTIFACTS_DIR}/selected-nodeids.txt"
+collect_nodeids "${ALL_COLLECTED_NODEIDS}" "${S3_TEST_FILE}" -m "not rustfs_never_marker"
+python3 "${SCRIPT_DIR}/report_compat.py" \
+    --lists-dir "${SCRIPT_DIR}" \
+    --collected-nodeids "${ALL_COLLECTED_NODEIDS}" \
+    --check-classifications-only || {
+    log_error "S3 test classifications do not match pinned revision ${S3TESTS_REV}"
+    exit 1
+}
+if [[ "${TEST_SCOPE}" == "all" && -z "${TESTEXPR}" && "${MARKEXPR}" == "not rustfs_never_marker" ]]; then
+    cp "${ALL_COLLECTED_NODEIDS}" "${UNSHARDED_SELECTED_NODEIDS}"
+else
+    collect_nodeids "${UNSHARDED_SELECTED_NODEIDS}" "${PYTEST_SELECTION_ARGS[@]}" -m "${MARKEXPR}"
+fi
+
+if (( S3_SHARD_COUNT > 1 )); then
+    awk -v count="${S3_SHARD_COUNT}" -v shard_index="${S3_SHARD_INDEX}" \
+        '((NR - 1) % count) == shard_index' \
+        "${UNSHARDED_SELECTED_NODEIDS}" > "${SELECTED_NODEIDS}"
+    if [[ ! -s "${SELECTED_NODEIDS}" ]]; then
+        log_error "Shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT} selected no tests"
+        exit 1
+    fi
+    PYTEST_SELECTION_ARGS=()
+    while IFS= read -r nodeid; do
+        PYTEST_SELECTION_ARGS+=("${nodeid}")
+    done < "${SELECTED_NODEIDS}"
+    log_info "Selected shard ${S3_SHARD_INDEX}/${S3_SHARD_COUNT}: ${#PYTEST_SELECTION_ARGS[@]} exact cases"
+else
+    cp "${UNSHARDED_SELECTED_NODEIDS}" "${SELECTED_NODEIDS}"
 fi
 
 # Run tests from s3tests/functional
+# Failure locals can contain multi-MiB request bodies; keep tracebacks without expanding local values.
+set +e
 S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     tox -- \
-    -vv -ra --showlocals --tb=long \
+    -vv -ra --tb=long \
     --maxfail="${MAXFAIL}" \
+    --timeout="${TEST_TIMEOUT}" \
     --junitxml="${ARTIFACTS_DIR}/junit.xml" \
     ${XDIST_ARGS} \
     "${PYTEST_SELECTION_ARGS[@]}" \
@@ -835,6 +1035,7 @@ S3TEST_CONF="${CONF_OUTPUT_PATH}" \
     2>&1 | tee "${ARTIFACTS_DIR}/pytest.log"
 
 TEST_EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 # Step 10: Collect RustFS logs
 log_info "Collecting RustFS logs..."
@@ -851,6 +1052,23 @@ elif [ "${DEPLOY_MODE}" = "existing" ]; then
     echo "{\"host\": \"${S3_HOST}\", \"port\": ${S3_PORT}, \"mode\": \"existing\"}" > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/inspect.json" || true
 fi
 
+# Step 11: Classification report and gate
+REPORT_SCRIPT="${SCRIPT_DIR}/report_compat.py"
+REPORT_ARGS=(
+    --junit "${ARTIFACTS_DIR}/junit.xml"
+    --lists-dir "${SCRIPT_DIR}"
+    --collected-nodeids "${SELECTED_NODEIDS}"
+    --output "${ARTIFACTS_DIR}/compat-report.md"
+    --fail-on-regression
+)
+if [[ "${TEST_SCOPE}" == "all" ]]; then
+    REPORT_ARGS+=(--fail-on-unclassified)
+fi
+set +e
+python3 "${REPORT_SCRIPT}" "${REPORT_ARGS[@]}"
+REPORT_EXIT_CODE=$?
+set -e
+
 # Summary
 if [ ${TEST_EXIT_CODE} -eq 0 ]; then
     log_info "Tests completed successfully!"
@@ -863,4 +1081,10 @@ else
     log_info "Check RustFS logs: ${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/rustfs.log"
 fi
 
-exit ${TEST_EXIT_CODE}
+if [[ "${TEST_EXIT_CODE}" -ne 0 && "${TEST_EXIT_CODE}" -ne 1 ]]; then
+    exit "${TEST_EXIT_CODE}"
+fi
+if [[ "${TEST_SCOPE}" == "implemented" && "${TEST_EXIT_CODE}" -ne 0 ]]; then
+    exit "${TEST_EXIT_CODE}"
+fi
+exit "${REPORT_EXIT_CODE}"

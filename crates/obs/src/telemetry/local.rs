@@ -36,7 +36,7 @@ use crate::cleaner::LogCleaner;
 use crate::cleaner::types::{CompressionAlgorithm, FileMatchMode};
 use crate::config::OtelConfig;
 use crate::global::{METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL, METRIC_LOG_CLEANER_RUNS_TOTAL, set_observability_metric_enabled};
-use crate::telemetry::filter::build_env_filter;
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 use metrics::counter;
 use rustfs_config::observability::{
@@ -47,16 +47,202 @@ use rustfs_config::observability::{
     DEFAULT_OBS_LOG_PARALLEL_WORKERS, DEFAULT_OBS_LOG_ZSTD_COMPRESSION_LEVEL, DEFAULT_OBS_LOG_ZSTD_FALLBACK_TO_GZIP,
     DEFAULT_OBS_LOG_ZSTD_WORKERS,
 };
-use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED};
+use rustfs_config::{APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME};
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
+use std::{collections::BTreeMap, fmt};
 use std::{fs, io::IsTerminal, time::Duration};
-use tracing::info;
+use tracing::Subscriber;
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_subscriber::{
-    fmt::{format::FmtSpan, time::LocalTime},
+    fmt::{
+        FormatEvent,
+        format::{FmtSpan, Format, Json, JsonFields, Writer},
+        time::LocalTime,
+    },
     layer::SubscriberExt,
+    registry::LookupSpan,
     util::SubscriberInitExt,
 };
+
+const LOG_COMPONENT_OBS: &str = "obs";
+const LOG_SUBSYSTEM_LOCAL_LOGGING: &str = "local_logging";
+const EVENT_LOCAL_LOGGING_STATE: &str = "local_logging_state";
+const EVENT_LOG_CLEANER_STATE: &str = "log_cleaner_state";
+const STDERR_WARNING_PREFIX: &str = "[WARN]";
+const REQUEST_ID_CANONICAL: &str = "request_id";
+const REQUEST_ID_COMPAT: &str = "request-id";
+
+pub(super) fn resolve_file_stdout_mirror(configured: Option<bool>, is_production: bool) -> bool {
+    configured.unwrap_or(!is_production)
+}
+
+#[cfg(unix)]
+pub(super) fn validate_stdout_sink(file_appender: &RollingAppender) -> Result<(), TelemetryError> {
+    use std::os::fd::AsFd;
+
+    let stdout_stat = rustix::fs::fstat(std::io::stdout().as_fd())
+        .map_err(|error| TelemetryError::LogSinkConflict(format!("failed to inspect stdout file descriptor: {error}")))?;
+    if !rustix::fs::FileType::from_raw_mode(stdout_stat.st_mode).is_file() {
+        return Ok(());
+    }
+
+    let stdout_device = {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            stdout_stat.st_dev
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        {
+            u64::try_from(stdout_stat.st_dev).map_err(|error| {
+                TelemetryError::LogSinkConflict(format!("stdout file descriptor returned an invalid device identifier: {error}"))
+            })?
+        }
+    };
+    let active_identity = file_appender
+        .active_file_identity()
+        .map_err(|error| TelemetryError::Io(error.to_string()))?;
+    validate_distinct_file_identities((stdout_device, stdout_stat.st_ino), active_identity, &file_appender.active_file_path())
+}
+
+#[cfg(not(unix))]
+pub(super) fn validate_stdout_sink(_file_appender: &RollingAppender) -> Result<(), TelemetryError> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_distinct_file_identities(
+    stdout_identity: (u64, u64),
+    active_identity: (u64, u64),
+    active_log_path: &std::path::Path,
+) -> Result<(), TelemetryError> {
+    if stdout_identity == active_identity {
+        return Err(TelemetryError::LogSinkConflict(format!(
+            "stdout and rolling log resolve to the same file {}; route stdout to journald or choose a different log file",
+            active_log_path.display()
+        )));
+    }
+
+    Ok(())
+}
+
+fn resolve_log_cleanup_interval_seconds(config: &OtelConfig) -> u64 {
+    match config.log_cleanup_interval_seconds {
+        Some(0) => {
+            warn!(
+                event = EVENT_LOG_CLEANER_STATE,
+                component = LOG_COMPONENT_OBS,
+                subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                result = "invalid_cleanup_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
+                "log cleaner state changed"
+            );
+            DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS
+        }
+        Some(seconds) => seconds,
+        None => DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS,
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RequestIdJsonFormat<T> {
+    inner: Format<Json, T>,
+}
+
+impl<T> RequestIdJsonFormat<T> {
+    fn new(inner: Format<Json, T>) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S, T> FormatEvent<S, JsonFields> for RequestIdJsonFormat<T>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    T: tracing_subscriber::fmt::time::FormatTime,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, JsonFields>,
+        mut writer: Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> fmt::Result {
+        let mut buffer = String::new();
+        self.inner.format_event(ctx, Writer::new(&mut buffer), event)?;
+
+        let request_id = span_scope_request_id(ctx, event);
+        if request_id.is_none() {
+            return writer.write_str(&buffer);
+        }
+
+        let trimmed = buffer.trim_end();
+        let mut payload: JsonValue = serde_json::from_str(trimmed).map_err(|_| fmt::Error)?;
+        if let Some(object) = payload.as_object_mut() {
+            let request_id = request_id.expect("checked is_some");
+            object
+                .entry(REQUEST_ID_CANONICAL.to_string())
+                .or_insert_with(|| JsonValue::String(request_id.clone()));
+            // Keep a top-level compatibility alias for operators or downstream
+            // queries that already rely on the earlier hyphenated field name.
+            object
+                .entry(REQUEST_ID_COMPAT.to_string())
+                .or_insert_with(|| JsonValue::String(request_id));
+        }
+
+        let serialized = serde_json::to_string(&payload).map_err(|_| fmt::Error)?;
+        writer.write_str(&serialized)?;
+        writer.write_char('\n')
+    }
+}
+
+fn span_scope_request_id<S>(
+    ctx: &tracing_subscriber::fmt::FmtContext<'_, S, JsonFields>,
+    event: &tracing::Event<'_>,
+) -> Option<String>
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+    let current_span = event.parent().and_then(|id| ctx.span(id)).or_else(|| ctx.lookup_current())?;
+    let mut request_id = None;
+
+    for span in current_span.scope().from_root() {
+        let extensions = span.extensions();
+        let formatted_fields = extensions.get::<tracing_subscriber::fmt::FormattedFields<JsonFields>>()?;
+        let fields: BTreeMap<String, JsonValue> = serde_json::from_str(&formatted_fields.fields).ok()?;
+        if let Some(value) = fields
+            .get(REQUEST_ID_CANONICAL)
+            .or_else(|| fields.get(REQUEST_ID_COMPAT))
+            .and_then(JsonValue::as_str)
+        {
+            request_id = Some(value.to_string());
+        }
+    }
+
+    request_id
+}
+
+pub(super) fn build_json_log_layer<S, W>(writer: W, enable_ansi: bool, span_events: FmtSpan) -> impl tracing_subscriber::Layer<S>
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
+{
+    tracing_subscriber::fmt::layer()
+        .with_timer(LocalTime::rfc_3339())
+        .with_target(true)
+        .with_ansi(enable_ansi)
+        .with_thread_names(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
+        .with_writer(writer)
+        .json()
+        .flatten_event(true)
+        .with_current_span(true)
+        .with_span_list(true)
+        .with_span_events(span_events)
+        .map_event_format(RequestIdJsonFormat::new)
+}
 
 /// Initialize local logging (stdout-only or file-rolling).
 ///
@@ -99,13 +285,14 @@ pub(super) fn init_local_logging(
         match init_file_logging_internal(config, log_directory, logger_level, is_production) {
             Ok(guard) => Ok(guard),
             Err(error) if should_fallback_to_stdout(&error) => {
+                let guard = init_stdout_only(config, logger_level, is_production)?;
                 emit_file_logging_fallback_warning(log_directory, &error);
-                Ok(init_stdout_only(config, logger_level, is_production))
+                Ok(guard)
             }
             Err(error) => Err(error),
         }
     } else {
-        Ok(init_stdout_only(config, logger_level, is_production))
+        init_stdout_only(config, logger_level, is_production)
     }
 }
 
@@ -121,46 +308,47 @@ pub(super) fn init_local_logging(
 /// * `_config` - Unused at the moment; reserved for future configuration.
 /// * `logger_level` - Effective log level string.
 /// * `is_production` - Controls span event verbosity.
-fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> OtelGuard {
+fn init_stdout_only(_config: &OtelConfig, logger_level: &str, is_production: bool) -> Result<OtelGuard, TelemetryError> {
     let env_filter = build_env_filter(logger_level, None);
     let (nb, guard) = tracing_appender::non_blocking(std::io::stdout());
+    let span_events = if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL };
 
     // Keep stdout formatting JSON-shaped even in local-only mode so operators
     // can ship the same log schema to external collectors if needed.
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTime::rfc_3339())
-        .with_target(true)
-        .with_ansi(std::io::stdout().is_terminal())
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_writer(nb)
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_span_events(if is_production { FmtSpan::CLOSE } else { FmtSpan::FULL });
+    let fmt_layer = build_json_log_layer(nb, std::io::stdout().is_terminal(), span_events);
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
         .with(fmt_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     set_observability_metric_enabled(false);
     counter!("rustfs_start_total").increment(1);
-    info!("Init stdout logging (level: {})", logger_level);
+    info!(
+        event = EVENT_LOCAL_LOGGING_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "initialized",
+        backend = "local",
+        sink = "stdout",
+        output_format = "json",
+        logger_level,
+        is_production,
+        "local logging state"
+    );
 
-    OtelGuard {
+    Ok(OtelGuard {
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard: None,
         cleanup_handle: None,
-    }
+    })
 }
 
 // ─── File-rolling ─────────────────────────────────────────────────────────────
@@ -181,7 +369,8 @@ fn init_file_logging_internal(
     is_production: bool,
 ) -> Result<OtelGuard, TelemetryError> {
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME);
-    let log_filename = config.log_filename.as_deref().unwrap_or(service_name);
+    let resolved_log_filename = resolve_log_cleanup_file_pattern(config, service_name);
+    let log_filename = resolved_log_filename.as_str();
     let keep_files = config.log_keep_files.unwrap_or(DEFAULT_LOG_KEEP_FILES);
 
     // ── 1. Ensure the log directory exists ───────────────────────────────────
@@ -218,6 +407,7 @@ fn init_file_logging_internal(
 
     let file_appender =
         RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+    validate_stdout_sink(&file_appender)?;
 
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
@@ -227,53 +417,27 @@ fn init_file_logging_internal(
 
     // File output stays machine-readable and free of ANSI sequences so the
     // resulting files are safe to parse or ship to log processors.
-    let file_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTime::rfc_3339())
-        .with_target(true)
-        .with_ansi(false)
-        .with_thread_names(true)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
-        .with_writer(non_blocking)
-        .json()
-        .with_current_span(true)
-        .with_span_list(true)
-        .with_span_events(span_events.clone());
+    let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
 
     // Optional stdout mirror: enabled explicitly via `log_stdout_enabled`, or
     // unconditionally in non-production environments so developers still see
     // immediate terminal output while file rotation remains enabled.
-    let (stdout_layer, stdout_guard) = if config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    let (stdout_layer, stdout_guard) = if resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_guard) = tracing_appender::non_blocking(std::io::stdout());
         let enable_color = std::io::stdout().is_terminal();
-        (
-            Some(
-                tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTime::rfc_3339())
-                    .with_target(true)
-                    .with_ansi(enable_color)
-                    .with_thread_names(true)
-                    .with_thread_ids(true)
-                    .with_file(true)
-                    .with_line_number(true)
-                    .with_writer(stdout_nb) // .json()
-                    // .with_current_span(true)
-                    // .with_span_list(true)
-                    .with_span_events(span_events),
-            ),
-            Some(stdout_guard),
-        )
+        (Some(build_json_log_layer(stdout_nb, enable_color, span_events)), Some(stdout_guard))
     } else {
         (None, None)
     };
 
     tracing_subscriber::registry()
         .with(env_filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer)
         .with(stdout_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     set_observability_metric_enabled(false);
 
@@ -281,15 +445,26 @@ fn init_file_logging_internal(
     let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
 
     info!(
-        "Init file logging at '{}', rotation: {}, keep {} files",
-        log_directory, rotation_str, keep_files
+        event = EVENT_LOCAL_LOGGING_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "initialized",
+        backend = "local",
+        sink = "file",
+        output_format = "json",
+        log_directory,
+        rotation = %rotation_str,
+        keep_files,
+        stdout_mirror_enabled = stdout_guard.is_some(),
+        is_production,
+        logger_level,
+        "local logging state"
     );
 
     Ok(OtelGuard {
         tracer_provider: None,
         meter_provider: None,
         logger_provider: None,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
         profiling_agent: None,
         tracing_guard: Some(guard),
         stdout_guard,
@@ -349,11 +524,29 @@ pub(super) fn should_fallback_to_stdout(error: &TelemetryError) -> bool {
     }
 }
 
+fn format_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) -> String {
+    format!(
+        "{STDERR_WARNING_PREFIX} local logging fallback to stdout: failed_sink=file sink=stdout log_directory={log_directory} error={error}"
+    )
+}
+
 pub(super) fn emit_file_logging_fallback_warning(log_directory: &str, error: &TelemetryError) {
-    eprintln!(
-        "[WARN] Failed to initialize file observability logging at '{}': {}. Falling back to stdout logging.",
-        log_directory, error
-    );
+    if tracing::dispatcher::has_been_set() {
+        warn!(
+            event = EVENT_LOCAL_LOGGING_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+            state = "fallback_to_stdout",
+            backend = "local",
+            failed_sink = "file",
+            sink = "stdout",
+            log_directory,
+            error = %error,
+            "local logging state changed"
+        );
+    } else {
+        eprintln!("{}", format_file_logging_fallback_warning(log_directory, error));
+    }
 }
 
 // ─── Cleanup task ─────────────────────────────────────────────────────────────
@@ -387,7 +580,7 @@ pub fn spawn_cleanup_task(
     let log_dir = std::path::PathBuf::from(log_directory);
     // Use suffix matching for log files like `2026-03-01-06-21.rustfs.log`
     // where `rustfs.log` is the stable suffix generated by the rolling appender.
-    let file_pattern = config.log_filename.as_deref().unwrap_or(log_filename).to_string();
+    let file_pattern = resolve_log_cleanup_file_pattern(config, log_filename);
     let active_filename = file_pattern.clone();
 
     // Determine match mode from config, defaulting to the repository-wide
@@ -432,9 +625,7 @@ pub fn spawn_cleanup_task(
         .log_min_file_age_seconds
         .unwrap_or(DEFAULT_OBS_LOG_MIN_FILE_AGE_SECONDS);
     let dry_run = config.log_dry_run.unwrap_or(DEFAULT_OBS_LOG_DRY_RUN);
-    let cleanup_interval = config
-        .log_cleanup_interval_seconds
-        .unwrap_or(DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
+    let cleanup_interval = resolve_log_cleanup_interval_seconds(config);
 
     let cleaner = Arc::new(
         LogCleaner::builder(log_dir, file_pattern, active_filename)
@@ -461,14 +652,35 @@ pub fn spawn_cleanup_task(
     );
 
     info!(
+        event = EVENT_LOG_CLEANER_STATE,
+        component = LOG_COMPONENT_OBS,
+        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+        state = "configured",
+        match_mode = %match_mode,
         compression_algorithm = %compression_algorithm,
         parallel_compress,
         parallel_workers,
-        zstd_level,
+        // Echo the *effective* (post-clamp) levels so the log matches what the
+        // codec actually runs with, not the raw configured value.
+        gzip_level = cleaner.effective_gzip_level(),
+        zstd_level = cleaner.effective_zstd_level(),
         zstd_fallback_to_gzip,
         zstd_workers,
-        "log cleaner compression profile configured"
+        "log cleaner state"
     );
+
+    // retention_days == 0 means "keep archives forever" (age expiry disabled),
+    // which is easy to misread as "delete immediately". Warn so an operator who
+    // enabled compression is aware archives rely solely on the byte cap.
+    if compress && retention_days == 0 {
+        warn!(
+            event = EVENT_LOG_CLEANER_STATE,
+            component = LOG_COMPONENT_OBS,
+            subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+            result = "archive_retention_disabled",
+            "compressed archives are kept forever (retention_days=0); disk is bounded only by max_total_size_bytes"
+        );
+    }
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(cleanup_interval));
@@ -485,22 +697,150 @@ pub fn spawn_cleanup_task(
                 }
                 Ok(Err(e)) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!("Log cleanup failed: {}", e);
+                    warn!(
+                        event = EVENT_LOG_CLEANER_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                        result = "cleanup_failed",
+                        error = %e,
+                        "log cleaner state changed"
+                    );
                 }
                 Err(e) => {
                     counter!(METRIC_LOG_CLEANER_RUN_FAILURES_TOTAL).increment(1);
-                    tracing::warn!("Log cleanup task panicked: {}", e);
+                    warn!(
+                        event = EVENT_LOG_CLEANER_STATE,
+                        component = LOG_COMPONENT_OBS,
+                        subsystem = LOG_SUBSYSTEM_LOCAL_LOGGING,
+                        result = "cleanup_task_panicked",
+                        error = %e,
+                        "log cleaner state changed"
+                    );
                 }
             }
         }
     })
 }
 
+fn resolve_log_cleanup_file_pattern(config: &OtelConfig, fallback_log_filename: &str) -> String {
+    match config.log_filename.as_deref() {
+        Some(candidate) if !candidate.trim().is_empty() => candidate.to_string(),
+        _ => fallback_log_filename.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::OtelConfig;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+    use std::io;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
+    use tracing_subscriber::{Registry, layer::SubscriberExt};
+
+    #[derive(Clone, Default)]
+    struct SharedWriter {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct SharedWriterGuard {
+        inner: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for SharedWriter {
+        type Writer = SharedWriterGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            SharedWriterGuard {
+                inner: Arc::clone(&self.inner),
+            }
+        }
+    }
+
+    impl io::Write for SharedWriterGuard {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let mut inner = self.inner.lock().expect("shared writer lock should not be poisoned");
+            inner.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn render_json_log(enable_ansi: bool) -> (String, Value) {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), enable_ansi, FmtSpan::NONE);
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            info!(component = "obs_contract_test", sink = "stdout", "hello world");
+        });
+
+        let raw = String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("log output should be valid UTF-8");
+        let first_line = raw.lines().next().expect("expected one JSON log line");
+        let parsed: Value = serde_json::from_str(first_line).expect("log line should be valid JSON");
+        (raw, parsed)
+    }
+
+    fn render_json_log_with_request_span() -> Value {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE);
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http-request", request_id = "req-123", method = "GET");
+            let _guard = span.enter();
+            info!(component = "obs_contract_test", message = "inside request span");
+        });
+
+        let raw = String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("log output should be valid UTF-8");
+        let first_line = raw.lines().next().expect("expected one JSON log line");
+        serde_json::from_str(first_line).expect("log line should be valid JSON")
+    }
+
+    fn render_json_log_with_recovery_monitor_child_span() -> Value {
+        let writer = SharedWriter::default();
+        let layer = build_json_log_layer(writer.clone(), false, FmtSpan::NONE);
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let request_span = tracing::info_span!("request-span", request_id = "req-parent", method = "GET");
+            let _request_guard = request_span.enter();
+            let recovery_span =
+                tracing::info_span!("recovery-monitor", kind = "remote_disk", endpoint = "http://127.0.0.1:9000/data");
+            let _recovery_guard = recovery_span.enter();
+            warn!(component = "obs_contract_test", message = "inside recovery monitor");
+        });
+
+        let raw = String::from_utf8(
+            writer
+                .inner
+                .lock()
+                .expect("shared writer lock should not be poisoned")
+                .clone(),
+        )
+        .expect("log output should be valid UTF-8");
+        let first_line = raw.lines().next().expect("expected one JSON log line");
+        serde_json::from_str(first_line).expect("log line should be valid JSON")
+    }
 
     #[test]
     /// Invalid file names should be reported as errors instead of panicking.
@@ -533,5 +873,243 @@ mod tests {
         assert!(!should_fallback_to_stdout(&TelemetryError::Io(
             "No such file or directory (os error 2)".to_string()
         )));
+    }
+
+    #[test]
+    fn stdout_mirror_configuration_overrides_environment_default() {
+        assert!(!resolve_file_stdout_mirror(None, true));
+        assert!(resolve_file_stdout_mirror(None, false));
+        assert!(resolve_file_stdout_mirror(Some(true), true));
+        assert!(resolve_file_stdout_mirror(Some(true), false));
+        assert!(!resolve_file_stdout_mirror(Some(false), true));
+        assert!(!resolve_file_stdout_mirror(Some(false), false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_sink_validation_rejects_file_aliases() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let active_path = temp_dir.path().join("rustfs.log");
+        let hardlink_path = temp_dir.path().join("stdout-hardlink.log");
+        let symlink_path = temp_dir.path().join("stdout-symlink.log");
+        File::create(&active_path).expect("create active log");
+        fs::hard_link(&active_path, &hardlink_path).expect("create hardlink");
+        std::os::unix::fs::symlink(&active_path, &symlink_path).expect("create symlink");
+
+        let active_metadata = fs::metadata(&active_path).expect("stat active log");
+        for alias in [&active_path, &hardlink_path, &symlink_path] {
+            let alias_metadata = fs::metadata(alias).expect("stat stdout alias");
+            assert!(matches!(
+                validate_distinct_file_identities(
+                    (alias_metadata.dev(), alias_metadata.ino()),
+                    (active_metadata.dev(), active_metadata.ino()),
+                    &active_path,
+                ),
+                Err(TelemetryError::LogSinkConflict(_))
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdout_sink_validation_allows_distinct_files() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::MetadataExt;
+
+        let temp_dir = tempdir().expect("create temp dir");
+        let stdout_path = temp_dir.path().join("stdout.log");
+        let active_path = temp_dir.path().join("rustfs.log");
+        File::create(&stdout_path).expect("create stdout log");
+        File::create(&active_path).expect("create active log");
+
+        let stdout_metadata = fs::metadata(&stdout_path).expect("stat stdout log");
+        let active_metadata = fs::metadata(&active_path).expect("stat active log");
+        assert!(
+            validate_distinct_file_identities(
+                (stdout_metadata.dev(), stdout_metadata.ino()),
+                (active_metadata.dev(), active_metadata.ino()),
+                &active_path,
+            )
+            .is_ok()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_logging_initialization_rejects_stdout_alias() {
+        const CHILD_ENV: &str = "RUSTFS_TEST_STDOUT_LOG_ALIAS_CHILD";
+        const PATH_ENV: &str = "RUSTFS_TEST_STDOUT_LOG_ALIAS_PATH";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use std::fs::OpenOptions;
+
+            let active_path = std::path::PathBuf::from(std::env::var_os(PATH_ENV).expect("child log path must be set"));
+            let stdout_file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&active_path)
+                .expect("open child stdout log");
+            rustix::stdio::dup2_stdout(&stdout_file).expect("redirect child stdout");
+
+            let config = OtelConfig {
+                log_filename: active_path.file_name().map(|name| name.to_string_lossy().into_owned()),
+                log_stdout_enabled: Some(false),
+                ..OtelConfig::default()
+            };
+            let log_directory = active_path.parent().expect("active log must have parent");
+            let runtime = tokio::runtime::Runtime::new().expect("create Tokio runtime");
+            runtime.block_on(async {
+                assert!(matches!(
+                    init_file_logging_internal(
+                        &config,
+                        log_directory.to_str().expect("log directory must be UTF-8"),
+                        "info",
+                        true,
+                    ),
+                    Err(TelemetryError::LogSinkConflict(_))
+                ));
+            });
+            return;
+        }
+
+        let temp_dir = tempdir().expect("create parent temp dir");
+        let active_path = temp_dir.path().join("rustfs.log");
+        let output = std::process::Command::new(std::env::current_exe().expect("resolve current test executable"))
+            .args([
+                "--exact",
+                "telemetry::local::tests::file_logging_initialization_rejects_stdout_alias",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .env(PATH_ENV, &active_path)
+            .output()
+            .expect("run isolated stdout alias child test");
+
+        assert!(
+            output.status.success(),
+            "stdout alias child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn test_file_logging_fallback_warning_message_is_actionable() {
+        let message = format_file_logging_fallback_warning(
+            "/var/log/rustfs",
+            &TelemetryError::Io("Permission denied (os error 13)".to_string()),
+        );
+
+        assert!(message.starts_with(STDERR_WARNING_PREFIX));
+        assert!(message.contains("fallback to stdout"));
+        assert!(message.contains("log_directory=/var/log/rustfs"));
+        assert!(message.contains("Permission denied"));
+    }
+
+    #[test]
+    fn test_json_log_layer_produces_parseable_json_without_ansi_escape_sequences() {
+        let (raw, parsed) = render_json_log(true);
+
+        assert!(!raw.contains('\u{1b}'), "JSON log output must not contain ANSI escape sequences: {raw}");
+        assert_eq!(parsed.get("level").and_then(Value::as_str), Some("INFO"));
+        assert_eq!(parsed["message"], Value::String("hello world".to_string()));
+        assert_eq!(parsed["component"], Value::String("obs_contract_test".to_string()));
+        assert_eq!(parsed["sink"], Value::String("stdout".to_string()));
+        assert!(parsed.get("target").is_some(), "expected target field in JSON log output");
+    }
+
+    #[test]
+    fn test_json_log_layer_keeps_same_shape_when_ansi_setting_changes() {
+        let (_raw_plain, plain) = render_json_log(false);
+        let (_raw_color, color) = render_json_log(true);
+
+        let plain_keys = plain
+            .as_object()
+            .expect("plain JSON log should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let color_keys = color
+            .as_object()
+            .expect("color JSON log should be an object")
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(plain_keys, color_keys, "top-level JSON log keys must stay stable across sinks");
+
+        let plain_field_keys = plain
+            .as_object()
+            .expect("plain JSON log should be an object")
+            .keys()
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "timestamp" | "level" | "target" | "filename" | "line_number" | "threadName" | "threadId"
+                )
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let color_field_keys = color
+            .as_object()
+            .expect("color JSON log should be an object")
+            .keys()
+            .filter(|key| {
+                !matches!(
+                    key.as_str(),
+                    "timestamp" | "level" | "target" | "filename" | "line_number" | "threadName" | "threadId"
+                )
+            })
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(plain_field_keys, color_field_keys, "structured field keys must stay stable across sinks");
+    }
+
+    #[test]
+    fn test_json_log_layer_promotes_request_id_from_current_span() {
+        let parsed = render_json_log_with_request_span();
+
+        assert_eq!(parsed["request_id"], Value::String("req-123".to_string()));
+        assert_eq!(parsed["request-id"], Value::String("req-123".to_string()));
+        assert_eq!(parsed["message"], Value::String("inside request span".to_string()));
+        assert_eq!(parsed["span"]["request_id"], Value::String("req-123".to_string()));
+    }
+
+    #[test]
+    fn test_json_log_layer_promotes_parent_request_id_for_recovery_monitor_child_span() {
+        let parsed = render_json_log_with_recovery_monitor_child_span();
+
+        assert_eq!(parsed["request_id"], Value::String("req-parent".to_string()));
+        assert_eq!(parsed["request-id"], Value::String("req-parent".to_string()));
+        assert_eq!(parsed["message"], Value::String("inside recovery monitor".to_string()));
+        assert_eq!(parsed["span"]["name"], Value::String("recovery-monitor".to_string()));
+        assert_eq!(parsed["span"]["kind"], Value::String("remote_disk".to_string()));
+        let spans = parsed["spans"].as_array().expect("spans should be present");
+        assert!(spans.iter().any(|span| {
+            span.get("name").and_then(Value::as_str) == Some("request-span")
+                && span.get("request_id").and_then(Value::as_str) == Some("req-parent")
+        }));
+    }
+
+    #[test]
+    fn test_resolve_log_cleanup_interval_seconds_rejects_zero() {
+        let config = OtelConfig {
+            log_cleanup_interval_seconds: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_log_cleanup_interval_seconds(&config), DEFAULT_OBS_LOG_CLEANUP_INTERVAL_SECONDS);
+    }
+
+    #[test]
+    fn empty_cleanup_pattern_falls_back_to_runtime_log_filename() {
+        let config = OtelConfig {
+            log_filename: Some("   ".to_string()),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_log_cleanup_file_pattern(&config, "rustfs.log"), "rustfs.log");
     }
 }

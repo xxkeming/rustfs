@@ -16,17 +16,23 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+mod health;
 mod http;
 mod hybrid;
 mod layer;
 mod module_switch;
 mod prefix;
+pub mod rate_limit;
 mod readiness;
 mod runtime;
+pub(crate) mod runtime_sources;
 mod service_state;
 pub mod tls_material;
 
+use tracing::warn;
+
 // Items used by main.rs (binary crate) and/or embedded.rs — must be fully pub.
+pub(crate) use audit::apply_audit_module_switch_for_context;
 pub use audit::{is_audit_module_enabled, refresh_audit_module_enabled, start_audit_system, stop_audit_system};
 pub use event::{init_event_notifier, is_notify_module_enabled, refresh_notify_module_enabled, shutdown_event_notifier};
 pub use http::start_http_server;
@@ -39,16 +45,81 @@ pub use service_state::ShutdownSignal;
 pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
+pub(crate) use event::{
+    is_event_notifier_reconciled, mark_event_notifier_reconciled, mark_event_notifier_unreconciled,
+    reconcile_event_notifier_from_store, start_persisted_event_notifier_reconciler,
+};
+#[cfg(test)]
+pub(crate) use health::{
+    HealthPayloadContext, HealthReadinessSource, build_component_details, build_health_payload, health_check_state,
+    readiness_source_for_probe,
+};
+pub(crate) use health::{
+    HealthProbe, build_health_response_parts, collect_probe_readiness, kms_probe_staleness_limit, kms_ready_from_probe,
+    probe_from_path,
+};
+pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
+pub(crate) use layer::{RequestContextLayer, is_sts_query_request};
 pub(crate) use module_switch::{
-    ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, current_module_switch_snapshot,
-    refresh_persisted_module_switches_from_store, save_persisted_module_switches_to_store, validate_module_switch_update,
+    MODULE_SWITCHES_SIGNAL_SUBSYSTEM, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches,
+    current_module_switch_snapshot, refresh_persisted_module_switches_from, refresh_persisted_module_switches_from_store,
+    save_persisted_module_switches_to, validate_module_switch_update,
 };
 pub(crate) use prefix::{
-    ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TONIC_PREFIX, VERSION,
+    ADMIN_PREFIX, APPLE_TOUCH_ICON_PATH, APPLE_TOUCH_ICON_PRECOMPOSED_PATH, CONSOLE_PREFIX, FAVICON_PATH,
+    HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX,
+    MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH,
+    PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX, TONIC_PREFIX,
+    VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
+pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
+pub(crate) use readiness::collect_dependency_readiness_report;
+pub(crate) use readiness::collect_node_readiness_report;
+pub use readiness::publish_ready_when_runtime_ready;
+pub(crate) use readiness::snapshot_dependency_readiness_report;
+pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
 
-#[derive(Clone, Copy, Debug)]
-pub struct RemoteAddr(pub std::net::SocketAddr);
+pub use crate::shared_types::RemoteAddr;
+
+pub struct ShutdownHandle {
+    shutdown_tx: Option<tokio::sync::broadcast::Sender<()>>,
+    task_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ShutdownHandle {
+    pub fn new(shutdown_tx: tokio::sync::broadcast::Sender<()>, task_handle: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(task_handle),
+        }
+    }
+
+    pub fn signal(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+    }
+
+    pub async fn shutdown(self) {
+        self.signal();
+        self.wait().await;
+    }
+
+    pub async fn wait(mut self) {
+        if let Some(task_handle) = self.task_handle.take()
+            && let Err(err) = task_handle.await
+        {
+            warn!(?err, "Server task join failed during shutdown");
+        }
+    }
+}
+
+impl Drop for ShutdownHandle {
+    fn drop(&mut self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.send(());
+        }
+    }
+}

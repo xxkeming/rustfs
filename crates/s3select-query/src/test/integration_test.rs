@@ -15,15 +15,65 @@
 #[cfg(test)]
 mod integration_tests {
     use crate::{create_fresh_db, get_global_db, instance::make_rustfsms};
+    use datafusion::arrow::{
+        array::{Array, Int64Array, StringArray},
+        record_batch::RecordBatch,
+    };
     use rustfs_s3select_api::{
         QueryError,
         query::{Context, Query},
     };
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
-        OutputSerialization, SelectObjectContentInput, SelectObjectContentRequest,
+        OutputSerialization, ParquetInput, ScanRange, SelectObjectContentInput, SelectObjectContentRequest,
     };
     use std::sync::Arc;
+
+    fn assert_ages_descending(output: &[RecordBatch]) {
+        let ages: Vec<i64> = output
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("age column should be Int64")
+                    .values()
+                    .iter()
+                    .copied()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        assert_eq!(ages, vec![40, 38, 35, 32, 30, 28, 26, 25, 24, 22]);
+    }
+
+    fn assert_department_counts(output: &[RecordBatch]) {
+        let mut counts: Vec<(&str, i64)> = output
+            .iter()
+            .flat_map(|batch| {
+                let departments = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("department column should be Utf8");
+                let counts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("count column should be Int64");
+                departments.iter().zip(counts.iter()).map(|(department, count)| {
+                    (
+                        department.expect("department should not be null"),
+                        count.expect("count should not be null"),
+                    )
+                })
+            })
+            .collect();
+        counts.sort_unstable();
+
+        assert_eq!(counts, vec![("Finance", 3), ("HR", 2), ("IT", 3), ("Marketing", 2)]);
+    }
 
     fn create_test_input(sql: &str) -> SelectObjectContentInput {
         SelectObjectContentInput {
@@ -54,8 +104,7 @@ mod integration_tests {
     }
 
     /// Build a `SelectObjectContentInput` targeting a JSON DOCUMENT file.
-    /// Uses `JSONType::DOCUMENT` so the NDJSON-flattening path in
-    /// `EcObjectStore` is exercised.
+    /// Uses `JSONType::DOCUMENT`, which keeps the document-style validation path.
     fn create_test_json_input(sql: &str) -> SelectObjectContentInput {
         SelectObjectContentInput {
             bucket: "test-bucket".to_string(),
@@ -71,6 +120,58 @@ mod integration_tests {
                     json: Some(JSONInput {
                         type_: Some(JSONType::from_static(JSONType::DOCUMENT)),
                     }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
+    fn create_test_json_lines_input(sql: &str) -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.json".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    json: Some(JSONInput {
+                        type_: Some(JSONType::from_static(JSONType::LINES)),
+                    }),
+                    ..Default::default()
+                },
+                output_serialization: OutputSerialization {
+                    json: Some(JSONOutput::default()),
+                    ..Default::default()
+                },
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
+    fn create_test_parquet_input(sql: &str) -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.parquet".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: SelectObjectContentRequest {
+                expression: sql.to_string(),
+                expression_type: ExpressionType::from_static("SQL"),
+                input_serialization: InputSerialization {
+                    parquet: Some(ParquetInput {}),
                     ..Default::default()
                 },
                 output_serialization: OutputSerialization {
@@ -107,7 +208,7 @@ mod integration_tests {
     async fn test_simple_select_query() {
         let sql = "SELECT * FROM S3Object";
         let input = create_test_input(sql);
-        let db = get_global_db(input.clone(), true).await.unwrap();
+        let db = get_global_db(input.clone(), true).await.expect("create csv test database");
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
         let result = db.execute(&query).await;
@@ -119,33 +220,142 @@ mod integration_tests {
     }
 
     #[tokio::test]
-    async fn test_select_with_where_clause() {
-        let sql = "SELECT name, age FROM S3Object WHERE age > 30";
+    async fn test_csv_values_remain_strings() {
+        let sql = "SELECT salary FROM S3Object LIMIT 1";
         let input = create_test_input(sql);
-        let db = get_global_db(input.clone(), true).await.unwrap();
+        let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        assert!(result.is_ok());
+        let batches = db
+            .execute(&query)
+            .await
+            .expect("execute CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect CSV query output");
+        let salaries = batches
+            .first()
+            .expect("CSV query should return one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("CSV column should use UTF-8 string values");
+
+        assert_eq!(salaries.value(0), "05000");
+    }
+
+    #[tokio::test]
+    async fn test_csv_header_modes_keep_positional_string_columns() {
+        for (header, expected) in [
+            (FileHeaderInfo::IGNORE, ["05000", "6000"]),
+            (FileHeaderInfo::NONE, ["salary", "05000"]),
+        ] {
+            let sql = "SELECT _5 FROM S3Object LIMIT 2";
+            let mut input = create_test_input(sql);
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("CSV input should be configured")
+                .file_header_info = Some(FileHeaderInfo::from_static(header));
+            let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+            let batches = db
+                .execute(&query)
+                .await
+                .expect("execute positional CSV query")
+                .result()
+                .chunk_result()
+                .await
+                .expect("collect positional CSV query output");
+
+            let values = batches
+                .iter()
+                .flat_map(|batch| {
+                    let column = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("positional CSV column should use UTF-8 strings");
+                    (0..column.len()).map(|row| column.value(row).to_string()).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                values,
+                expected.map(|value| value.to_string()),
+                "unexpected values for FileHeaderInfo={header}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_csv_numeric_comparison_with_and_without_cast() {
+        for sql in [
+            "SELECT name, age FROM S3Object WHERE age > 30",
+            "SELECT name, age FROM S3Object WHERE CAST(age AS INT) > 30",
+        ] {
+            let input = create_test_input(sql);
+            let db = get_global_db(input.clone(), true).await.expect("create CSV test database");
+            let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+            let batches = db
+                .execute(&query)
+                .await
+                .expect("execute CSV numeric comparison")
+                .result()
+                .chunk_result()
+                .await
+                .expect("collect CSV numeric comparison output");
+
+            let mut rows = Vec::new();
+            for batch in &batches {
+                let names = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("CSV name column should use UTF-8 strings");
+                let ages = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("CSV age column should use UTF-8 strings");
+                for row in 0..batch.num_rows() {
+                    rows.push((names.value(row).to_string(), ages.value(row).to_string()));
+                }
+            }
+
+            assert_eq!(
+                rows,
+                [
+                    ("Charlie".to_string(), "35".to_string()),
+                    ("Frank".to_string(), "40".to_string()),
+                    ("Henry".to_string(), "32".to_string()),
+                    ("Jack".to_string(), "38".to_string()),
+                ],
+                "unexpected rows for query: {sql}"
+            );
+        }
     }
 
     #[tokio::test]
     async fn test_select_with_aggregation() {
-        let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
+        let sql = "SELECT department, COUNT(*) FROM S3Object GROUP BY department";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        // Aggregation queries might fail due to lack of actual data, which is acceptable
-        match result {
-            Ok(_) => {
-                // If successful, that's great
-            }
-            Err(_) => {
-                // Expected to fail due to no actual data source
-            }
-        }
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute grouped CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect grouped CSV output");
+
+        assert_department_counts(&output);
     }
 
     #[tokio::test]
@@ -220,13 +430,22 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_query_with_order_by() {
-        let sql = "SELECT name, age FROM S3Object ORDER BY age DESC";
+        let sql = "SELECT name, CAST(age AS BIGINT) AS age FROM S3Object ORDER BY CAST(age AS BIGINT) DESC";
         let input = create_test_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        assert!(result.is_ok());
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute ordered CSV query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect ordered CSV output");
+
+        assert_eq!(output.iter().map(|batch| batch.num_rows()).sum::<usize>(), 10);
+        assert_ages_descending(&output);
     }
 
     #[tokio::test]
@@ -258,7 +477,6 @@ mod integration_tests {
 
     // ──────────────────────────────────────────────
     // JSON-input variants of all the above tests
-    // These exercise the JSONType::LINES (JSON lines) code path
     // ──────────────────────────────────────────────
 
     #[tokio::test]
@@ -291,6 +509,125 @@ mod integration_tests {
     }
 
     #[tokio::test]
+    async fn test_simple_select_query_parquet() {
+        let sql = "SELECT name, age FROM S3Object WHERE age > 25";
+        let input = create_test_parquet_input(sql);
+        let db = get_global_db(input.clone(), true).await.unwrap();
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result.unwrap().result().chunk_result().await.unwrap();
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 3);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_parquet_with_scan_range_filters_row_groups() {
+        let sql = "SELECT name, age FROM S3Object WHERE age > 25";
+        let mut input = create_test_parquet_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create parquet scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute parquet scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect parquet scan range query output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_parquet_with_full_scan_range() {
+        let sql = "SELECT * FROM S3Object";
+        let mut input = create_test_parquet_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create parquet full scan range database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute parquet full scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect parquet full scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert_eq!(total_rows, 5);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_csv_with_scan_range() {
+        let sql = "SELECT name, age FROM S3Object LIMIT 20";
+        let mut input = create_test_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create csv scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute csv scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect csv scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert!(total_rows > 0);
+    }
+
+    #[tokio::test]
+    async fn test_simple_select_query_json_with_scan_range() {
+        let sql = "SELECT name, age FROM S3Object LIMIT 20";
+        let mut input = create_test_json_lines_input(sql);
+        input.request.scan_range = Some(ScanRange {
+            start: Some(0),
+            end: Some(1024),
+        });
+        let db = get_global_db(input.clone(), true)
+            .await
+            .expect("create json scan range test database");
+        let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
+
+        let result = db.execute(&query).await;
+        assert!(result.is_ok());
+
+        let output = result
+            .expect("execute json scan range query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect json scan range output");
+        let total_rows: usize = output.iter().map(|batch| batch.num_rows()).sum();
+        assert!(total_rows > 0);
+    }
+
+    #[tokio::test]
     async fn test_select_with_where_clause_json() {
         let sql = "SELECT name, age FROM S3Object WHERE age > 30";
         let input = create_test_json_input(sql);
@@ -303,21 +640,21 @@ mod integration_tests {
 
     #[tokio::test]
     async fn test_select_with_aggregation_json() {
-        let sql = "SELECT department, COUNT(*) as count FROM S3Object GROUP BY department";
+        let sql = "SELECT department, COUNT(*) FROM S3Object GROUP BY department";
         let input = create_test_json_input(sql);
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        // Aggregation queries may fail due to lack of actual data, which is acceptable
-        match result {
-            Ok(_) => {
-                // If successful, that's great
-            }
-            Err(_) => {
-                // Expected to fail due to no actual data source
-            }
-        }
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute grouped JSON query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect grouped JSON output");
+
+        assert_department_counts(&output);
     }
 
     #[tokio::test]
@@ -393,8 +730,17 @@ mod integration_tests {
         let db = get_global_db(input.clone(), true).await.unwrap();
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await;
-        assert!(result.is_ok());
+        let output = db
+            .execute(&query)
+            .await
+            .expect("execute ordered JSON query")
+            .result()
+            .chunk_result()
+            .await
+            .expect("collect ordered JSON output");
+
+        assert_eq!(output.iter().map(|batch| batch.num_rows()).sum::<usize>(), 10);
+        assert_ages_descending(&output);
     }
 
     #[tokio::test]

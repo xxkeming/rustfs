@@ -12,21 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::OnceLock;
 use std::time::Duration;
-use sysinfo::{RefreshKind, System};
 
-// Import TelemetryGuard from rustfs_obs re-export
-use rustfs_obs::dial9::TelemetryGuard;
-
-// Global storage for TelemetryGuard to keep it alive for the program duration
-static DIAL9_TELEMETRY_GUARD: OnceLock<TelemetryGuard> = OnceLock::new();
+use rustfs_obs::dial9::Dial9SessionGuard;
 
 #[inline]
 fn compute_default_thread_stack_size() -> usize {
-    // Baseline: Release 1 MiB，Debug 2 MiB；macOS at least 2 MiB
-    // macOS is more conservative: many system libraries and backtracking are more "stack-eating"
-    if cfg!(debug_assertions) || cfg!(target_os = "macos") {
+    if cfg!(debug_assertions) {
+        // Debug builds keep larger async futures and tracing state on the stack;
+        // scanner e2e paths need more headroom than the release runtime.
+        8 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
+    } else if cfg!(target_os = "macos") {
+        // macOS is more conservative: many system libraries and backtracking are more "stack-eating"
         2 * rustfs_config::DEFAULT_THREAD_STACK_SIZE
     } else {
         rustfs_config::DEFAULT_THREAD_STACK_SIZE
@@ -34,27 +31,58 @@ fn compute_default_thread_stack_size() -> usize {
 }
 
 #[inline]
+fn mark_allocator_threadpool_thread() {
+    #[cfg(not(target_os = "windows"))]
+    rustfs_mimalloc::set_current_thread_in_threadpool();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_thread_stack_size_matches_build_profile() {
+        let default_stack = rustfs_config::DEFAULT_THREAD_STACK_SIZE;
+        let expected = if cfg!(debug_assertions) {
+            8 * default_stack
+        } else if cfg!(target_os = "macos") {
+            2 * default_stack
+        } else {
+            default_stack
+        };
+
+        assert_eq!(compute_default_thread_stack_size(), expected);
+    }
+}
+
+#[inline]
 fn detect_cores() -> usize {
-    // Priority physical cores, fallback logic cores, minimum 1
-    let mut sys = System::new_with_specifics(RefreshKind::everything().without_memory().without_processes());
-    sys.refresh_cpu_all();
-    sys.cpus().len().max(1)
+    // Uses cgroup-aware detection from cgroup_resources module
+    // Returns effective CPU cores considering cgroup limits and overrides
+    crate::cgroup_resources::container_resources().cpu_cores
 }
 
 #[inline]
 fn compute_default_worker_threads() -> usize {
-    // Physical cores are used by default (closer to CPU compute resources and cache topology)
-    detect_cores()
+    // Cap at 16 worker threads for optimal small-object PUT performance.
+    // Now cgroup-aware: in containers, uses the container's CPU limit
+    detect_cores().min(16)
 }
 
 /// Default max_blocking_threads calculations based on sysinfo:
 /// 16 cores -> 1024; more than 16 cores are doubled by multiples:
 /// 1..=16 -> 1024, 17..=32 -> 2048, 33..=64 -> 4096, and so on.
+///
+/// For containerized environments with limited resources, this is capped
+/// to prevent excessive memory usage from thread stacks.
 fn compute_default_max_blocking_threads() -> usize {
     const BASE_CORES: usize = rustfs_config::DEFAULT_WORKER_THREADS;
     const BASE_THREADS: usize = rustfs_config::DEFAULT_MAX_BLOCKING_THREADS;
+    // Cap for small containers to prevent excessive memory usage
+    // Each blocking thread can use up to 1 MiB stack space
+    const SMALL_CONTAINER_MAX_THREADS: usize = 256;
 
-    let cores = detect_cores();
+    let cores = detect_cores().min(16);
 
     let mut threads = BASE_THREADS;
     let mut threshold = BASE_CORES;
@@ -63,6 +91,12 @@ fn compute_default_max_blocking_threads() -> usize {
     while cores > threshold {
         threads = threads.saturating_mul(2);
         threshold = threshold.saturating_mul(2);
+    }
+
+    // For small containers (<=4 cores), cap the blocking threads to prevent memory issues
+    // This prevents a 1 GiB container from allocating up to 1 GiB just for thread stacks
+    if cores <= 4 {
+        threads = threads.min(SMALL_CONTAINER_MAX_THREADS);
     }
 
     threads
@@ -89,7 +123,7 @@ fn compute_default_max_blocking_threads() -> usize {
 /// ```no_run
 /// // tokio_runtime_builder is pub(crate) - call it from within the rustfs binary:
 /// // let builder = tokio_runtime_builder();
-/// // let runtime = builder.build().unwrap();
+/// // let runtime = builder.build().expect("operation should succeed");
 /// ```
 pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
     let mut builder = tokio::runtime::Builder::new_multi_thread();
@@ -132,15 +166,19 @@ pub fn tokio_runtime_builder() -> tokio::runtime::Builder {
         rustfs_utils::get_env_usize(rustfs_config::ENV_MAX_IO_EVENTS_PER_TICK, rustfs_config::DEFAULT_MAX_IO_EVENTS_PER_TICK);
     builder.enable_all().max_io_events_per_tick(max_io_events_per_tick);
 
-    // Optional: Simple log of thread start/stop
-    if print_tokio_thread_enable() {
-        builder
-            .on_thread_start(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
-            })
-            .on_thread_stop(|| {
-                tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
-            });
+    let print_tokio_threads = print_tokio_thread_enable();
+    builder.on_thread_start(move || {
+        mark_allocator_threadpool_thread();
+        if print_tokio_threads {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread started");
+        }
+    });
+
+    // Optional: Simple log of thread stop
+    if print_tokio_threads {
+        builder.on_thread_stop(|| {
+            tracing::trace!(thread_id = ?std::thread::current().id(), "worker thread stopped");
+        });
     }
     if !rustfs_obs::is_production_environment() {
         println!(
@@ -166,56 +204,43 @@ fn print_tokio_thread_enable() -> bool {
     rustfs_utils::get_env_bool(rustfs_config::ENV_THREAD_PRINT_ENABLED, rustfs_config::DEFAULT_THREAD_PRINT_ENABLED)
 }
 
-/// Build Tokio runtime with optional dial9 telemetry support.
+/// Build the Tokio runtime, attaching dial9 telemetry when it is enabled.
 ///
-/// If dial9 is enabled via environment variables, creates a TracedRuntime
-/// and stores the TelemetryGuard globally to keep it alive for the
-/// duration of the program.
+/// The returned [`Dial9SessionGuard`] owns the telemetry session. It **must**
+/// be dropped before the process exits: dropping it flushes buffered events and
+/// seals the final trace segment. Parking it in a `static` would mean it is
+/// never dropped and the last events — usually the ones that explain a stall —
+/// are lost.
+///
+/// When telemetry is requested but cannot be built, this falls back to a
+/// standard runtime and returns `None` for the guard rather than failing
+/// startup. The `rustfs_dial9_active_sessions` metric reports that outcome.
 ///
 /// # Returns
 ///
-/// * `Ok(runtime)` - Successfully created runtime
-/// * `Err(e)` - Failed to create runtime
+/// The runtime, plus `Some(guard)` when a telemetry session is recording.
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The Tokio runtime builder fails
-/// - Dial9 is enabled but fails to initialize (falls back to standard runtime)
-///
-/// # Examples
-///
-/// ```no_run
-/// // build_tokio_runtime is pub(crate) - call it from within the rustfs binary:
-/// // let runtime = build_tokio_runtime().expect("Failed to build runtime");
-/// // runtime.block_on(async { /* ... */ })
-/// ```
-pub fn build_tokio_runtime() -> Result<tokio::runtime::Runtime, BuildError> {
-    let mut builder = tokio_runtime_builder();
-
-    // Check if dial9 is enabled
-    if rustfs_obs::dial9::is_enabled() {
-        tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
-
-        return match rustfs_obs::dial9::build_traced_runtime(builder) {
-            Ok((runtime, guard)) => {
-                // Store guard in global static to keep it alive for the program duration
-                let _ = DIAL9_TELEMETRY_GUARD.set(guard);
-                tracing::info!("TracedRuntime created successfully, guard stored globally");
-                Ok(runtime)
-            }
-            Err(e) => {
-                tracing::warn!("Failed to build TracedRuntime: {}", e);
-                tracing::warn!("Falling back to standard Tokio runtime");
-                // Rebuild the builder for standard runtime
-                let mut builder = tokio_runtime_builder();
-                builder.build().map_err(BuildError::Runtime)
-            }
-        };
+/// Returns [`BuildError::Runtime`] if the Tokio runtime builder itself fails.
+pub fn build_tokio_runtime() -> Result<(tokio::runtime::Runtime, Option<Dial9SessionGuard>), BuildError> {
+    if !rustfs_obs::dial9::is_enabled() {
+        let runtime = tokio_runtime_builder().build().map_err(BuildError::Runtime)?;
+        return Ok((runtime, None));
     }
 
-    // Standard runtime
-    builder.build().map_err(BuildError::Runtime)
+    tracing::info!("Dial9 telemetry enabled, building TracedRuntime");
+    match rustfs_obs::dial9::build_traced_runtime(tokio_runtime_builder()) {
+        Ok((runtime, guard)) => {
+            tracing::info!("TracedRuntime created and recording");
+            Ok((runtime, Some(guard)))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to build TracedRuntime: {e}; falling back to standard Tokio runtime");
+            let runtime = tokio_runtime_builder().build().map_err(BuildError::Runtime)?;
+            Ok((runtime, None))
+        }
+    }
 }
 
 /// Error type for runtime building failures.

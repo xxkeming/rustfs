@@ -20,7 +20,6 @@ use std::fmt;
 
 /// Swift-specific error type
 #[derive(Debug)]
-#[allow(dead_code)] // Error variants used by Swift implementation
 pub enum SwiftError {
     /// 400 Bad Request
     BadRequest(String),
@@ -32,6 +31,8 @@ pub enum SwiftError {
     NotFound(String),
     /// 409 Conflict
     Conflict(String),
+    /// 411 Length Required
+    LengthRequired(String),
     /// 413 Request Entity Too Large (Payload Too Large)
     RequestEntityTooLarge(String),
     /// 422 Unprocessable Entity
@@ -54,6 +55,7 @@ impl fmt::Display for SwiftError {
             SwiftError::Forbidden(msg) => write!(f, "Forbidden: {}", msg),
             SwiftError::NotFound(msg) => write!(f, "Not Found: {}", msg),
             SwiftError::Conflict(msg) => write!(f, "Conflict: {}", msg),
+            SwiftError::LengthRequired(msg) => write!(f, "Length Required: {}", msg),
             SwiftError::RequestEntityTooLarge(msg) => write!(f, "Request Entity Too Large: {}", msg),
             SwiftError::UnprocessableEntity(msg) => write!(f, "Unprocessable Entity: {}", msg),
             SwiftError::TooManyRequests { retry_after, .. } => {
@@ -76,6 +78,7 @@ impl SwiftError {
             SwiftError::Forbidden(_) => StatusCode::FORBIDDEN,
             SwiftError::NotFound(_) => StatusCode::NOT_FOUND,
             SwiftError::Conflict(_) => StatusCode::CONFLICT,
+            SwiftError::LengthRequired(_) => StatusCode::LENGTH_REQUIRED,
             SwiftError::RequestEntityTooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             SwiftError::UnprocessableEntity(_) => StatusCode::UNPROCESSABLE_ENTITY,
             SwiftError::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,

@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Cluster usage metrics collector.
 //!
 //! Collects cluster-wide and per-bucket usage metrics including
@@ -21,10 +19,13 @@
 
 use crate::metrics::report::PrometheusMetric;
 use crate::metrics::schema::cluster_usage::*;
+use std::time::{Duration, SystemTime};
 
 /// Cluster-wide usage statistics.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterUsageStats {
+    /// Time since the persisted usage snapshot was last updated
+    pub since_last_update_seconds: u64,
     /// Total bytes used in the cluster
     pub total_bytes: u64,
     /// Total number of objects
@@ -33,6 +34,11 @@ pub struct ClusterUsageStats {
     pub versions_count: u64,
     /// Total number of delete markers
     pub delete_markers_count: u64,
+    /// Total number of buckets in the usage snapshot
+    pub buckets_count: u64,
+    /// Whether the selected admin usage snapshot completed without concurrent
+    /// namespace activity.
+    pub snapshot_converged: bool,
     /// Object size distribution by range
     pub object_size_distribution: Vec<(String, u64)>,
     /// Version count distribution by range
@@ -64,14 +70,23 @@ pub struct BucketUsageStats {
 ///
 /// Returns a vector of Prometheus metrics for cluster usage.
 pub fn collect_cluster_usage_metrics(stats: &ClusterUsageStats) -> Vec<PrometheusMetric> {
-    let mut metrics = Vec::with_capacity(4 + stats.object_size_distribution.len() + stats.versions_distribution.len());
+    let mut metrics = Vec::with_capacity(7 + stats.object_size_distribution.len() + stats.versions_distribution.len());
 
+    metrics.push(PrometheusMetric::from_descriptor(
+        &USAGE_SINCE_LAST_UPDATE_SECONDS_MD,
+        stats.since_last_update_seconds as f64,
+    ));
     metrics.push(PrometheusMetric::from_descriptor(&USAGE_TOTAL_BYTES_MD, stats.total_bytes as f64));
     metrics.push(PrometheusMetric::from_descriptor(&USAGE_OBJECTS_COUNT_MD, stats.objects_count as f64));
     metrics.push(PrometheusMetric::from_descriptor(&USAGE_VERSIONS_COUNT_MD, stats.versions_count as f64));
     metrics.push(PrometheusMetric::from_descriptor(
         &USAGE_DELETE_MARKERS_COUNT_MD,
         stats.delete_markers_count as f64,
+    ));
+    metrics.push(PrometheusMetric::from_descriptor(&USAGE_BUCKETS_COUNT_MD, stats.buckets_count as f64));
+    metrics.push(PrometheusMetric::from_descriptor(
+        &USAGE_SNAPSHOT_CONVERGED_MD,
+        if stats.snapshot_converged { 1.0 } else { 0.0 },
     ));
 
     // Object size distribution
@@ -91,6 +106,13 @@ pub fn collect_cluster_usage_metrics(stats: &ClusterUsageStats) -> Vec<Prometheu
     }
 
     metrics
+}
+
+pub fn usage_since_last_update_seconds(last_update: Option<SystemTime>, now: SystemTime) -> u64 {
+    last_update
+        .and_then(|updated_at| now.duration_since(updated_at).ok())
+        .unwrap_or(Duration::ZERO)
+        .as_secs()
 }
 
 /// Collects per-bucket usage metrics from the given stats.
@@ -153,10 +175,13 @@ mod tests {
     #[test]
     fn test_collect_cluster_usage_metrics() {
         let stats = ClusterUsageStats {
+            since_last_update_seconds: 45,
             total_bytes: 1024 * 1024 * 1024 * 100, // 100 GB
             objects_count: 10000,
             versions_count: 15000,
             delete_markers_count: 500,
+            buckets_count: 8,
+            snapshot_converged: false,
             object_size_distribution: vec![
                 ("0-1KB".to_string(), 5000),
                 ("1KB-1MB".to_string(), 3000),
@@ -169,12 +194,19 @@ mod tests {
         let metrics = collect_cluster_usage_metrics(&stats);
         report_metrics(&metrics);
 
-        // 4 base metrics + 4 size distribution + 3 version distribution = 11
-        assert_eq!(metrics.len(), 11);
+        // 7 base metrics + 4 size distribution + 3 version distribution = 14
+        assert_eq!(metrics.len(), 14);
 
         let total_bytes_name = USAGE_TOTAL_BYTES_MD.get_full_metric_name();
         let total_bytes = metrics.iter().find(|m| m.name == total_bytes_name);
         assert!(total_bytes.is_some());
+
+        let stale_name = USAGE_SINCE_LAST_UPDATE_SECONDS_MD.get_full_metric_name();
+        let stale = metrics.iter().find(|m| m.name == stale_name && m.value == 45.0);
+        assert!(stale.is_some());
+
+        let converged_name = USAGE_SNAPSHOT_CONVERGED_MD.get_full_metric_name();
+        assert!(metrics.iter().any(|m| m.name == converged_name && m.value == 0.0));
     }
 
     #[test]
@@ -195,5 +227,24 @@ mod tests {
 
         // 5 base metrics + 1 size distribution + 1 version distribution = 7
         assert_eq!(metrics.len(), 7);
+    }
+
+    #[test]
+    fn usage_since_last_update_seconds_reports_elapsed_time() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(120);
+        let last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(75));
+
+        assert_eq!(usage_since_last_update_seconds(last_update, now), 45);
+    }
+
+    #[test]
+    fn usage_since_last_update_seconds_returns_zero_for_missing_or_future_timestamps() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(120);
+
+        assert_eq!(usage_since_last_update_seconds(None, now), 0);
+        assert_eq!(
+            usage_since_last_update_seconds(Some(SystemTime::UNIX_EPOCH + Duration::from_secs(180)), now),
+            0
+        );
     }
 }

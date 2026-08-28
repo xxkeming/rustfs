@@ -12,6 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+/// Heal admin config subsystem name.
+pub const HEAL_SUB_SYS: &str = "heal";
+
+/// Heal config key setting the scanner-driven periodic deep bitrot scan cycle in seconds.
+pub const HEAL_BITROT_CYCLE: &str = "bitrot_cycle";
+
+/// Heal config keys supported by the admin config subsystem.
+pub const HEAL_KEYS: &[&str] = &[HEAL_BITROT_CYCLE];
+
+/// Default scanner-driven bitrot scan cycle used by heal/scanner runtime config.
+pub const DEFAULT_HEAL_BITROT_CYCLE_SECS: u64 = 30 * 24 * 60 * 60;
+
 /// Environment variable name that enables or disables auto-heal functionality.
 /// - Purpose: Control whether the system automatically performs heal operations.
 /// - Valid values: "true" or "false" (case insensitive).
@@ -121,6 +133,21 @@ pub const ENV_HEAL_SET_BULKHEAD_ENABLE: &str = "RUSTFS_HEAL_SET_BULKHEAD_ENABLE"
 /// Environment variable that toggles page-level parallel object healing for erasure-set repair.
 pub const ENV_HEAL_PAGE_PARALLEL_ENABLE: &str = "RUSTFS_HEAL_PAGE_PARALLEL_ENABLE";
 
+/// Environment variable that toggles foreground read pressure gating for background heal work.
+pub const ENV_HEAL_MAINLINE_THROTTLE_ENABLE: &str = "RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE";
+
+/// Environment variable that controls the foreground read permit utilization percentage
+/// at which background heal work pauses starting new tasks.
+pub const ENV_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: &str = "RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT";
+
+/// Environment variable that controls the foreground write utilization percentage
+/// at which background heal work pauses starting new tasks.
+pub const ENV_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: &str = "RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT";
+
+/// Environment variable that controls how soon the heal scheduler rechecks foreground
+/// pressure after delaying background work.
+pub const ENV_HEAL_MAINLINE_MAX_SLEEP_MS: &str = "RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS";
+
 /// Default behavior is to merge duplicate low-priority requests.
 pub const DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE: bool = true;
 
@@ -138,3 +165,52 @@ pub const DEFAULT_HEAL_SET_BULKHEAD_ENABLE: bool = true;
 
 /// Default behavior is to keep erasure-set page parallelism enabled.
 pub const DEFAULT_HEAL_PAGE_PARALLEL_ENABLE: bool = true;
+
+/// Default behavior is to pause best-effort heal task starts when foreground reads are saturated.
+pub const DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE: bool = true;
+
+/// Default foreground read permit utilization threshold for pausing best-effort heal task starts.
+pub const DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: usize = 80;
+
+/// Default foreground write utilization threshold for pausing best-effort heal task starts.
+pub const DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: usize = 80;
+
+/// Default foreground pressure recheck delay for heal scheduler, in milliseconds.
+pub const DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS: u64 = 250;
+
+/// Environment variable that toggles the MRF (mission repair feed) intent
+/// pipeline: error paths deliver repair intents to the heal runtime, and
+/// unconsumed intents are replayed from the durable journal after a restart.
+pub const ENV_HEAL_MRF_ENABLE: &str = "RUSTFS_HEAL_MRF_ENABLE";
+
+/// Environment variable for the MRF in-memory queue capacity (intent count).
+pub const ENV_HEAL_MRF_QUEUE_SIZE: &str = "RUSTFS_HEAL_MRF_QUEUE_SIZE";
+
+/// Environment variable for the MRF journal byte budget. The journal is
+/// compacted once its on-disk size crosses this bound.
+pub const ENV_HEAL_MRF_JOURNAL_MAX_BYTES: &str = "RUSTFS_HEAL_MRF_JOURNAL_MAX_BYTES";
+
+/// Environment variable for the MRF journal replay batch size (intents per
+/// replay push round).
+pub const ENV_HEAL_MRF_REPLAY_BATCH: &str = "RUSTFS_HEAL_MRF_REPLAY_BATCH";
+
+/// Default behavior keeps the MRF intent pipeline enabled.
+pub const DEFAULT_HEAL_MRF_ENABLE: bool = true;
+
+/// Default MRF queue capacity (matches MinIO's 100k MRF list ceiling).
+pub const DEFAULT_HEAL_MRF_QUEUE_SIZE: usize = 100_000;
+
+/// Default MRF journal byte budget (8 MiB), mirroring the channel payload cap.
+pub const DEFAULT_HEAL_MRF_JOURNAL_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Default MRF replay batch size.
+pub const DEFAULT_HEAL_MRF_REPLAY_BATCH: usize = 256;
+
+/// Environment variable selecting how admin heal starts behave when the
+/// requested path overlaps an already running or queued heal: `merge`
+/// (default, keep today's dedup/merge semantics) or `minio_error` (return a
+/// typed already-running / overlapping-paths rejection like madmin).
+pub const ENV_HEAL_OVERLAP_POLICY: &str = "RUSTFS_HEAL_OVERLAP_POLICY";
+
+/// Default overlap policy: merge duplicate/overlapping requests.
+pub const DEFAULT_HEAL_OVERLAP_POLICY: &str = "merge";

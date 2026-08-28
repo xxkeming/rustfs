@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::common::client::s3::StorageBackend as S3StorageBackend;
-use crate::common::gateway::{S3Action, authorize_operation};
+use crate::common::gateway::{AuthorizationError, S3Action, authorize_operation};
 use crate::common::session::SessionContext;
 use bytes::Bytes;
 use dav_server::davpath::DavPath;
@@ -22,7 +22,9 @@ use dav_server::fs::{
 };
 use futures_util::{FutureExt, StreamExt, stream};
 use percent_encoding::percent_decode_str;
+use rustfs_utils::MaskedAccessKey;
 use rustfs_utils::path;
+use s3s::S3ErrorCode;
 use s3s::dto::*;
 use std::fmt::Debug;
 use std::io::SeekFrom;
@@ -30,6 +32,22 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::RwLock;
 use tracing::{debug, error};
+
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_WEBDAV_DRIVER: &str = "webdav_driver";
+const EVENT_WEBDAV_OBJECT_METADATA_FAILED: &str = "webdav_object_metadata_failed";
+const EVENT_WEBDAV_STREAM_READ_FAILED: &str = "webdav_stream_read_failed";
+const EVENT_WEBDAV_OBJECT_READ_FAILED: &str = "webdav_object_read_failed";
+const EVENT_WEBDAV_OBJECT_WRITE_STATE: &str = "webdav_object_write_state";
+const EVENT_WEBDAV_LIST_FAILED: &str = "webdav_list_failed";
+const EVENT_WEBDAV_COPY_FAILED: &str = "webdav_copy_failed";
+const EVENT_WEBDAV_DELETE_FAILED: &str = "webdav_delete_failed";
+const EVENT_WEBDAV_PROBE_FAILED: &str = "webdav_probe_failed";
+const EVENT_WEBDAV_BUCKET_LIST_FAILED: &str = "webdav_bucket_list_failed";
+const EVENT_WEBDAV_BUCKET_METADATA_STATE: &str = "webdav_bucket_metadata_state";
+const EVENT_WEBDAV_DIRECTORY_STATE: &str = "webdav_directory_state";
+const EVENT_WEBDAV_OBJECT_DELETE_STATE: &str = "webdav_object_delete_state";
+const EVENT_WEBDAV_RENAME_STATE: &str = "webdav_rename_state";
 
 /// Convert s3s ETag enum to string
 fn etag_to_string(etag: &ETag) -> String {
@@ -205,11 +223,19 @@ where
                         created: modified,
                         is_dir: false,
                         etag: output.e_tag.as_ref().map(etag_to_string),
-                        content_type: output.content_type.map(|c| c.to_string()),
+                        content_type: output.content_type,
                     }) as Box<dyn DavMetaData>)
                 }
                 Err(e) => {
-                    error!("Failed to get file metadata for {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_METADATA_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "webdav object metadata failed"
+                    );
                     Err(FsError::NotFound)
                 }
             }
@@ -280,7 +306,15 @@ where
                             match chunk_result {
                                 Ok(bytes) => data.extend_from_slice(&bytes),
                                 Err(e) => {
-                                    error!("Error reading stream: {}", e);
+                                    error!(
+                                        event = EVENT_WEBDAV_STREAM_READ_FAILED,
+                                        component = LOG_COMPONENT_PROTOCOLS,
+                                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                                        bucket = %bucket,
+                                        object = %key,
+                                        error = %e,
+                                        "webdav stream read failed"
+                                    );
                                     return Err(FsError::GeneralFailure);
                                 }
                             }
@@ -294,7 +328,17 @@ where
                     }
                 }
                 Err(e) => {
-                    error!("Failed to read bytes from {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_READ_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        start_pos,
+                        read_len = count,
+                        error = %e,
+                        "webdav object read failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -372,12 +416,31 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully flushed {} bytes to {}/{}", file_size, bucket, key);
+                    debug!(
+                        event = EVENT_WEBDAV_OBJECT_WRITE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "flushed",
+                        bucket = %bucket,
+                        object = %key,
+                        file_size,
+                        "WebDAV object flush completed"
+                    );
                     // Buffer already cleared by std::mem::take above
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to flush to {}/{}: {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_WRITE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "flush_failed",
+                        bucket = %bucket,
+                        object = %key,
+                        file_size,
+                        error = %e,
+                        "WebDAV object flush failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -395,6 +458,10 @@ where
     storage: S,
     /// Session context for authorization
     session_context: Arc<SessionContext>,
+    /// Policy-safe WebDAV request headers used by IAM conditions.
+    request_headers: Option<http::HeaderMap>,
+    /// Whether the WebDAV connection uses TLS.
+    secure_transport: bool,
 }
 
 enum ResolvedPath {
@@ -428,6 +495,8 @@ where
         Self {
             storage: self.storage.clone(),
             session_context: self.session_context.clone(),
+            request_headers: self.request_headers.clone(),
+            secure_transport: self.secure_transport,
         }
     }
 }
@@ -441,7 +510,16 @@ where
         Self {
             storage,
             session_context,
+            request_headers: None,
+            secure_transport: false,
         }
+    }
+
+    /// Attach the request context used by IAM policy conditions.
+    pub fn with_request_context(mut self, request_headers: http::HeaderMap, secure_transport: bool) -> Self {
+        self.request_headers = Some(request_headers);
+        self.secure_transport = secure_transport;
+        self
     }
 
     fn credentials(&self) -> (&str, &str) {
@@ -473,7 +551,15 @@ where
             .list_objects_v2(list_input, access_key, secret_key)
             .await
             .map_err(|e| {
-                error!("Failed to list objects in {} with prefix '{}': {}", bucket, prefix, e);
+                error!(
+                    event = EVENT_WEBDAV_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    bucket = %bucket,
+                    prefix = %prefix,
+                    error = %e,
+                    "webdav list failed"
+                );
                 FsError::GeneralFailure
             })?;
 
@@ -488,7 +574,18 @@ where
             .get_object(src_bucket, src_key, access_key, secret_key, None)
             .await
             .map_err(|e| {
-                error!("Failed to get source object '{}' in '{}': {}", src_key, src_bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_COPY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "source_read_failed",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    error = %e,
+                    "webdav copy failed"
+                );
                 FsError::GeneralFailure
             })?;
 
@@ -499,7 +596,17 @@ where
             ..
         } = get_output;
         let body = body.ok_or_else(|| {
-            error!("GetObject for source object '{}/{}' returned no body stream", src_bucket, src_key);
+            error!(
+                event = EVENT_WEBDAV_COPY_FAILED,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                state = "source_body_missing",
+                src_bucket = %src_bucket,
+                src_object = %src_key,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_key,
+                "webdav copy failed"
+            );
             FsError::GeneralFailure
         })?;
 
@@ -523,8 +630,16 @@ where
             .await
             .map_err(|e| {
                 error!(
-                    "Failed to copy object from '{}/{}' to '{}/{}': {}",
-                    src_bucket, src_key, dst_bucket, dst_key, e
+                    event = EVENT_WEBDAV_COPY_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "destination_write_failed",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    error = %e,
+                    "webdav copy failed"
                 );
                 FsError::GeneralFailure
             })?;
@@ -550,7 +665,16 @@ where
                 .delete_object(src_bucket, src_obj_key, access_key, secret_key)
                 .await
                 .map_err(|e| {
-                    error!("Failed to delete source object '{}' after directory rename: {}", src_obj_key, e);
+                    error!(
+                        event = EVENT_WEBDAV_DELETE_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "rename_cleanup_failed",
+                        bucket = %src_bucket,
+                        object = %src_obj_key,
+                        error = %e,
+                        "webdav delete failed"
+                    );
                     FsError::GeneralFailure
                 })?;
         }
@@ -575,7 +699,15 @@ where
                 if Self::is_missing_head_object_error(&err_msg) {
                     Ok(HeadObjectProbe::Missing)
                 } else {
-                    error!("Failed to probe object '{}/{}': {}", bucket, key, err_msg);
+                    error!(
+                        event = EVENT_WEBDAV_PROBE_FAILED,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        bucket = %bucket,
+                        object = %key,
+                        error = %err_msg,
+                        "webdav probe failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -654,11 +786,20 @@ where
         let decoded_path = percent_decode_str(&path_str)
             .decode_utf8()
             .map_err(|_| FsError::GeneralFailure)?;
+
+        if decoded_path.chars().any(char::is_control) {
+            return Err(FsError::GeneralFailure);
+        }
+
         let cleaned_path = path::clean(&decoded_path);
         let (bucket, object) = path::path_to_bucket_object(&cleaned_path);
 
         if bucket.is_empty() {
             return Ok((String::new(), None));
+        }
+
+        if object.contains(path::GLOBAL_DIR_SUFFIX) {
+            return Err(FsError::GeneralFailure);
         }
 
         let key = if object.is_empty() { None } else { Some(object) };
@@ -674,54 +815,81 @@ where
     /// List all buckets (for root path)
     async fn list_buckets(&self) -> FsResult<Vec<WebDavDirEntry>> {
         match authorize_operation(&self.session_context, &S3Action::ListBuckets, "", None).await {
-            Ok(_) => {}
-            Err(_e) => {
-                return Err(FsError::Forbidden);
+            Ok(()) => {
+                let (access_key, secret_key) = self.credentials();
+                return match self.storage.list_buckets(access_key, secret_key).await {
+                    Ok(output) => Ok(Self::bucket_entries(output)),
+                    Err(error) => {
+                        error!(
+                            event = EVENT_WEBDAV_BUCKET_LIST_FAILED,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            error = %error,
+                            access_key = %MaskedAccessKey(access_key),
+                            "webdav bucket list failed"
+                        );
+                        Err(FsError::GeneralFailure)
+                    }
+                };
             }
+            Err(AuthorizationError::AccessDenied) => {}
+            Err(AuthorizationError::IamUnavailable) => return Err(FsError::GeneralFailure),
         }
 
-        match self
+        let Some(request_headers) = self.request_headers.as_ref() else {
+            return Err(FsError::Forbidden);
+        };
+        let result = self
             .storage
-            .list_buckets(
-                &self.session_context.principal.user_identity.credentials.access_key,
-                &self.session_context.principal.user_identity.credentials.secret_key,
-            )
-            .await
-        {
-            Ok(output) => {
-                let mut entries = Vec::new();
-                if let Some(buckets) = output.buckets {
-                    for bucket in buckets {
-                        if let Some(ref bucket_name) = bucket.name {
-                            let modified = bucket
-                                .creation_date
-                                .map(|dt| {
-                                    let offset_dt: time::OffsetDateTime = dt.into();
-                                    SystemTime::from(offset_dt)
-                                })
-                                .unwrap_or_else(SystemTime::now);
+            .list_buckets_for_session(&self.session_context, request_headers, self.secure_transport)
+            .await;
 
-                            entries.push(WebDavDirEntry {
-                                name: bucket_name.clone(),
-                                metadata: WebDavMetaData {
-                                    size: 0,
-                                    modified,
-                                    created: modified,
-                                    is_dir: true,
-                                    etag: None,
-                                    content_type: None,
-                                },
-                            });
-                        }
-                    }
-                }
-                Ok(entries)
-            }
+        match result {
+            Ok(output) => Ok(Self::bucket_entries(output)),
             Err(e) => {
-                error!("Failed to list buckets: {}", e);
+                if matches!(e.code(), S3ErrorCode::AccessDenied) {
+                    return Err(FsError::Forbidden);
+                }
+                error!(
+                    event = EVENT_WEBDAV_BUCKET_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    error = %e,
+                    access_key = %MaskedAccessKey(&self.session_context.principal.user_identity.credentials.access_key),
+                    "webdav bucket list failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
+    }
+
+    fn bucket_entries(output: ListBucketsOutput) -> Vec<WebDavDirEntry> {
+        output
+            .buckets
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|bucket| {
+                let name = bucket.name?;
+                let modified = bucket
+                    .creation_date
+                    .map(|date| {
+                        let date: time::OffsetDateTime = date.into();
+                        SystemTime::from(date)
+                    })
+                    .unwrap_or_else(SystemTime::now);
+                Some(WebDavDirEntry {
+                    name,
+                    metadata: WebDavMetaData {
+                        size: 0,
+                        modified,
+                        created: modified,
+                        is_dir: true,
+                        etag: None,
+                        content_type: None,
+                    },
+                })
+            })
+            .collect()
     }
 
     /// List objects in a bucket
@@ -852,7 +1020,15 @@ where
                 Ok(entries)
             }
             Err(e) => {
-                error!("Failed to list objects in {}: {}", bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_LIST_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    bucket = %bucket,
+                    prefix = %prefix_with_slash.unwrap_or_default(),
+                    error = %e,
+                    "webdav list failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -860,6 +1036,13 @@ where
 
     /// Recursively delete all objects in a bucket, then delete the bucket itself
     async fn delete_bucket_recursively(&self, bucket: &str) -> FsResult<()> {
+        // SECURITY: s3:DeleteBucket does not imply the right to destroy the
+        // bucket contents. Enumerating and deleting each object are separate
+        // authorization boundaries and must be cleared on their own.
+        authorize_operation(&self.session_context, &S3Action::ListBucket, bucket, None)
+            .await
+            .map_err(|_| FsError::Forbidden)?;
+
         // First, delete all objects in the bucket (with pagination)
         let mut continuation_token = None;
         loop {
@@ -884,6 +1067,10 @@ where
                 if let Some(objects) = output.contents {
                     for obj in objects {
                         if let Some(obj_key) = obj.key {
+                            authorize_operation(&self.session_context, &S3Action::DeleteObject, bucket, Some(&obj_key))
+                                .await
+                                .map_err(|_| FsError::Forbidden)?;
+
                             let _ = self
                                 .storage
                                 .delete_object(
@@ -920,7 +1107,15 @@ where
             Ok(_) => Ok(()),
             Err(e) if e.to_string().contains("NoSuchBucket") => Ok(()),
             Err(e) => {
-                error!("Failed to delete bucket '{}': {}", bucket, e);
+                error!(
+                    event = EVENT_WEBDAV_DELETE_FAILED,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    state = "bucket_delete_failed",
+                    bucket = %bucket,
+                    error = %e,
+                    "webdav delete failed"
+                );
                 Err(FsError::GeneralFailure)
             }
         }
@@ -1026,7 +1221,7 @@ where
                             created: modified,
                             is_dir: false,
                             etag: output.e_tag.as_ref().map(etag_to_string),
-                            content_type: output.content_type.map(|c| c.to_string()),
+                            content_type: output.content_type,
                         }) as Box<dyn DavMetaData>)
                     }
                     ResolvedPath::Directory { metadata, .. } => {
@@ -1045,7 +1240,7 @@ where
                             created: modified,
                             is_dir: true,
                             etag: metadata.as_ref().and_then(|output| output.e_tag.as_ref().map(etag_to_string)),
-                            content_type: metadata.and_then(|output| output.content_type.map(|c| c.to_string())),
+                            content_type: metadata.and_then(|output| output.content_type),
                         }) as Box<dyn DavMetaData>)
                     }
                 };
@@ -1073,7 +1268,15 @@ where
                         content_type: None,
                     }) as Box<dyn DavMetaData>),
                     Err(e) => {
-                        debug!("Bucket not found: {}: {}", bucket, e);
+                        debug!(
+                            event = EVENT_WEBDAV_BUCKET_METADATA_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            result = "not_found",
+                            bucket = %bucket,
+                            error = %e,
+                            "WebDAV bucket metadata listed"
+                        );
                         Err(FsError::NotFound)
                     }
                 }
@@ -1125,11 +1328,28 @@ where
                     .await
                 {
                     Ok(_) => {
-                        debug!("Successfully created directory '{}' in bucket '{}'", dir_key, bucket);
+                        debug!(
+                            event = EVENT_WEBDAV_DIRECTORY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "created",
+                            bucket = %bucket,
+                            object = %dir_key,
+                            "WebDAV directory marker created"
+                        );
                         return Ok(());
                     }
                     Err(e) => {
-                        error!("Failed to create directory '{}' in bucket '{}': {}", dir_key, bucket, e);
+                        error!(
+                            event = EVENT_WEBDAV_DIRECTORY_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "create_failed",
+                            bucket = %bucket,
+                            object = %dir_key,
+                            error = %e,
+                            "WebDAV directory marker create failed"
+                        );
                         return Err(FsError::GeneralFailure);
                     }
                 }
@@ -1150,11 +1370,26 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully created bucket '{}'", bucket);
+                    debug!(
+                        event = EVENT_WEBDAV_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "bucket_created",
+                        bucket = %bucket,
+                        "WebDAV bucket created"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to create bucket '{}': {}", bucket, e);
+                    error!(
+                        event = EVENT_WEBDAV_DIRECTORY_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "bucket_create_failed",
+                        bucket = %bucket,
+                        error = %e,
+                        "WebDAV bucket create failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -1179,6 +1414,14 @@ where
                 };
 
                 authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&prefix_with_slash))
+                    .await
+                    .map_err(|_| FsError::Forbidden)?;
+
+                // SECURITY: clearing s3:DeleteObject on the directory marker key
+                // says nothing about the children stored under it. Enumerating the
+                // prefix and deleting each child are separate authorization
+                // boundaries and must be cleared on their own.
+                authorize_operation(&self.session_context, &S3Action::ListBucket, &bucket, Some(&prefix_with_slash))
                     .await
                     .map_err(|_| FsError::Forbidden)?;
 
@@ -1207,6 +1450,10 @@ where
                         if let Some(objects) = output.contents {
                             for obj in objects {
                                 if let Some(obj_key) = obj.key {
+                                    authorize_operation(&self.session_context, &S3Action::DeleteObject, &bucket, Some(&obj_key))
+                                        .await
+                                        .map_err(|_| FsError::Forbidden)?;
+
                                     let _ = self
                                         .storage
                                         .delete_object(
@@ -1279,11 +1526,28 @@ where
                 .await
             {
                 Ok(_) => {
-                    debug!("Successfully deleted object '{}/{}'", bucket, key);
+                    debug!(
+                        event = EVENT_WEBDAV_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "deleted",
+                        bucket = %bucket,
+                        object = %key,
+                        "WebDAV object deleted"
+                    );
                     Ok(())
                 }
                 Err(e) => {
-                    error!("Failed to delete object '{}/{}': {}", bucket, key, e);
+                    error!(
+                        event = EVENT_WEBDAV_OBJECT_DELETE_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "delete_failed",
+                        bucket = %bucket,
+                        object = %key,
+                        error = %e,
+                        "WebDAV object delete failed"
+                    );
                     Err(FsError::GeneralFailure)
                 }
             }
@@ -1323,11 +1587,32 @@ where
                         .delete_object(&src_bucket, &src_key, access_key, secret_key)
                         .await
                         .map_err(|e| {
-                            error!("Failed to delete source object after rename: {}", e);
+                            error!(
+                                event = EVENT_WEBDAV_RENAME_STATE,
+                                component = LOG_COMPONENT_PROTOCOLS,
+                                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                                state = "source_delete_failed",
+                                src_bucket = %src_bucket,
+                                src_object = %src_key,
+                                dst_bucket = %dst_bucket,
+                                dst_object = %dst_key,
+                                error = %e,
+                                "WebDAV rename source delete failed"
+                            );
                             FsError::GeneralFailure
                         })?;
 
-                    debug!("Successfully renamed file '{}/{}' to '{}/{}'", src_bucket, src_key, dst_bucket, dst_key);
+                    debug!(
+                        event = EVENT_WEBDAV_RENAME_STATE,
+                        component = LOG_COMPONENT_PROTOCOLS,
+                        subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                        state = "file_renamed",
+                        src_bucket = %src_bucket,
+                        src_object = %src_key,
+                        dst_bucket = %dst_bucket,
+                        dst_object = %dst_key,
+                        "WebDAV file renamed"
+                    );
                     return Ok(());
                 }
                 ResolvedPath::Directory { prefix, .. } => {
@@ -1376,7 +1661,18 @@ where
                     .list_objects_v2(list_input, access_key, secret_key)
                     .await
                     .map_err(|e| {
-                        error!("Failed to list objects during directory rename: {}", e);
+                        error!(
+                            event = EVENT_WEBDAV_RENAME_STATE,
+                            component = LOG_COMPONENT_PROTOCOLS,
+                            subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                            state = "directory_list_failed",
+                            src_bucket = %src_bucket,
+                            src_prefix = %src_prefix,
+                            dst_bucket = %dst_bucket,
+                            dst_prefix = %dst_prefix,
+                            error = %e,
+                            "WebDAV rename directory listing failed"
+                        );
                         FsError::GeneralFailure
                     })?;
 
@@ -1415,13 +1711,30 @@ where
             }
 
             if !renamed_any {
-                debug!("Source not found: {}/{}", src_bucket, src_key);
+                debug!(
+                    event = EVENT_WEBDAV_RENAME_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                    result = "source_not_found",
+                    src_bucket = %src_bucket,
+                    src_object = %src_key,
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_key,
+                    "WebDAV rename source not found"
+                );
                 return Err(FsError::NotFound);
             }
 
             debug!(
-                "Successfully renamed directory '{}/{}' to '{}/{}'",
-                src_bucket, src_key, dst_bucket, dst_key
+                event = EVENT_WEBDAV_RENAME_STATE,
+                component = LOG_COMPONENT_PROTOCOLS,
+                subsystem = LOG_SUBSYSTEM_WEBDAV_DRIVER,
+                state = "directory_renamed",
+                src_bucket = %src_bucket,
+                src_object = %src_key,
+                dst_bucket = %dst_bucket,
+                dst_object = %dst_key,
+                "WebDAV directory renamed"
             );
             Ok(())
         }
@@ -1438,12 +1751,15 @@ where
 mod tests {
     use super::WebDavDriver;
     use crate::common::client::s3::StorageBackend as S3StorageBackend;
-    use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
+    use crate::common::dummy_storage::DummyBackend;
+    use crate::common::gateway::{S3Action, with_test_auth_override, with_test_iam_unavailable};
+    use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext, test_session};
     use async_trait::async_trait;
     use bytes::Bytes;
     use dav_server::davpath::DavPath;
-    use dav_server::fs::FsError;
+    use dav_server::fs::{DavFileSystem, FsError};
     use futures_util::StreamExt;
+    use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
     use rustfs_credentials::Credentials;
     use rustfs_policy::auth::UserIdentity;
     use s3s::dto::*;
@@ -1627,11 +1943,140 @@ mod tests {
         WebDavDriver::new(DummyStorage, Arc::new(session_context))
     }
 
+    #[tokio::test]
+    async fn session_bucket_listing_does_not_require_global_list_permission() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_ok(ListBucketsOutput {
+            buckets: Some(vec![Bucket {
+                name: Some("allowed-bucket".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav))).with_request_context(
+            http::HeaderMap::from_iter([(http::header::USER_AGENT, http::HeaderValue::from_static("webdav-test"))]),
+            false,
+        );
+
+        let entries = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect("session-aware backend should own bucket filtering");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "allowed-bucket");
+        let (headers, secure_transport) = storage
+            .last_session_list_context()
+            .expect("request context should be forwarded");
+        assert_eq!(headers.get("user-agent").expect("user agent"), "webdav-test");
+        assert!(!secure_transport);
+    }
+
+    #[tokio::test]
+    async fn list_buckets_maps_typed_access_denied_to_forbidden() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(s3s::S3ErrorCode::AccessDenied, "policy denied"));
+        let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("bucket listing should be denied");
+
+        assert!(matches!(error, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn list_buckets_does_not_classify_error_text_as_access_denied() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_err(s3s::S3Error::with_message(
+            s3s::S3ErrorCode::InternalError,
+            "AccessDenied appears only in the message",
+        ));
+        let driver = WebDavDriver::new(storage, Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("bucket listing should fail");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+    }
+
+    #[tokio::test]
+    async fn global_list_permission_keeps_the_legacy_backend_path() {
+        let storage = DummyBackend::new();
+        storage.queue_list_buckets_ok(ListBucketsOutput {
+            buckets: Some(vec![Bucket {
+                name: Some("legacy-bucket".to_string()),
+                ..Default::default()
+            }]),
+            ..Default::default()
+        });
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)));
+
+        let entries = with_test_auth_override(|_, _, _| true, driver.list_buckets())
+            .await
+            .expect("globally authorized legacy backend should keep working");
+
+        assert_eq!(entries[0].name, "legacy-bucket");
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_bucket_list_error_is_a_general_failure() {
+        let storage = DummyBackend::new();
+        storage.queue_list_buckets_err(crate::common::dummy_storage::DummyError::Injected("backend failed".to_string()));
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)));
+
+        let error = with_test_auth_override(|_, _, _| true, driver.list_buckets())
+            .await
+            .expect_err("legacy backend error should fail the listing");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn iam_unavailable_does_not_enter_the_session_fallback() {
+        let storage = DummyBackend::new();
+        storage.queue_session_list_buckets_ok(ListBucketsOutput::default());
+        let driver = WebDavDriver::new(storage.clone(), Arc::new(test_session(Protocol::WebDav)))
+            .with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_iam_unavailable(driver.list_buckets())
+            .await
+            .expect_err("IAM outage must fail closed");
+
+        assert!(matches!(error, FsError::GeneralFailure));
+        assert!(storage.last_session_list_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_request_context_fails_closed() {
+        let error = with_test_auth_override(|_, _, _| false, driver().list_buckets())
+            .await
+            .expect_err("bucket listing should require the original request context");
+
+        assert!(matches!(error, FsError::Forbidden));
+    }
+
+    #[tokio::test]
+    async fn backend_without_session_listing_fails_closed() {
+        let driver = driver().with_request_context(http::HeaderMap::new(), false);
+
+        let error = with_test_auth_override(|_, _, _| false, driver.list_buckets())
+            .await
+            .expect_err("default session listing must deny the request");
+
+        assert!(matches!(error, FsError::Forbidden));
+    }
+
     #[derive(Default)]
     struct RecordingStorageState {
         objects: HashMap<(String, String), Vec<u8>>,
         put_keys: Vec<String>,
         delete_keys: Vec<String>,
+        deleted_buckets: Vec<String>,
         fail_delete_keys: HashSet<String>,
     }
 
@@ -1751,11 +2196,34 @@ mod tests {
 
         async fn list_objects_v2(
             &self,
-            _input: ListObjectsV2Input,
+            input: ListObjectsV2Input,
             _access_key: &str,
             _secret_key: &str,
         ) -> Result<ListObjectsV2Output, Self::Error> {
-            unreachable!("list_objects_v2 is not used in rename regression tests")
+            let prefix = input.prefix.unwrap_or_default();
+            let mut keys: Vec<String> = self
+                .state
+                .lock()
+                .expect("recording storage lock poisoned")
+                .objects
+                .keys()
+                .filter(|(bucket, key)| *bucket == input.bucket && key.starts_with(&prefix))
+                .map(|(_, key)| key.clone())
+                .collect();
+            keys.sort();
+
+            Ok(ListObjectsV2Output {
+                contents: Some(
+                    keys.into_iter()
+                        .map(|key| Object {
+                            key: Some(ObjectKey::from(key)),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                is_truncated: Some(false),
+                ..Default::default()
+            })
         }
 
         async fn list_buckets(&self, _access_key: &str, _secret_key: &str) -> Result<ListBucketsOutput, Self::Error> {
@@ -1773,11 +2241,16 @@ mod tests {
 
         async fn delete_bucket(
             &self,
-            _bucket: &str,
+            bucket: &str,
             _access_key: &str,
             _secret_key: &str,
         ) -> Result<DeleteBucketOutput, Self::Error> {
-            unreachable!("delete_bucket is not used in rename regression tests")
+            self.state
+                .lock()
+                .expect("recording storage lock poisoned")
+                .deleted_buckets
+                .push(bucket.to_string());
+            Ok(DeleteBucketOutput::default())
         }
 
         async fn copy_object(
@@ -1939,6 +2412,115 @@ mod tests {
 
         assert_eq!(bucket, "bucket");
         assert_eq!(key.as_deref(), Some("file with spaces.txt"));
+    }
+
+    #[test]
+    fn parse_path_rejects_control_bytes_after_decode() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/report%0Aname.txt").expect("path should parse");
+
+        let err = driver.parse_path(&path).expect_err("control bytes should be rejected");
+
+        assert_eq!(err, FsError::GeneralFailure);
+    }
+
+    #[test]
+    fn parse_path_rejects_internal_directory_marker() {
+        let driver = driver();
+        let path = DavPath::new("/bucket/__XLDIR__").expect("path should parse");
+
+        let err = driver
+            .parse_path(&path)
+            .expect_err("internal directory marker should be rejected");
+
+        assert_eq!(err, FsError::GeneralFailure);
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn parse_path_never_leaks_control_bytes_or_traversal_in_ok_output(
+            input in proptest::prelude::any::<String>(),
+        ) {
+            let driver = driver();
+            let encoded = utf8_percent_encode(&input, NON_ALPHANUMERIC).to_string();
+            let Ok(path) = DavPath::new(&format!("/{encoded}")) else {
+                return Ok(());
+            };
+
+            match driver.parse_path(&path) {
+                Err(err) => {
+                    proptest::prop_assert_eq!(err, FsError::GeneralFailure);
+                }
+                Ok((bucket, key)) => {
+                    proptest::prop_assert!(!bucket.contains('/'));
+                    proptest::prop_assert!(!bucket.chars().any(char::is_control));
+
+                    if let Some(k) = key.as_deref() {
+                        proptest::prop_assert!(!k.chars().any(char::is_control));
+                        proptest::prop_assert!(!k.starts_with('/'));
+                        proptest::prop_assert!(!k.split('/').any(|segment| segment == ".."));
+                        proptest::prop_assert!(!k.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX));
+                    }
+                }
+            }
+        }
+    }
+
+    /// A bucket DELETE wipes every object in the bucket, so `s3:DeleteBucket`
+    /// alone must not be enough: each object needs its own `s3:DeleteObject`
+    /// boundary. The backend would happily complete the whole recursive delete
+    /// if the per-object check were removed again.
+    #[tokio::test]
+    async fn bucket_delete_denied_per_object_leaves_contents_and_bucket_intact() {
+        let (driver, storage) = recording_driver(&[("bucket", "secret.txt", b"secret")], &[]);
+        let path = DavPath::new("/bucket/").expect("path should parse");
+
+        let err = with_test_auth_override(
+            |action, _bucket, _object| !matches!(action, S3Action::DeleteObject),
+            driver.remove_dir(&path),
+        )
+        .await
+        .expect_err("bucket DELETE must fail closed when s3:DeleteObject is denied for a bucket member");
+
+        assert_eq!(err, FsError::Forbidden);
+
+        let state = storage.state.lock().expect("recording storage lock poisoned");
+        assert!(state.delete_keys.is_empty(), "no object may be deleted once the deny lands");
+        assert!(
+            state.deleted_buckets.is_empty(),
+            "the bucket must survive when its contents could not be authorized for deletion"
+        );
+        assert!(state.objects.contains_key(&("bucket".to_string(), "secret.txt".to_string())));
+    }
+
+    /// A directory DELETE authorizes the `dir/` marker key, but the children
+    /// stored under that prefix are separate resources and each needs its own
+    /// `s3:DeleteObject` boundary.
+    #[tokio::test]
+    async fn directory_delete_denied_for_child_leaves_child_intact() {
+        let (driver, storage) = recording_driver(&[("bucket", "dir/child.txt", b"child")], &[]);
+        let path = DavPath::new("/bucket/dir/").expect("path should parse");
+
+        let err = with_test_auth_override(
+            |action, _bucket, object| !matches!((action, object), (S3Action::DeleteObject, Some("dir/child.txt"))),
+            driver.remove_dir(&path),
+        )
+        .await
+        .expect_err("directory DELETE must fail closed when a child object denies s3:DeleteObject");
+
+        assert_eq!(err, FsError::Forbidden);
+
+        let state = storage.state.lock().expect("recording storage lock poisoned");
+        assert!(
+            state.delete_keys.is_empty(),
+            "the denied child must not be deleted, got {:?}",
+            state.delete_keys
+        );
+        assert!(
+            state
+                .objects
+                .contains_key(&("bucket".to_string(), "dir/child.txt".to_string()))
+        );
     }
 
     #[tokio::test]

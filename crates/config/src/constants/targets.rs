@@ -49,6 +49,10 @@ pub const KAFKA_TLS_ENABLE: &str = "tls_enable";
 pub const KAFKA_TLS_CA: &str = "tls_ca";
 pub const KAFKA_TLS_CLIENT_CERT: &str = "tls_client_cert";
 pub const KAFKA_TLS_CLIENT_KEY: &str = "tls_client_key";
+pub const KAFKA_SASL_ENABLE: &str = "sasl_enable";
+pub const KAFKA_SASL_MECHANISM: &str = "sasl_mechanism";
+pub const KAFKA_SASL_USERNAME: &str = "sasl_username";
+pub const KAFKA_SASL_PASSWORD: &str = "sasl_password";
 
 pub const AMQP_URL: &str = "url";
 pub const AMQP_EXCHANGE: &str = "exchange";
@@ -75,6 +79,13 @@ pub const NATS_TLS_CLIENT_KEY: &str = "tls_client_key";
 pub const NATS_TLS_REQUIRED: &str = "tls_required";
 pub const NATS_QUEUE_DIR: &str = "queue_dir";
 pub const NATS_QUEUE_LIMIT: &str = "queue_limit";
+pub const NATS_JETSTREAM_ENABLE: &str = "jetstream_enable";
+pub const NATS_JETSTREAM_STREAM_NAME: &str = "jetstream_stream_name";
+pub const NATS_JETSTREAM_ACK_TIMEOUT_SECS: &str = "jetstream_ack_timeout_secs";
+
+pub const NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS: u64 = 30;
+pub const NATS_JETSTREAM_ACK_TIMEOUT_MIN_SECS: u64 = 10;
+pub const NATS_JETSTREAM_ACK_TIMEOUT_MAX_SECS: u64 = 120;
 
 pub const PULSAR_BROKER: &str = "broker";
 pub const PULSAR_TOPIC: &str = "topic";

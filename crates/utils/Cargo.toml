@@ -25,69 +25,72 @@ keywords = ["utilities", "hashing", "compression", "network", "rustfs"]
 categories = ["web-programming", "development-tools", "cryptography"]
 
 [dependencies]
+hotpath.workspace = true
 base64-simd = { workspace = true, optional = true }
 blake2 = { workspace = true, optional = true }
 brotli = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true, optional = true, features = ["serde"] }
 crc-fast = { workspace = true, optional = true }
 flate2 = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
-hashbrown = { workspace = true, optional = true }
 hex-simd = { workspace = true, optional = true }
 highway = { workspace = true, optional = true }
 hmac = { workspace = true, optional = true }
 http = { workspace = true, optional = true }
-hyper = { workspace = true, optional = true }
-libc = { workspace = true, optional = true }
+hyper = { workspace = true, optional = true, features = ["http2", "http1", "server"] }
 local-ip-address = { workspace = true, optional = true }
 lz4 = { workspace = true, optional = true }
 md-5 = { workspace = true, optional = true }
 netif = { workspace = true, optional = true }
 regex = { workspace = true, optional = true }
-rustix = { workspace = true, optional = true }
-rustls = { workspace = true, optional = true }
-rustls-pki-types = { workspace = true, optional = true }
-s3s = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
+reqwest = { workspace = true, optional = true }
+rustix = { workspace = true, optional = true, features = ["fs"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
 sha1 = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 convert_case = { workspace = true, optional = true }
 siphasher = { workspace = true, optional = true }
 snap = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
-thiserror = { workspace = true, optional = true }
-tokio = { workspace = true, optional = true, features = ["io-util", "macros"] }
+tokio = { workspace = true, optional = true, features = ["io-util", "net", "time"] }
 tracing = { workspace = true }
 transform-stream = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
 temp-env = { workspace = true }
+proptest = "1"
+
+[[bench]]
+name = "hash_hotpath_benchmark"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows = { workspace = true, optional = true, features = ["Win32_Storage_FileSystem"] }
 
 [lints]
 workspace = true
 
 [features]
 default = ["ip"]  # features that are enabled by default
+hotpath = ["hotpath/hotpath", "hotpath/tokio", "hotpath/futures", "hotpath/reqwest-0-13"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 ip = ["dep:local-ip-address"]  # ip characteristics and their dependencies
-tls = ["dep:rustls", "dep:rustls-pki-types"]  # tls characteristics and their dependencies
-net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:s3s", "dep:hyper", "dep:thiserror", "dep:tokio"]  # network features with DNS resolver
+net = ["ip", "dep:url", "dep:netif", "dep:futures", "dep:transform-stream", "dep:bytes", "dep:hyper", "dep:tokio"]  # network features with DNS resolver
+egress = ["ip", "dep:reqwest", "dep:tokio", "dep:url"]
 io = ["dep:tokio"]
 path = []  # path manipulation features
-notify = ["dep:hyper", "dep:s3s", "dep:hashbrown", "dep:thiserror", "dep:serde", "dep:libc", "dep:url", "dep:regex"]  # file system notification features
 compress = ["dep:flate2", "dep:brotli", "dep:snap", "dep:lz4", "dep:zstd"]
 string = ["dep:regex"]
-crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1"]
+crypto = ["dep:base64-simd", "dep:hex-simd", "dep:hmac", "dep:hyper", "dep:sha1", "dep:sha2"]
 hash = ["dep:highway", "dep:md-5", "dep:sha2", "dep:blake2", "dep:serde", "dep:siphasher", "dep:hex-simd", "dep:crc-fast"]
 os = ["dep:rustix", "dep:tempfile", "dep:windows"]  # operating system utilities
 integration = []  # integration test features
 http = ["dep:convert_case", "dep:http", "dep:regex"]
 obj = ["http"] # object storage features
-full = ["ip", "tls", "net", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "notify", "http", "obj"]  # all features
+full = ["ip", "net", "egress", "io", "hash", "os", "integration", "path", "crypto", "string", "compress", "http", "obj"]  # all features

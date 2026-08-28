@@ -191,7 +191,7 @@ RUST_LOG=debug cargo test test_local_kms_end_to_end -- --nocapture
 4. **Monitor ports**
    ```bash
    netstat -an | grep 9050
-   curl http://127.0.0.1:9050/minio/health/ready
+   curl http://127.0.0.1:9050/health/ready
    ```
 
 ## 📊 Coverage
@@ -244,9 +244,9 @@ Designed to run inside CI/CD pipelines:
 
 ## 📚 References
 
-- [KMS configuration guide](../../../../docs/kms/README.md)
-- [Dynamic configuration API](../../../../docs/kms/http-api.md)
-- [Troubleshooting](../../../../docs/kms/troubleshooting.md)
+- [KMS configuration types](../../../kms/src/config.rs)
+- [Dynamic configuration API handlers](../../../../rustfs/src/admin/handlers/kms_dynamic.rs)
+- [KMS management API handlers](../../../../rustfs/src/admin/handlers/kms_management.rs)
 
 ---
 

@@ -1,4 +1,4 @@
-[![RustFS](https://github.com/user-attachments/assets/1b5afcd6-a2c3-47ff-8bc3-ce882b0ddca7)](https://rustfs.com.cn)
+[![RustFS](https://repository-images.githubusercontent.com/722597620/0fa936a2-8164-4f53-867f-def4beb64b21)](https://rustfs.com.cn)
 
 <p align="center">RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。</p>
 
@@ -12,8 +12,7 @@
 
 
 <p align="center">
-<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a> 
-<a href="https://runacap.com/ross-index/q4-2025/" target="_blank" rel="noopener"><img style="width: 260px; height: 55px" src="https://runacap.com/wp-content/uploads/2026/01/ROSS_badge_white_Q4_2025.svg" alt="ROSS Index - Fastest Growing Open-Source Startups in Q4 2025 | Runa Capital" height="55" /></a>
+<a href="https://trendshift.io/repositories/14181" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14181" alt="rustfs%2Frustfs | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
 </p>
 
 <p align="center">
@@ -34,7 +33,7 @@
   <a href="https://readme-i18n.com/rustfs/rustfs?lang=ru">Русский</a>
 </p>
 
-RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust 是全球最受开发者喜爱的编程语言之一，RustFS 完美结合了 MinIO 的简洁性与 Rust 的内存安全及高性能优势。它提供完整的 S3 兼容性，完全开源，并专为数据湖、人工智能（AI）和大数据负载进行了优化。
+RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust 是全球最受开发者喜爱的编程语言之一，RustFS 结合了 MinIO 的简洁性与 Rust 的内存安全及高性能优势。它为已支持功能提供广泛的 S3 API 兼容性，完全开源，并专为数据湖、人工智能（AI）和大数据负载进行了优化。
 
 与其他存储系统不同，RustFS 采用更宽松、商业友好的 Apache 2.0 许可证，避免了 AGPL 协议的限制。以 Rust 为基石，RustFS 为下一代对象存储提供了更快的速度和更安全的分布式特性。
 
@@ -42,7 +41,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 
 - **高性能**：基于 Rust 构建，确保极致的速度和资源效率。
 - **分布式架构**：可扩展且容错的设计，适用于大规模部署。
-- **S3 兼容性**：与现有的 S3 兼容应用和工具无缝集成。
+- **S3 兼容性**：与常见 S3 兼容应用和工具集成，当前覆盖范围见 [S3 兼容矩阵](docs/architecture/s3-compatibility-matrix.md)。
 - **数据湖支持**：专为高吞吐量的大数据和 AI 工作负载优化。
 - **完全开源**：采用 Apache 2.0 许可证，鼓励社区贡献和商业使用。
 - **简单易用**：设计简洁，易于部署和管理。
@@ -77,7 +76,7 @@ RustFS 是一个基于 Rust 构建的高性能分布式对象存储系统。Rust
 | **语言与安全** | **基于 Rust 开发**<br>天生的内存安全。                                                                              | **基于 Go 或 C 开发**<br>存在内存 GC 停顿或内存泄漏的潜在风险。          |
 | **数据主权**   | **无遥测 / 完全合规**<br>防止未经授权的数据跨境传输。完全符合 GDPR (欧盟/英国)、CCPA (美国) 和 APPI (日本) 等法规。 | **潜在风险**<br>可能存在法律风险和隐蔽的数据遥测（Telemetry）。          |
 | **开源协议**   | **宽松的 Apache 2.0**<br>商业友好，无“毒丸”条款。                                                                   | **受限的 AGPL v3**<br>存在许可证陷阱和知识产权污染的风险。               |
-| **兼容性**     | **100% S3 兼容**<br>适用于任何云提供商和客户端，随处运行。                                                          | **兼容性不一**<br>虽然支持 S3，但可能缺乏对本地云厂商或特定 API 的支持。 |
+| **兼容性**     | **S3 核心兼容**<br>适配常见 S3 兼容客户端，覆盖范围以兼容矩阵为准。                                                  | **兼容性不一**<br>虽然支持 S3，但可能缺乏对本地云厂商或特定 API 的支持。 |
 | **边缘与 IoT** | **强大的边缘支持**<br>非常适合安全、创新的边缘设备。                                                                | **边缘支持较弱**<br>对于边缘网关来说通常过于沉重。                       |
 | **成本**       | **稳定且免费**<br>免费社区支持，稳定的商业定价。                                                                    | **高昂成本**<br>1PiB 的成本可能高达 250,000 美元。                       |
 | **风险控制**   | **企业级风险规避**<br>清晰的知识产权，商业使用安全无忧。                                                            | **法律风险**<br>知识产权归属模糊及使用限制风险。                         |
@@ -100,29 +99,41 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 ### 2\. Docker 快速启动 (选项 2)
 
-RustFS 容器以非 root 用户 `rustfs` (UID `10001`) 运行。如果您使用 Docker 的 `-v` 参数挂载宿主机目录，请务必确保宿主机目录的所有者已更改为 `10001`，否则会遇到权限拒绝错误。
+RustFS 容器以非 root 用户 `rustfs` (UID/GID `10001:10001`) 运行。如果您通过 Docker 或 Compose 绑定挂载宿主机目录，请务必确保所有挂载路径都对该用户可写，否则启动时可能出现权限拒绝错误。这不仅适用于数据目录和日志目录，也适用于启用 `RUSTFS_TLS_PATH` 时挂载的 TLS 证书目录。
 
 ```bash
- # 创建数据和日志目录
- mkdir -p data logs
+# 创建数据和日志目录
+mkdir -p data logs
 
- # 更改这两个目录的所有者
- chown -R 10001:10001 data logs
+# 更改这两个目录的所有者
+chown -R 10001:10001 data logs
 
- # 使用最新版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
+# 使用最新版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
- # 使用指定版本运行
- docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:v1.0.0-beta.1
+# 使用指定版本运行
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.0-rc.4
 ```
 
-您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
+如果您通过绑定挂载启用 TLS 证书目录，也请用同样方式准备该目录：
 
 ```bash
-docker compose --profile observability up -d
+mkdir -p certs
+chown -R 10001:10001 certs
 ```
 
-**注意**: 我们建议您在运行前查看 `docker-compose.yml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
+您也可以使用 Docker Compose。使用根目录下的 `docker-compose-simple.yml` 文件：
+
+```bash
+docker compose -f docker-compose-simple.yml up -d
+```
+
+在使用 Compose 且包含宿主机绑定挂载时，请先确认：
+
+- 所有挂载到容器内的宿主机路径都对 `10001:10001` 可写。
+- 如果启用了 TLS，挂载到 `/opt/tls` 的证书目录也需要对 `10001:10001` 可读。
+- 如果不方便调整宿主机目录归属，可以为 `rustfs` 服务显式设置 `user: "<host-uid>:<host-gid>"`。
+- `docker-compose-simple.yml` 为命名 volume 提供了 `volume-permission-helper` 服务；`docker-compose-simple.yml` 使用宿主机绑定挂载，因此需要您在启动前自行准备目录权限。
 
 ### 3\. 源码编译 (选项 3) - 进阶用户
 
@@ -202,7 +213,7 @@ rustfs --help
 2. **创建存储桶**: 使用控制台为您​​的对象创建一个新的存储桶 (Bucket)。
 3. **上传对象**: 您可以直接通过控制台上传文件，或使用 S3 兼容的 API/客户端与您的 RustFS 实例进行交互。
 
-**注意**: 如果您希望通过 `https` 访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/integration/tls-configured.html)。
+**注意**: 如果您希望通过 `https` 访问 RustFS 实例，请参考 [TLS 配置文档](https://docs.rustfs.com/integration/tls-configured)。
 
 ## 文档
 
@@ -235,12 +246,18 @@ rustfs --help
 RustFS 是一个社区驱动的项目，我们感谢所有的贡献。请查看 [贡献者](https://github.com/rustfs/rustfs/graphs/contributors) 页面，看看那些让 RustFS 变得更好的了不起的人们。
 
 <a href="https://github.com/rustfs/rustfs/graphs/contributors">
-<img src="https://opencollective.com/rustfs/contributors.svg?width=890&limit=500&button=false" alt="Contributors" />
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rustfs/rustfs/star-history/contributors-dark.svg">
+  <img src="https://raw.githubusercontent.com/rustfs/rustfs/star-history/contributors-light.svg" alt="RustFS 贡献者">
+</picture>
 </a>
 
 ## Star 历史
 
-[![Star History Chart](https://api.star-history.com/svg?repos=rustfs/rustfs&type=date&legend=top-left)](https://www.star-history.com/#rustfs/rustfs&type=date&legend=top-left)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-dark.svg">
+  <img src="https://raw.githubusercontent.com/rustfs/rustfs/star-history/star-history-light.svg" alt="RustFS Star 历史图表">
+</picture>
 
 ## 许可证
 

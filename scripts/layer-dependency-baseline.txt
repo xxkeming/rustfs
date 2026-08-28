@@ -1,19 +1,33 @@
 # Layer dependency baseline for the rustfs binary crate.
 #
-# These are intra-crate module references within rustfs/ that cross the
-# conceptual layer boundaries (app, infra/server, interface/admin).
-# Since they live inside one Cargo crate, Rust doesn't enforce separation.
-# The list is maintained for architectural awareness during code review.
+# RATCHET RULE (backlog#1834): this file only shrinks. A PR may delete lines
+# (after migrating the violation) via --update-baseline; a PR that ADDS a line
+# is baselining a brand-new layering violation and must carry an explicit
+# exemption rationale in its description — the baseline is a migration ledger,
+# not an amnesty list.
 #
-# Format: status|source_file|direction|imported_symbol
+# The guard models production imports as:
+#   composition -> interface -> app -> infra
 #
-# Status:
-#   accepted - reviewed and intentionally allowed
-#   todo     - should be resolved in a future refactor
-
-accepted|rustfs/src/main.rs|infra->app|crate::app::context::*|main wires all layers
-accepted|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
-accepted|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
-accepted|rustfs/src/server/http.rs|infra->interface|crate::admin|HTTP server routes to admin handlers
-accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path|pure path predicate for routing
-accepted|rustfs/src/storage/objects/put_object.rs|infra->app|crate::app::context::resolve_bucket_metadata_handle|metadata resolution uses global AppContext
+# Canonical dependency entry:
+#   dep|source_file|source_layer->target_layer|crate::imported_symbol
+#
+# Canonical conceptual cycle entry:
+#   cycle|left_layer<->right_layer
+cycle|app<->infra
+cycle|app<->interface
+cycle|infra<->interface
+dep|rustfs/src/app/admin_usecase.rs|app->interface|crate::server::collect_dependency_readiness_report
+dep|rustfs/src/cluster_snapshot.rs|infra->interface|crate::server::snapshot_dependency_readiness_report
+dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
+dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::server::cors
+dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_audit_module_enabled
+dep|rustfs/src/storage/helper.rs|infra->interface|crate::server::refresh_notify_module_enabled
+dep|rustfs/src/storage/rpc/http_service.rs|infra->interface|crate::server::RPC_PREFIX
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::current_kms_config_fingerprint
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::handlers::kms_dynamic::reload_persisted_kms_config
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM

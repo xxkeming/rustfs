@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
 };
-use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
-use rustfs_utils::http::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, ip::get_source_ip_raw,
-};
+use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
+use rustfs_trusted_proxies::ClientInfo;
+use rustfs_utils::MaskedAccessKey;
+use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
 use s3s::S3Result;
@@ -32,10 +33,36 @@ use s3s::auth::SimpleAuth;
 use s3s::s3_error;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
+use url::form_urlencoded;
+
+const LOG_COMPONENT_AUTH: &str = "auth";
+const LOG_SUBSYSTEM_CREDENTIALS: &str = "credentials";
+const LOG_SUBSYSTEM_KEYSTONE: &str = "keystone";
+const LOG_SUBSYSTEM_REQUEST: &str = "request";
+const EVENT_SECRET_KEY_LOOKUP_FAILED: &str = "secret_key_lookup_failed";
+const EVENT_ACCESS_KEY_VALIDATION_STARTED: &str = "access_key_validation_started";
+const EVENT_KEYSTONE_CREDENTIALS_DETECTED: &str = "keystone_credentials_detected";
+const EVENT_KEYSTONE_CREDENTIALS_VALIDATED: &str = "keystone_credentials_validated";
+const EVENT_KEYSTONE_CONTEXT_MISSING: &str = "keystone_context_missing";
+const EVENT_SESSION_TOKEN_EXTRACTION: &str = "session_token_extraction";
+
+/// RustFS-specific query capability for a single presigned PutObject request.
+pub(crate) const RUSTFS_MAX_CONTENT_LENGTH_QUERY: &str = "x-rustfs-max-content-length";
+pub(crate) const RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY: &str = "x-rustfs-max-total-object-size";
+
+/// Inserted by the S3 access boundary after the upstream verifier accepts a
+/// request as SigV4 presigned. Downstream capability parsing must require this
+/// marker instead of treating query syntax as proof of authentication.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedPresignedRequest;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VerifiedSigV4Request;
 
 /// Performs constant-time string comparison to prevent timing attacks.
 ///
@@ -100,6 +127,7 @@ pub struct IAMAuth {
     simple_auth: SimpleAuth,
     access_key: String,
     secret_key: SecretKey,
+    server_ctx: Option<std::sync::Arc<ServerContextSlot>>,
 }
 
 impl Clone for IAMAuth {
@@ -108,6 +136,7 @@ impl Clone for IAMAuth {
             simple_auth: SimpleAuth::from_single(self.access_key.clone(), self.secret_key.clone()),
             access_key: self.access_key.clone(),
             secret_key: self.secret_key.clone(),
+            server_ctx: self.server_ctx.clone(),
         }
     }
 }
@@ -121,7 +150,18 @@ impl IAMAuth {
             simple_auth,
             access_key,
             secret_key,
+            server_ctx: None,
         }
+    }
+
+    pub(crate) fn with_server_context(
+        ak: impl Into<String>,
+        sk: impl Into<SecretKey>,
+        server_ctx: std::sync::Arc<ServerContextSlot>,
+    ) -> Self {
+        let mut auth = Self::new(ak, sk);
+        auth.server_ctx = Some(server_ctx);
+        auth
     }
 }
 
@@ -133,7 +173,14 @@ impl S3Auth for IAMAuth {
         use rustfs_keystone::KEYSTONE_CREDENTIALS;
 
         if let Ok(Some(creds)) = KEYSTONE_CREDENTIALS.try_with(|c| c.clone()) {
-            debug!("IAMAuth: Keystone credentials found in task-local storage for user {}", creds.parent_user);
+            debug!(
+                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                principal = %MaskedAccessKey(&creds.parent_user),
+                result = "token_auth",
+                "Keystone task-local credentials detected"
+            );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             return Ok(SecretKey::from(String::new()));
         }
@@ -146,8 +193,12 @@ impl S3Auth for IAMAuth {
         // Keystone credentials use token authentication, not signature verification
         if access_key.starts_with("keystone:") {
             debug!(
-                "IAMAuth: Keystone access key detected ({}), returning empty secret for token-based auth",
-                access_key
+                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_KEYSTONE,
+                access_key = %MaskedAccessKey(access_key),
+                result = "token_auth",
+                "Keystone token-auth access key detected"
             );
             // Return empty secret key - Keystone uses token validation, not AWS signatures
             // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
@@ -162,7 +213,15 @@ impl S3Auth for IAMAuth {
             return Ok(key);
         }
 
-        if let Ok(iam_store) = rustfs_iam::get() {
+        let iam_store = match &self.server_ctx {
+            Some(server_ctx) => server_ctx
+                .installed_app_context()
+                .filter(|context| context.iam().is_ready())
+                .map(|context| context.iam().handle())
+                .ok_or(()),
+            None => current_ready_iam_handle().map_err(|_| ()),
+        };
+        if let Ok(iam_store) = iam_store {
             // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
             // This is important for newly created users that may not be in cache yet.
             // check_key will automatically attempt to load the user from disk if not found in cache.
@@ -173,15 +232,37 @@ impl S3Auth for IAMAuth {
                     return Ok(SecretKey::from(id.credentials.secret_key));
                 }
                 Ok((None, _)) => {
-                    warn!("get_secret_key failed: no such user, access_key: {access_key}");
+                    warn!(
+                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = LOG_COMPONENT_AUTH,
+                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                        access_key = %MaskedAccessKey(access_key),
+                        reason = "no_such_user",
+                        "Secret key lookup rejected"
+                    );
                 }
                 Err(e) => {
-                    warn!("get_secret_key failed: check_key error, access_key: {access_key}, error: {e:?}");
+                    warn!(
+                        event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                        component = LOG_COMPONENT_AUTH,
+                        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                        access_key = %MaskedAccessKey(access_key),
+                        error = ?e,
+                        reason = "check_key_error",
+                        "Secret key lookup errored"
+                    );
                     return Err(iam_lookup_error_to_s3_error(&e));
                 }
             }
         } else {
-            warn!("get_secret_key failed: iam not initialized, access_key: {access_key}");
+            warn!(
+                event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                access_key = %MaskedAccessKey(access_key),
+                reason = "iam_not_initialized",
+                "Secret key lookup skipped"
+            );
         }
 
         Err(s3_error!(
@@ -197,6 +278,29 @@ fn iam_lookup_error_to_s3_error(_err: &IamError) -> S3Error {
 
 // check_key_valid checks the key is valid or not. return the user's credentials and if the user is the owner.
 pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<(Credentials, bool)> {
+    check_key_valid_with_context(session_token, access_key, None).await
+}
+
+fn has_root_access(sys_cred: &Credentials, cred: &Credentials) -> bool {
+    (constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key))
+        && !cred
+            .claims
+            .as_ref()
+            .is_some_and(|claims| claims.contains_key(SESSION_POLICY_NAME) || rustfs_iam::sys::is_rustfs_oidc_claims(claims))
+}
+
+/// Validate an access key, resolving the root credentials and IAM system from
+/// an explicit application context when one is given (backlog#1052 S6).
+///
+/// A per-server request path passes its own context so a second embedded
+/// server authenticates against its own root identity and IAM domain instead
+/// of the process defaults; `None` falls back to the ambient globals — the
+/// single-instance legacy behavior that all existing callers keep.
+pub async fn check_key_valid_with_context(
+    session_token: &str,
+    access_key: &str,
+    ctx: Option<&AppContext>,
+) -> S3Result<(Credentials, bool)> {
     // KEYSTONE INTEGRATION: Check if Keystone credentials are present in task-local storage
     // This handles both:
     // 1. Pure X-Auth-Token requests (access_key may be empty)
@@ -207,26 +311,38 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // Try to get Keystone credentials from task-local storage first
     // Add debug logging for UI authentication tracking
     debug!(
-        "check_key_valid: starting validation - access_key={}, session_token_len={}",
-        access_key,
-        session_token.len()
+        event = EVENT_ACCESS_KEY_VALIDATION_STARTED,
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+        access_key = %MaskedAccessKey(access_key),
+        has_session_token = !session_token.is_empty(),
+        "Access key validation started"
     );
     if let Ok(Some(credentials)) = KEYSTONE_CREDENTIALS.try_with(|creds| creds.clone()) {
-        debug!("check_key_valid: Keystone credentials found in task-local storage");
+        debug!(
+            event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            result = "task_local",
+            "Keystone task-local credentials detected"
+        );
 
         if !auth_keystone::is_keystone_enabled() {
             return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication is not enabled"));
         }
 
-        tracing::info!(
-            "check_key_valid: Retrieved Keystone credentials for user: {} (project: {})",
-            credentials.parent_user,
-            credentials
+        debug!(
+            event = EVENT_KEYSTONE_CREDENTIALS_VALIDATED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            principal = %MaskedAccessKey(&credentials.parent_user),
+            has_project_name = credentials
                 .claims
                 .as_ref()
                 .and_then(|c| c.get("keystone_project_name"))
                 .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
+                .is_some(),
+            "Keystone task-local credentials validated"
         );
 
         // Determine if user is admin (owner-level access)
@@ -245,8 +361,12 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
             .unwrap_or(false);
 
         debug!(
-            "check_key_valid: Keystone user {} has owner permissions: {}",
-            credentials.parent_user, is_owner
+            event = EVENT_KEYSTONE_CREDENTIALS_VALIDATED,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            principal = %MaskedAccessKey(&credentials.parent_user),
+            is_owner,
+            "Keystone owner permissions evaluated"
         );
 
         return Ok((credentials, is_owner));
@@ -255,8 +375,11 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     // Legacy check for explicit "keystone:" prefix (for backwards compatibility)
     if access_key.starts_with("keystone:") {
         warn!(
-            "check_key_valid: Keystone access key detected but no credentials in task-local storage. \
-             This indicates middleware was bypassed or not configured."
+            event = EVENT_KEYSTONE_CONTEXT_MISSING,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_KEYSTONE,
+            access_key = %MaskedAccessKey(access_key),
+            "Keystone context missing for access key"
         );
 
         if !auth_keystone::is_keystone_enabled() {
@@ -266,7 +389,13 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
-    let Some(mut cred) = get_global_action_cred() else {
+    // Prefer this server's context (backlog#1052 S6); fall back to the ambient
+    // process credentials when no context was threaded in.
+    let root_cred = match ctx {
+        Some(context) => context.action_credentials().get(),
+        None => current_action_credentials(),
+    };
+    let Some(mut cred) = root_cred else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
             format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
@@ -276,7 +405,12 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     let sys_cred = cred.clone();
 
     if !constant_time_eq(&cred.access_key, access_key) {
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let iam_store = match ctx {
+            Some(context) if context.iam().is_ready() => Ok(context.iam().handle()),
+            Some(_) => Err(()),
+            None => current_ready_iam_handle().map_err(|_| ()),
+        };
+        let Ok(iam_store) = iam_store else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
@@ -290,16 +424,37 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
 
         if !ok {
             let Some(ref u) = u else {
-                warn!("check_key_valid: user not found for access_key={}", access_key);
+                warn!(
+                    event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                    access_key = %MaskedAccessKey(access_key),
+                    reason = "user_not_found",
+                    "Access key validation rejected"
+                );
                 return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             };
 
             if u.credentials.status == "off" {
-                warn!("check_key_valid: account disabled for access_key={}", access_key);
-                return Err(s3_error!(InvalidRequest, "ErrAccessKeyDisabled"));
+                warn!(
+                    event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                    component = LOG_COMPONENT_AUTH,
+                    subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                    access_key = %MaskedAccessKey(access_key),
+                    reason = "account_disabled",
+                    "Access key validation rejected"
+                );
+                return Err(s3_error!(InvalidAccessKeyId, "check key failed"));
             }
 
-            warn!("check_key_valid: validation failed for access_key={}", access_key);
+            warn!(
+                event = EVENT_SECRET_KEY_LOOKUP_FAILED,
+                component = LOG_COMPONENT_AUTH,
+                subsystem = LOG_SUBSYSTEM_CREDENTIALS,
+                access_key = %MaskedAccessKey(access_key),
+                reason = "validation_failed",
+                "Access key validation rejected"
+            );
             return Err(s3_error!(InvalidRequest, "check key failed"));
         }
 
@@ -310,25 +465,24 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         cred = u.credentials;
     }
 
-    let claims = check_claims_from_token(session_token, &cred)
+    let claims = check_claims_from_token_with_context(session_token, &cred, ctx)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("check claims failed {e}")))?;
 
     cred.claims = if !claims.is_empty() { Some(claims) } else { None };
 
-    let mut owner =
-        constant_time_eq(&sys_cred.access_key, &cred.access_key) || constant_time_eq(&cred.parent_user, &sys_cred.access_key);
-
-    // permitRootAccess
-    if let Some(claims) = &cred.claims
-        && claims.contains_key(SESSION_POLICY_NAME)
-    {
-        owner = false
-    }
-
+    let owner = has_root_access(&sys_cred, &cred);
     Ok((cred, owner))
 }
 
 pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<HashMap<String, Value>> {
+    check_claims_from_token_with_context(token, cred, None)
+}
+
+fn check_claims_from_token_with_context(
+    token: &str,
+    cred: &Credentials,
+    ctx: Option<&AppContext>,
+) -> S3Result<HashMap<String, Value>> {
     if !token.is_empty() && cred.access_key.is_empty() {
         return Err(s3_error!(InvalidRequest, "no access key"));
     }
@@ -341,7 +495,7 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid token2"));
     }
 
-    if !cred.is_service_account() && cred.is_temp() && token != cred.session_token {
+    if !cred.is_service_account() && cred.is_temp() && !constant_time_eq(token, &cred.session_token) {
         return Err(s3_error!(InvalidRequest, "invalid token3"));
     }
 
@@ -349,11 +503,13 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
     }
 
-    let Some(sys_cred) = get_global_action_cred() else {
+    let sys_cred = match ctx {
+        Some(context) => context.action_credentials().get(),
+        None => current_action_credentials(),
+    };
+    let Some(sys_cred) = sys_cred else {
         return Err(s3_error!(InternalError, "action cred not init"));
     };
-
-    // TODO: REPLICATION
 
     let (token, secret) = if cred.is_service_account() {
         (cred.session_token.as_str(), cred.secret_key.as_str())
@@ -374,51 +530,19 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
     Ok(HashMap::new())
 }
 
-/// Check for Keystone authentication headers and authenticate if present
-/// Returns Some((Credentials, is_owner)) if Keystone authentication succeeds
-/// Returns None if no Keystone headers present (fall back to standard auth)
-///
-/// Reserved for future use (alternative Keystone auth path)
-#[allow(dead_code)]
-pub async fn try_keystone_auth(headers: &HeaderMap) -> S3Result<Option<(Credentials, bool)>> {
-    use crate::auth_keystone;
-
-    if !auth_keystone::is_keystone_enabled() {
-        return Ok(None);
-    }
-
-    match auth_keystone::authenticate_keystone(headers).await? {
-        Some(cred) => {
-            // Keystone credentials are never "owner" in the traditional sense
-            // unless they have admin role
-            let is_owner = cred
-                .groups
-                .as_ref()
-                .map(|groups| {
-                    groups
-                        .iter()
-                        .any(|g| g.eq_ignore_ascii_case("admin") || g.eq_ignore_ascii_case("reseller_admin"))
-                })
-                .unwrap_or(false);
-
-            Ok(Some((cred, is_owner)))
-        }
-        None => Ok(None),
-    }
-}
-
 pub fn get_session_token<'a>(uri: &'a Uri, hds: &'a HeaderMap) -> Option<&'a str> {
     let token = hds
         .get("x-amz-security-token")
         .map(|v| v.to_str().unwrap_or_default())
         .or_else(|| get_query_param(uri.query().unwrap_or_default(), "x-amz-security-token"));
 
-    // Add debug logging to track session token extraction
-    if token.is_some() {
-        debug!("get_session_token: session token found in request (header or query param)");
-    } else {
-        debug!("get_session_token: no session token found in request headers or query params");
-    }
+    trace!(
+        event = EVENT_SESSION_TOKEN_EXTRACTION,
+        component = LOG_COMPONENT_AUTH,
+        subsystem = LOG_SUBSYSTEM_REQUEST,
+        has_session_token = token.is_some(),
+        "Completed session token extraction"
+    );
 
     token
 }
@@ -434,6 +558,20 @@ pub(crate) fn extract_string_list_claim(claims: &HashMap<String, Value>, claim_n
             .collect(),
         ClaimLookup::Missing | ClaimLookup::Ambiguous | ClaimLookup::Found(_) => Vec::new(),
     }
+}
+
+fn policy_source_ip(remote_addr: Option<SocketAddr>, client_info: Option<&ClientInfo>) -> String {
+    client_info
+        .map(|info| info.real_ip.to_string())
+        .or_else(|| remote_addr.map(|addr| addr.ip().to_string()))
+        .unwrap_or_default()
+}
+
+fn policy_secure_transport(client_info: Option<&ClientInfo>) -> bool {
+    client_info
+        .and_then(|info| info.forwarded_proto.as_deref())
+        .map(|proto| proto.eq_ignore_ascii_case("https"))
+        .unwrap_or(false)
 }
 
 /// Get condition values for policy evaluation
@@ -453,9 +591,21 @@ pub fn get_condition_values(
     cred: &Credentials,
     version_id: Option<&str>,
     region: Option<s3s::region::Region>,
-    remote_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<SocketAddr>,
 ) -> HashMap<String, Vec<String>> {
-    get_condition_values_with_query(header, cred, version_id, region, remote_addr, None)
+    get_condition_values_with_client_info(header, cred, version_id, region, remote_addr, None)
+}
+
+/// Get condition values for policy evaluation with verified client information.
+pub fn get_condition_values_with_client_info(
+    header: &HeaderMap,
+    cred: &Credentials,
+    version_id: Option<&str>,
+    region: Option<s3s::region::Region>,
+    remote_addr: Option<SocketAddr>,
+    client_info: Option<&ClientInfo>,
+) -> HashMap<String, Vec<String>> {
+    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, None, client_info)
 }
 
 /// Get condition values for policy evaluation with optional query-string values.
@@ -475,8 +625,22 @@ pub fn get_condition_values_with_query(
     cred: &Credentials,
     version_id: Option<&str>,
     region: Option<s3s::region::Region>,
-    remote_addr: Option<std::net::SocketAddr>,
+    remote_addr: Option<SocketAddr>,
     query: Option<&str>,
+) -> HashMap<String, Vec<String>> {
+    get_condition_values_with_query_and_client_info(header, cred, version_id, region, remote_addr, query, None)
+}
+
+/// Get condition values for policy evaluation with optional query-string values
+/// and verified client information from trusted proxy middleware.
+pub fn get_condition_values_with_query_and_client_info(
+    header: &HeaderMap,
+    cred: &Credentials,
+    version_id: Option<&str>,
+    region: Option<s3s::region::Region>,
+    remote_addr: Option<SocketAddr>,
+    query: Option<&str>,
+    client_info: Option<&ClientInfo>,
 ) -> HashMap<String, Vec<String>> {
     let username = if cred.is_temp() || cred.is_service_account() {
         cred.parent_user.clone()
@@ -484,7 +648,7 @@ pub fn get_condition_values_with_query(
         cred.access_key.clone()
     };
 
-    let sys_cred = get_global_action_cred().unwrap_or_default();
+    let sys_cred = current_action_credentials().unwrap_or_default();
 
     let claims = &cred.claims;
 
@@ -510,21 +674,8 @@ pub fn get_condition_values_with_query(
     // Determine auth type and signature version from headers and query
     let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
 
-    // Get TLS status from header
-    let is_tls = header
-        .get("x-forwarded-proto")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s == "https")
-        .or_else(|| {
-            header
-                .get("x-forwarded-scheme")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s == "https")
-        })
-        .unwrap_or(false);
-
-    // Get remote address from header or use default
-    let remote_addr_s = remote_addr.map(|a| a.ip().to_string()).unwrap_or_default();
+    let is_tls = policy_secure_transport(client_info);
+    let source_ip = policy_source_ip(remote_addr, client_info);
 
     let mut args = HashMap::new();
 
@@ -532,7 +683,7 @@ pub fn get_condition_values_with_query(
     args.insert("CurrentTime".to_owned(), vec![curr_time.format(&Rfc3339).unwrap_or_default()]);
     args.insert("EpochTime".to_owned(), vec![epoch_time.to_string()]);
     args.insert("SecureTransport".to_owned(), vec![is_tls.to_string()]);
-    args.insert("SourceIp".to_owned(), vec![get_source_ip_raw(header, &remote_addr_s)]);
+    args.insert("SourceIp".to_owned(), vec![source_ip]);
 
     // Add user agent and referer
     if let Some(user_agent) = header.get("user-agent") {
@@ -607,24 +758,8 @@ pub fn get_condition_values_with_query(
         clone_header.remove(*grant_header);
     }
 
-    for (key, _values) in clone_header.iter() {
-        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
-            continue;
-        }
-        if let Some(existing_values) = args.get_mut(key.as_str()) {
-            existing_values.extend(clone_header.get_all(key).iter().map(|v| v.to_str().unwrap_or("").to_string()));
-        } else {
-            args.insert(
-                key.as_str().to_string(),
-                header
-                    .get_all(key)
-                    .iter()
-                    .map(|v| v.to_str().unwrap_or("").to_string())
-                    .collect(),
-            );
-        }
-    }
-
+    // Claims and group membership are part of the verified identity, so they are
+    // resolved before request headers are merged in below.
     if let Some(claims) = &cred.claims {
         for (k, v) in claims {
             if let Some(v_str) = v.as_str() {
@@ -649,7 +784,38 @@ pub fn get_condition_values_with_query(
         args.insert("groups".to_string(), groups.clone());
     }
 
+    // Every remaining header is attacker-controlled. A header must never contribute
+    // to a condition key that describes the caller's own identity or the connection,
+    // otherwise sending `userid: admin` (or any `jwt:`/`ldap:` claim name) would let a
+    // request satisfy a policy condition about itself. Reject those names outright --
+    // both the ones already populated above and the well-known identity keys that are
+    // absent for this credential, since an absent key is exactly what a spoofed header
+    // would fill in.
+    for key in clone_header.keys() {
+        if key.as_str().eq_ignore_ascii_case("x-amz-tagging") {
+            continue;
+        }
+        if is_reserved_condition_key(key.as_str(), &args) {
+            continue;
+        }
+        args.insert(
+            key.as_str().to_string(),
+            header
+                .get_all(key)
+                .iter()
+                .map(|v| v.to_str().unwrap_or("").to_string())
+                .collect(),
+        );
+    }
+
     args
+}
+
+/// Whether a request header is forbidden from contributing to policy condition key
+/// `key`, either because the server already derived that key from verified state or
+/// because it is a well-known identity/context key that only the server may populate.
+fn is_reserved_condition_key(key: &str, server_derived: &HashMap<String, Vec<String>>) -> bool {
+    server_derived.contains_key(key) || is_server_derived_condition_key(key)
 }
 
 /// Get request authentication type
@@ -660,12 +826,10 @@ pub fn get_condition_values_with_query(
 /// # Returns
 /// * `AuthType` - The determined authentication type
 ///
-#[allow(dead_code)]
 pub fn get_request_auth_type(header: &HeaderMap) -> AuthType {
     get_request_auth_type_with_query(header, None)
 }
 
-#[allow(dead_code)]
 pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option<&str>) -> AuthType {
     if is_request_signature_v2(header) {
         AuthType::SignedV2
@@ -694,20 +858,6 @@ pub(crate) fn get_request_auth_type_with_query(header: &HeaderMap, query: Option
     }
 }
 
-/// Helper function to determine auth type and signature version
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `(String, String)` - Tuple of auth type and signature version
-///
-#[allow(dead_code)]
-fn determine_auth_type_and_version(header: &HeaderMap) -> (String, String) {
-    determine_auth_type_and_version_with_query(header, None)
-}
-
-#[allow(dead_code)]
 fn determine_auth_type_and_version_with_query(header: &HeaderMap, query: Option<&str>) -> (String, String) {
     match get_request_auth_type_with_query(header, query) {
         AuthType::JWT => ("JWT".to_string(), String::new()),
@@ -773,25 +923,15 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
-/// Verify if request has AWS PreSign Version '4'
-///
-/// # Arguments
-/// * `header` - HTTP headers of the request
-///
-/// # Returns
-/// * `bool` - True if request has AWS PreSign Version '4', false otherwise
-#[allow(dead_code)]
-pub(crate) fn is_request_presigned_signature_v4(header: &HeaderMap) -> bool {
-    is_request_presigned_signature_v4_with_query(header, None)
-}
-
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
     }
-    query
-        .and_then(|query| get_query_param(query, "x-amz-credential"))
-        .is_some_and(|credential| !credential.is_empty())
+    query.is_some_and(|query| {
+        form_urlencoded::parse(query.as_bytes())
+            .find(|(name, _)| name.eq_ignore_ascii_case("x-amz-credential"))
+            .is_some_and(|(_, credential)| !credential.is_empty())
+    })
 }
 
 /// Verify request has AWS PreSign Version '2'
@@ -883,15 +1023,227 @@ pub fn get_query_param<'a>(query: &'a str, param_name: &str) -> Option<&'a str> 
     None
 }
 
+/// Parse the RustFS presigned PutObject size capability after authentication.
+///
+/// The query value is covered by SigV4 when it is present before presigning, but
+/// the signature does not assign any semantics to the extension. Keep parsing
+/// strict and only enable the capability for a verified SigV4 presigned request.
+pub(crate) fn parse_presigned_put_max_content_length(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_presigned: bool,
+) -> S3Result<Option<u64>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    let mut value = None;
+    let mut decoded_query = Vec::new();
+    for (name, candidate) in form_urlencoded::parse(query.as_bytes()) {
+        decoded_query.push((name.to_string(), candidate.to_string()));
+        if name == RUSTFS_MAX_CONTENT_LENGTH_QUERY {
+            if value.is_some() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must appear exactly once"),
+                ));
+            }
+            value = Some(candidate.into_owned());
+        } else if name.eq_ignore_ascii_case(RUSTFS_MAX_CONTENT_LENGTH_QUERY) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("query parameter name must be exactly {RUSTFS_MAX_CONTENT_LENGTH_QUERY}"),
+            ));
+        }
+    }
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let query_value = |wanted: &str| {
+        decoded_query
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(wanted))
+            .map(|(_, value)| value.as_str())
+    };
+    let is_complete_sigv4_query = [
+        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+        ("x-amz-date", ""),
+        ("x-amz-expires", ""),
+        ("x-amz-signedheaders", ""),
+        ("x-amz-credential", ""),
+        ("x-amz-signature", ""),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        query_value(name).is_some_and(|value| !value.is_empty() && (expected.is_empty() || value == expected))
+    });
+    if !verified_presigned
+        || !is_complete_sigv4_query
+        || !matches!(get_request_auth_type_with_query(header, Some(query)), AuthType::Presigned)
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} requires a SigV4 presigned request"),
+        ));
+    }
+
+    let limit = value.parse::<u64>().map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} must be a non-negative 64-bit integer"),
+        )
+    })?;
+
+    Ok(Some(limit))
+}
+
+/// Reject the PutObject-only size capability when it appears on another
+/// operation. Callers must invoke this after request authentication has run.
+pub(crate) fn reject_presigned_put_max_content_length_for_other_operation(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_presigned: bool,
+) -> S3Result<()> {
+    if parse_presigned_put_max_content_length(header, query, verified_presigned)?.is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is only supported for presigned PutObject"),
+        ));
+    }
+    Ok(())
+}
+
+/// Parse the V2 multipart total-size capability after SigV4 authentication.
+/// Header-authenticated CreateMultipartUpload requests are accepted because the
+/// custom query is covered by the SigV4 canonical request; later multipart
+/// operations read the immutable value from the upload session metadata.
+pub(crate) fn parse_presigned_multipart_max_total_object_size(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_sigv4: bool,
+) -> S3Result<Option<u64>> {
+    let Some(query) = query else {
+        return Ok(None);
+    };
+
+    let mut value = None;
+    let mut decoded_query = Vec::new();
+    for (name, candidate) in form_urlencoded::parse(query.as_bytes()) {
+        decoded_query.push((name.to_string(), candidate.to_string()));
+        if name == RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY {
+            if value.is_some() {
+                return Err(S3Error::with_message(
+                    S3ErrorCode::InvalidRequest,
+                    format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must appear exactly once"),
+                ));
+            }
+            value = Some(candidate.into_owned());
+        } else if name.eq_ignore_ascii_case(RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("query parameter name must be exactly {RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY}"),
+            ));
+        }
+    }
+
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let auth_type = get_request_auth_type_with_query(header, Some(query));
+    let is_presigned = matches!(auth_type, AuthType::Presigned);
+    let is_header_signed = matches!(auth_type, AuthType::Signed);
+    let complete_presigned_query = [
+        ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+        ("x-amz-date", ""),
+        ("x-amz-expires", ""),
+        ("x-amz-signedheaders", ""),
+        ("x-amz-credential", ""),
+        ("x-amz-signature", ""),
+    ]
+    .into_iter()
+    .all(|(name, expected)| {
+        decoded_query
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(name))
+            .is_some_and(|(_, candidate)| !candidate.is_empty() && (expected.is_empty() || candidate == expected))
+    });
+
+    let authenticated = verified_sigv4 && (is_header_signed || (is_presigned && complete_presigned_query));
+    if !authenticated {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} requires a verified SigV4 request"),
+        ));
+    }
+
+    value.parse::<u64>().map(Some).map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} must be a non-negative 64-bit integer"),
+        )
+    })
+}
+
+pub(crate) fn reject_presigned_multipart_max_total_object_size_for_other_operation(
+    header: &HeaderMap,
+    query: Option<&str>,
+    verified_sigv4: bool,
+) -> S3Result<()> {
+    if parse_presigned_multipart_max_total_object_size(header, query, verified_sigv4)?.is_some() {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("{RUSTFS_MAX_TOTAL_OBJECT_SIZE_QUERY} is only supported for CreateMultipartUpload"),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime_sources::{IamInterface, KmsInterface};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_credentials::Credentials;
+    use rustfs_iam::{
+        store::{
+            Store as _,
+            object::{IAM_CONFIG_PREFIX, ObjectStore},
+        },
+        sys::IamSys,
+    };
+    use rustfs_kms::KmsServiceManager;
+    use rustfs_policy::auth::get_new_credentials_with_metadata;
+    use rustfs_trusted_proxies::ValidationMode;
     use s3s::auth::SecretKey;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use time::OffsetDateTime;
+
+    struct ContextIam {
+        handle: Arc<IamSys<ObjectStore>>,
+    }
+
+    impl IamInterface for ContextIam {
+        fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+            self.handle.clone()
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestKms;
+
+    impl KmsInterface for TestKms {
+        fn handle(&self) -> Arc<KmsServiceManager> {
+            Arc::new(KmsServiceManager::new())
+        }
+    }
 
     fn create_test_credentials() -> Credentials {
         Credentials {
@@ -939,6 +1291,26 @@ mod tests {
             name: Some("service-account".to_string()),
             description: Some("service account for auth tests".to_string()),
         }
+    }
+
+    #[test]
+    fn oidc_session_cannot_inherit_root_access_from_display_name() {
+        let sys_cred = Credentials {
+            access_key: "root-access-key".to_string(),
+            ..Default::default()
+        };
+        let oidc_cred = Credentials {
+            access_key: "temporary-access-key".to_string(),
+            parent_user: sys_cred.access_key.clone(),
+            claims: Some(HashMap::from([
+                ("iss".to_string(), json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), json!("default")),
+                ("sub".to_string(), json!("subject-123")),
+            ])),
+            ..Default::default()
+        };
+
+        assert!(!has_root_access(&sys_cred, &oidc_cred));
     }
 
     #[test]
@@ -1074,6 +1446,59 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn check_claims_uses_the_explicit_context_signing_secret() {
+        let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        ObjectStore::new(store.clone())
+            .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
+            .await
+            .expect("seed request IAM format");
+        let iam = rustfs_iam::build_iam_sys(store.clone())
+            .await
+            .expect("request IAM should initialize");
+        let matching = AppContext::new(store.clone(), Arc::new(ContextIam { handle: iam.clone() }), Arc::new(TestKms));
+        let mismatching = AppContext::new(store, Arc::new(ContextIam { handle: iam.clone() }), Arc::new(TestKms));
+        assert!(matching.publish_action_credentials(Credentials {
+            access_key: "matching-root".to_string(),
+            secret_key: "matching-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        }));
+        assert!(mismatching.publish_action_credentials(Credentials {
+            access_key: "mismatching-root".to_string(),
+            secret_key: "mismatching-signing-secret".to_string(),
+            status: "on".to_string(),
+            ..Default::default()
+        }));
+        let claims = HashMap::from([
+            (
+                "exp".to_string(),
+                json!((OffsetDateTime::now_utc() + time::Duration::minutes(5)).unix_timestamp()),
+            ),
+            ("context".to_string(), json!("matching")),
+        ]);
+        let mut credential = get_new_credentials_with_metadata(&claims, "matching-signing-secret")
+            .expect("temporary credentials should be generated");
+        credential.parent_user = "matching-root".to_string();
+        iam.set_temp_user(&credential.access_key, &credential, None)
+            .await
+            .expect("temporary credentials should be stored in request IAM");
+
+        let (verified, _) = check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&matching))
+            .await
+            .expect("the matching request context should verify the token");
+        assert_eq!(
+            verified.claims.as_ref().and_then(|claims| claims.get("context")),
+            Some(&json!("matching"))
+        );
+        assert!(
+            check_key_valid_with_context(&credential.session_token, &credential.access_key, Some(&mismatching))
+                .await
+                .is_err(),
+            "a different server context must not validate the token"
+        );
+    }
+
     #[test]
     fn test_get_session_token_from_header() {
         let mut headers = HeaderMap::new();
@@ -1169,6 +1594,75 @@ mod tests {
         assert_eq!(conditions.get("username"), Some(&vec!["service-parent".to_string()]));
         // Service accounts with claims should be "AssumedRole" type
         assert_eq!(conditions.get("principaltype"), Some(&vec!["AssumedRole".to_string()]));
+    }
+
+    #[test]
+    fn ghsa_6r96_identity_condition_keys_ignore_spoofed_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        // A caller naming its headers after identity condition keys must not be able
+        // to add or replace values the server derives from the credential.
+        headers.insert("userid", "admin".parse().unwrap());
+        headers.insert("username", "admin".parse().unwrap());
+        headers.insert("principaltype", "Account".parse().unwrap());
+        headers.insert("signatureversion", "AWS4-HMAC-SHA256".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("userid"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("username"), Some(&vec!["test-access-key".to_string()]));
+        assert_eq!(conditions.get("principaltype"), Some(&vec!["User".to_string()]));
+        assert!(
+            !conditions
+                .get("signatureversion")
+                .is_some_and(|v| v.iter().any(|s| s == "AWS4-HMAC-SHA256")),
+            "an unsigned request must not gain a signatureversion from a header"
+        );
+    }
+
+    #[test]
+    fn version_id_condition_ignores_spoofed_headers() {
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("versionid", "spoofed-version".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+        assert_eq!(conditions.get("versionid"), None);
+
+        let conditions = get_condition_values(&headers, &cred, Some("server-version"), None, None);
+        assert_eq!(conditions.get("versionid"), Some(&vec!["server-version".to_string()]));
+    }
+
+    #[test]
+    fn ghsa_6r96_claim_condition_keys_ignore_spoofed_headers() {
+        // The credential carries no groups/roles claims, so these keys are absent --
+        // precisely the case a spoofed header would otherwise fill in.
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("groups", "admins".parse().unwrap());
+        headers.insert("roles", "RustFS.ConsoleAdmin".parse().unwrap());
+        headers.insert("sub", "someone-else".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("groups"), None, "groups must come from the credential only");
+        assert_eq!(conditions.get("roles"), None, "roles must come from claims only");
+        assert_eq!(conditions.get("sub"), None, "jwt claim keys must come from claims only");
+    }
+
+    #[test]
+    fn test_request_headers_still_reach_conditions() {
+        // The reserved list must stay narrow: ordinary request headers, including the
+        // `s3:x-amz-*` condition keys, are still expected to be available to policies.
+        let cred = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        headers.insert("x-amz-server-side-encryption", "AES256".parse().unwrap());
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("x-amz-content-sha256"), Some(&vec!["UNSIGNED-PAYLOAD".to_string()]));
+        assert_eq!(conditions.get("x-amz-server-side-encryption"), Some(&vec!["AES256".to_string()]));
     }
 
     #[test]
@@ -1349,6 +1843,113 @@ mod tests {
         let result = get_query_param(query, "param1");
 
         assert_eq!(result, Some("value=with=equals"));
+    }
+
+    #[test]
+    fn presigned_put_max_content_length_requires_exactly_one_signed_query_value() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+
+        let query = format!("{signed_prefix}&x-rustfs-max-content-length=104857600");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&query), true).unwrap(),
+            Some(104_857_600)
+        );
+
+        let encoded_credential = query.replacen("X-Amz-Credential", "X%2DAmz-Credential", 1);
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&encoded_credential), true).unwrap(),
+            Some(104_857_600)
+        );
+
+        let duplicate = format!("{query}&x-rustfs-max-content-length=1");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&duplicate), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        let wrong_case = format!("{signed_prefix}&X-RustFS-Max-Content-Length=1");
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(&wrong_case), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+
+        assert_eq!(
+            reject_presigned_put_max_content_length_for_other_operation(&headers, Some(&query), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn presigned_put_max_content_length_rejects_unsigned_or_invalid_values() {
+        let headers = HeaderMap::new();
+        let forged = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/credential&X-Amz-Signature=fake&x-rustfs-max-content-length=1";
+        assert_eq!(
+            parse_presigned_put_max_content_length(&headers, Some(forged), false)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+        for query in [
+            "x-rustfs-max-content-length=1",
+            "X-Amz-Credential=test/credential&x-rustfs-max-content-length=-1",
+            "X-Amz-Credential=test/credential&x-rustfs-max-content-length=18446744073709551616",
+        ] {
+            let error = parse_presigned_put_max_content_length(&headers, Some(query), true).unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        }
+    }
+
+    #[test]
+    fn multipart_max_total_object_size_requires_signed_create_request() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+        let query = format!("{signed_prefix}&x-rustfs-max-total-object-size=104857600");
+
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&query), true).unwrap(),
+            Some(104_857_600)
+        );
+        assert_eq!(
+            reject_presigned_multipart_max_total_object_size_for_other_operation(&headers, Some(&query), true)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn multipart_max_total_object_size_rejects_tampering_and_invalid_values() {
+        let headers = HeaderMap::new();
+        let signed_prefix = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20260827T000000Z&X-Amz-Expires=900&X-Amz-SignedHeaders=host&X-Amz-Credential=test/20260827/us-east-1/s3/aws4_request&X-Amz-Signature=signature";
+        for query in [
+            "x-rustfs-max-total-object-size=1",
+            "X-RustFS-Max-Total-Object-Size=1",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=1&x-rustfs-max-total-object-size=2",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=-1",
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&x-rustfs-max-total-object-size=18446744073709551616",
+        ] {
+            assert_eq!(
+                parse_presigned_multipart_max_total_object_size(&headers, Some(query), true)
+                    .unwrap_err()
+                    .code(),
+                &S3ErrorCode::InvalidRequest
+            );
+        }
+
+        let forged = format!("{signed_prefix}&x-rustfs-max-total-object-size=1");
+        assert_eq!(
+            parse_presigned_multipart_max_total_object_size(&headers, Some(&forged), false)
+                .unwrap_err()
+                .code(),
+            &S3ErrorCode::InvalidRequest
+        );
     }
 
     #[test]
@@ -1572,9 +2173,10 @@ mod tests {
     #[test]
     fn test_constant_time_eq() {
         assert!(constant_time_eq("test", "test"));
-        assert!(!constant_time_eq("test", "Test"));
-        assert!(!constant_time_eq("test", "test1"));
-        assert!(!constant_time_eq("test1", "test"));
+        assert!(!constant_time_eq("Test", "test"), "first-byte mismatch must fail");
+        assert!(!constant_time_eq("tesu", "test"), "last-byte mismatch must fail");
+        assert!(!constant_time_eq("test", "test1"), "longer candidate must fail");
+        assert!(!constant_time_eq("test1", "test"), "shorter candidate must fail");
         assert!(!constant_time_eq("", "test"));
         assert!(constant_time_eq("", ""));
 
@@ -1584,6 +2186,18 @@ mod tests {
         let key3 = "AKIAIOSFODNN7EXAMPLF";
         assert!(constant_time_eq(key1, key2));
         assert!(!constant_time_eq(key1, key3));
+    }
+
+    #[test]
+    fn session_token_comparison_uses_constant_time_helper() {
+        let source = include_str!("auth.rs");
+        let production = source.split_once("#[cfg(test)]").map_or(source, |(production, _)| production);
+        let ordinary_comparison = ["token ", "!=", " cred.session_token"].concat();
+        assert!(
+            !production.contains(&ordinary_comparison),
+            "temporary session tokens must not use ordinary string comparison"
+        );
+        assert!(production.contains("!constant_time_eq(token, &cred.session_token)"));
     }
 
     #[test]
@@ -1600,38 +2214,73 @@ mod tests {
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
         assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 3: X-Forwarded-For present -> XFF (takes precedence over remote_addr)
+        // Case 3: X-Forwarded-For is ignored without verified proxy context
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.1");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 4: X-Forwarded-For with multiple IPs -> First IP
+        // Case 4: X-Forwarded-For with multiple IPs is ignored without verified proxy context
         headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.3, 10.0.0.4"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.3");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 5: X-Real-IP present (XFF removed) -> X-Real-IP
+        // Case 5: X-Real-IP is ignored without verified proxy context
         headers.remove("x-forwarded-for");
         headers.insert("x-real-ip", HeaderValue::from_static("10.0.0.2"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.2");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 6: Forwarded header present (X-Real-IP removed) -> Forwarded
+        // Case 6: Forwarded is ignored without verified proxy context
         headers.remove("x-real-ip");
         headers.insert("forwarded", HeaderValue::from_static("for=10.0.0.5;proto=http"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.5");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
-        // Case 7: Forwarded header with quotes and multiple values
+        // Case 7: Forwarded with quotes and multiple values is ignored without verified proxy context
         headers.insert("forwarded", HeaderValue::from_static("for=\"10.0.0.6\", for=10.0.0.7"));
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr));
-        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.6");
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "192.168.0.10");
 
         // Case 8: IPv6 Remote Addr
         let remote_addr_v6: std::net::SocketAddr = "[2001:db8::1]:8080".parse().unwrap();
         headers.clear();
         let conditions = get_condition_values(&headers, &cred, None, None, Some(remote_addr_v6));
         assert_eq!(conditions.get("SourceIp").unwrap()[0], "2001:db8::1");
+    }
+
+    #[test]
+    fn test_get_condition_values_uses_verified_client_info() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", HeaderValue::from_static("10.0.0.1"));
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let cred = Credentials::default();
+        let remote_addr: std::net::SocketAddr = "192.168.0.10:12345".parse().unwrap();
+        let client_info = ClientInfo::from_trusted_proxy(
+            "10.0.0.1".parse().unwrap(),
+            None,
+            Some("https".to_string()),
+            "192.168.0.10".parse().unwrap(),
+            1,
+            ValidationMode::Lenient,
+            Vec::new(),
+        );
+
+        let conditions =
+            get_condition_values_with_client_info(&headers, &cred, None, None, Some(remote_addr), Some(&client_info));
+
+        assert_eq!(conditions.get("SourceIp").unwrap()[0], "10.0.0.1");
+        assert_eq!(conditions.get("SecureTransport").unwrap()[0], "true");
+    }
+
+    #[test]
+    fn test_get_condition_values_ignores_unverified_secure_transport_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
+        let cred = Credentials::default();
+
+        let conditions = get_condition_values(&headers, &cred, None, None, None);
+
+        assert_eq!(conditions.get("SecureTransport").unwrap()[0], "false");
     }
 
     // ========== KEYSTONE AUTHENTICATION TESTS ==========
@@ -1860,6 +2509,89 @@ mod tests_policy {
         };
 
         assert!(!policy.is_allowed(&args_fail).await, "IAM Policy should deny non-matching IP");
+    }
+
+    /// The failure this issue is about: when `remote_addr` is dropped the
+    /// `aws:SourceIp` key never reaches the condition map, and `AddrFunc::evaluate`
+    /// returns `false` for an absent key. That flips two policy shapes in
+    /// opposite directions, and only one of them looks like a failure
+    /// (rustfs/backlog#1885).
+    #[tokio::test]
+    async fn source_ip_policies_break_in_both_directions_when_the_key_is_missing() {
+        let allow_from_office = |effect: &str| {
+            format!(
+                r#"{{
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {{"Effect": "Allow", "Action": ["admin:ConfigUpdate"], "Resource": ["arn:aws:s3:::*"]}},
+                        {{
+                            "Effect": "{effect}",
+                            "Action": ["admin:ConfigUpdate"],
+                            "Resource": ["arn:aws:s3:::*"],
+                            "Condition": {{"IpAddress": {{"aws:SourceIp": "192.168.1.0/24"}}}}
+                        }}
+                    ]
+                }}"#
+            )
+        };
+
+        let claims = HashMap::new();
+        let groups = None;
+        let mut with_ip = HashMap::new();
+        with_ip.insert("SourceIp".to_string(), vec!["192.168.1.10".to_string()]);
+        let without_ip: HashMap<String, Vec<String>> = HashMap::new();
+
+        let args_with_ip = Args {
+            account: "test-account",
+            groups: &groups,
+            action: Action::AdminAction(rustfs_policy::policy::action::AdminAction::ConfigUpdateAdminAction),
+            bucket: "",
+            conditions: &with_ip,
+            is_owner: false,
+            object: "",
+            claims: &claims,
+            deny_only: false,
+        };
+        let args_without_ip = Args {
+            conditions: &without_ip,
+            ..args_with_ip
+        };
+
+        // Deny + blacklist: the bypass shape. With the key present the deny
+        // matches and the request is refused; drop the key and the deny stops
+        // matching, so a source that policy means to block gets through.
+        let deny_policy: Policy = serde_json::from_str(&allow_from_office("Deny")).expect("deny policy parses");
+        assert!(
+            !deny_policy.is_allowed(&args_with_ip).await,
+            "a blacklisted source must be refused while aws:SourceIp is present"
+        );
+        assert!(
+            deny_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr makes the Deny statement unreachable — this is the bypass"
+        );
+
+        // Allow + whitelist: the availability shape, and the only one an
+        // operator would notice, which is why the bypass above went unseen.
+        let allow_policy: Policy = serde_json::from_str(
+            r#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": ["admin:ConfigUpdate"],
+                    "Resource": ["arn:aws:s3:::*"],
+                    "Condition": {"IpAddress": {"aws:SourceIp": "192.168.1.0/24"}}
+                }]
+            }"#,
+        )
+        .expect("allow policy parses");
+        assert!(
+            allow_policy.is_allowed(&args_with_ip).await,
+            "a whitelisted source must be allowed while aws:SourceIp is present"
+        );
+        assert!(
+            !allow_policy.is_allowed(&args_without_ip).await,
+            "dropping remote_addr locks out a legitimate admin"
+        );
     }
 
     #[tokio::test]

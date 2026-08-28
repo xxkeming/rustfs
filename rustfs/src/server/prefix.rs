@@ -22,6 +22,8 @@ pub(crate) const PROFILE_MEMORY_PATH: &str = "/profile/memory";
 /// Favicon path to handle browser requests for the favicon.
 /// This path serves the favicon.ico file.
 pub(crate) const FAVICON_PATH: &str = "/favicon.ico";
+pub(crate) const APPLE_TOUCH_ICON_PATH: &str = "/apple-touch-icon.png";
+pub(crate) const APPLE_TOUCH_ICON_PRECOMPOSED_PATH: &str = "/apple-touch-icon-precomposed.png";
 
 /// Predefined health check path for RustFS server.
 /// This path is used to check the health status of the server.
@@ -31,6 +33,21 @@ pub(crate) const HEALTH_PREFIX: &str = "/health";
 /// This path is used to check dependency readiness and may return 503.
 pub(crate) const HEALTH_READY_PATH: &str = "/health/ready";
 
+/// Health liveness probe compatibility alias path.
+pub(crate) const HEALTH_COMPAT_LIVE_PATH: &str = "/health/live";
+
+/// MinIO-compatible health liveness probe alias path.
+pub(crate) const MINIO_HEALTH_LIVE_PATH: &str = "/minio/health/live";
+
+/// MinIO-compatible health readiness probe alias path.
+pub(crate) const MINIO_HEALTH_READY_PATH: &str = "/minio/health/ready";
+
+/// MinIO-compatible cluster health probe alias path.
+pub(crate) const MINIO_HEALTH_CLUSTER_PATH: &str = "/minio/health/cluster";
+
+/// MinIO-compatible cluster read health probe alias path.
+pub(crate) const MINIO_HEALTH_CLUSTER_READ_PATH: &str = "/minio/health/cluster/read";
+
 /// Predefined administrative prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle administrative tasks
 /// such as configuration, monitoring, and management.
@@ -39,6 +56,25 @@ pub(crate) const ADMIN_PREFIX: &str = "/rustfs/admin";
 /// MinIO-compatible administrative prefix accepted by RustFS.
 /// This alias allows stock MinIO admin tooling to reach RustFS handlers.
 pub(crate) const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
+
+/// Iceberg REST Catalog prefix for RustFS S3 Tables control-plane routes.
+pub(crate) const TABLE_CATALOG_PREFIX: &str = "/iceberg/v1";
+
+/// MinIO AIStor-compatible Iceberg REST Catalog prefix alias.
+pub(crate) const TABLE_CATALOG_COMPAT_PREFIX: &str = "/_iceberg/v1";
+
+/// Returns true for the admin prefix itself or slash-delimited children.
+pub(crate) fn is_admin_path(path: &str) -> bool {
+    has_path_prefix(path, ADMIN_PREFIX) || has_path_prefix(path, MINIO_ADMIN_PREFIX) || is_table_catalog_path(path)
+}
+
+pub(crate) fn is_table_catalog_path(path: &str) -> bool {
+    has_path_prefix(path, TABLE_CATALOG_PREFIX) || has_path_prefix(path, TABLE_CATALOG_COMPAT_PREFIX)
+}
+
+pub(crate) fn has_path_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.strip_prefix(prefix).is_some_and(|suffix| suffix.starts_with('/'))
+}
 
 /// Environment variable name for overriding the default
 /// administrative prefix path.

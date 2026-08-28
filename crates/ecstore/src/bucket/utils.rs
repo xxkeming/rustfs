@@ -32,6 +32,9 @@ lazy_static::lazy_static! {
 pub fn check_bucket_name_common(bucket_name: &str, strict: bool) -> Result<()> {
     let bucket_name_trimmed = bucket_name.trim();
 
+    if bucket_name_trimmed != bucket_name {
+        return Err(Error::other("Bucket name cannot contain leading or trailing whitespace"));
+    }
     if bucket_name_trimmed.is_empty() {
         return Err(Error::other("Bucket name cannot be empty"));
     }
@@ -70,23 +73,6 @@ pub fn check_valid_bucket_name_strict(bucket_name: &str) -> Result<()> {
     check_bucket_name_common(bucket_name, true)
 }
 
-pub fn check_valid_object_name_prefix(object_name: &str) -> Result<()> {
-    if object_name.len() > 1024 {
-        return Err(Error::other("Object name cannot be longer than 1024 characters"));
-    }
-    if !object_name.is_ascii() {
-        return Err(Error::other("Object name with non-UTF-8 strings are not supported"));
-    }
-    Ok(())
-}
-
-pub fn check_valid_object_name(object_name: &str) -> Result<()> {
-    if object_name.trim().is_empty() {
-        return Err(Error::other("Object name cannot be empty"));
-    }
-    check_valid_object_name_prefix(object_name)
-}
-
 pub fn deserialize<T>(input: &[u8]) -> xml::DeResult<T>
 where
     T: for<'xml> xml::Deserialize<'xml>,
@@ -97,6 +83,10 @@ where
     Ok(ans)
 }
 
+#[allow(
+    dead_code,
+    reason = "xml serialize helper with no caller in this port; the live sibling is deserialize (backlog#1823)"
+)]
 pub fn serialize_content<T: xml::SerializeContent>(val: &T) -> xml::SerResult<String> {
     let mut buf = Vec::with_capacity(256);
     {
@@ -137,25 +127,9 @@ pub fn has_bad_path_component(path: &str) -> bool {
             i += 1;
         }
 
-        // Trim whitespace of segment
-        let mut segment_start = start;
-        let mut segment_end = i;
-
-        while segment_start < segment_end && bytes[segment_start].is_ascii_whitespace() {
-            segment_start += 1;
-        }
-        while segment_end > segment_start && bytes[segment_end - 1].is_ascii_whitespace() {
-            segment_end -= 1;
-        }
-
-        // Check for ".." or "."
-        match segment_end - segment_start {
-            2 if segment_start + 1 < n && bytes[segment_start] == b'.' && bytes[segment_start + 1] == b'.' => {
-                return true;
-            }
-            1 if bytes[segment_start] == b'.' => {
-                return true;
-            }
+        // Trim whitespace of segment and check for ".." or "."
+        match path[start..i].trim() {
+            "." | ".." => return true,
             _ => {}
         }
 
@@ -196,6 +170,55 @@ pub fn is_valid_object_name(object: &str) -> bool {
     is_valid_object_prefix(object)
 }
 
+/// Client-facing reason attached to rejections of object keys that Win32/NTFS
+/// cannot represent as file paths (issue #3299). Deployments on Linux/macOS
+/// accept the full S3 key character set.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
+pub const WINDOWS_RESERVED_CHARACTERS_REASON: &str =
+    "object key contains characters unsupported on Windows hosts (one of ':', '*', '?', '\"', '|', '<', '>')";
+
+/// Client-facing reason for path segments Windows can store but not address
+/// afterwards (issue #3449): trailing dot/space or reserved DOS device names.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
+pub const WINDOWS_RESERVED_SEGMENT_REASON: &str = "object key contains a path segment unsupported on Windows hosts (trailing dot or space, or a reserved device name such as NUL/CON/COM1)";
+
+/// Reserved DOS device names that shadow regular files on Windows, even when
+/// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+    "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Returns true when `object` contains a path segment that NTFS can store but
+/// the Win32 API cannot address afterwards (issue #3449): segments ending in a
+/// dot or a space, and reserved DOS device names — bare or with an extension
+/// (`NUL.txt`), matching classic Win32 path resolution semantics.
+#[allow(
+    dead_code,
+    reason = "live on Windows: callers sit inside the #[cfg(target_os = \"windows\")] block in check_object_name_for_length_and_slash (backlog#1823)"
+)]
+pub fn object_name_has_windows_incompatible_segment(object: &str) -> bool {
+    object.split(['/', '\\']).any(|segment| {
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return true;
+        }
+        // Device names are matched on the part before the first dot, with
+        // trailing spaces ignored (so `NUL .txt` is also reserved).
+        let base = segment.split('.').next().unwrap_or(segment).trim_end_matches(' ');
+        WINDOWS_RESERVED_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
+    })
+}
+
 pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
     if object.len() > 1024 {
         return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
@@ -216,7 +239,21 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
             || object.contains('>')
         // || object.contains('\\')
         {
-            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                WINDOWS_RESERVED_CHARACTERS_REASON.to_owned(),
+            ));
+        }
+
+        // Reject names that NTFS would happily create but the Win32 path
+        // layer cannot read back (os error 3), e.g. `baddir.` or `NUL.txt`.
+        if object_name_has_windows_incompatible_segment(object) {
+            return Err(StorageError::InvalidArgument(
+                bucket.to_owned(),
+                object.to_owned(),
+                WINDOWS_RESERVED_SEGMENT_REASON.to_owned(),
+            ));
         }
     }
 
@@ -235,6 +272,32 @@ pub fn check_del_obj_args(bucket: &str, object: &str) -> Result<()> {
     check_bucket_and_object_names(bucket, object)
 }
 
+/// Filesystem `NAME_MAX`: every object-key path segment becomes one on-disk
+/// directory entry, so a longer segment can never be stored and previously
+/// escaped as an `ENAMETOOLONG` io error → `InternalError` 500 (rustfs#5785).
+const MAX_OBJECT_KEY_SEGMENT_BYTES: usize = 255;
+
+/// Reject object keys whose on-disk directory names would exceed `NAME_MAX`.
+///
+/// Middle segments map to their raw bytes; the final segment of a
+/// directory-object key (trailing `/`) is stored with the `__XLDIR__` suffix
+/// appended, shrinking its budget accordingly.
+fn object_key_segments_fit_on_disk(object: &str) -> bool {
+    let trailing_dir = object.ends_with('/');
+    let segments: Vec<&str> = object.split('/').collect();
+    let last_nonempty = segments.iter().rposition(|s| !s.is_empty());
+    for (index, segment) in segments.iter().enumerate() {
+        let mut budget = MAX_OBJECT_KEY_SEGMENT_BYTES;
+        if trailing_dir && Some(index) == last_nonempty {
+            budget = budget.saturating_sub(rustfs_utils::path::GLOBAL_DIR_SUFFIX.len());
+        }
+        if segment.len() > budget {
+            return false;
+        }
+    }
+    true
+}
+
 pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     if !is_meta_bucketname(bucket) && check_valid_bucket_name_strict(bucket).is_err() {
         return Err(StorageError::BucketNameInvalid(bucket.to_string()));
@@ -245,6 +308,10 @@ pub fn check_bucket_and_object_names(bucket: &str, object: &str) -> Result<()> {
     }
 
     if !is_valid_object_prefix(object) {
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
+    }
+
+    if !object_key_segments_fit_on_disk(object) {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
@@ -276,10 +343,8 @@ pub fn check_list_multipart_args(
 ) -> Result<()> {
     check_list_objs_args(bucket, prefix, key_marker)?;
 
-    if let Some(upload_id_marker) = upload_id_marker {
-        if let Some(key_marker) = key_marker
-            && key_marker.ends_with('/')
-        {
+    if let (Some(key_marker), Some(upload_id_marker)) = (key_marker, upload_id_marker) {
+        if key_marker.ends_with('/') {
             return Err(StorageError::InvalidUploadIDKeyCombination(
                 upload_id_marker.to_string(),
                 key_marker.to_string(),
@@ -347,12 +412,77 @@ pub fn check_put_object_args(bucket: &str, object: &str) -> Result<()> {
         return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
     }
 
+    // The write path validates arguments here rather than through
+    // check_bucket_and_object_names, so the on-disk segment budget has to be
+    // enforced in both places or an over-NAME_MAX key still reaches the disk
+    // layer and escapes as ENAMETOOLONG → InternalError 500 (rustfs#5785).
+    if !object_key_segments_fit_on_disk(object) {
+        return Err(StorageError::ObjectNameInvalid(bucket.to_string(), object.to_string()));
+    }
+
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    /// rustfs#5785: keys whose path segments exceed the on-disk NAME_MAX
+    /// budget must be rejected up front as ObjectNameInvalid (4xx), not leak
+    /// ENAMETOOLONG as InternalError 500 from the disk layer.
+    #[test]
+    fn object_key_segment_name_max_budget() {
+        // 255-byte single segment: exactly at the on-disk limit.
+        assert!(check_bucket_and_object_names("bucket", &"a".repeat(255)).is_ok());
+        // 256 bytes: one over.
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &"a".repeat(256)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        // Long keys are fine as long as every segment fits.
+        let segmented = ["b".repeat(200), "c".repeat(200), "d".repeat(200)].join("/");
+        assert!(check_bucket_and_object_names("bucket", &segmented).is_ok());
+        // The budget counts bytes, not characters (100 CJK chars = 300 bytes).
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &"中".repeat(100)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        assert!(check_bucket_and_object_names("bucket", &"中".repeat(85)).is_ok());
+        // Directory-object keys spend GLOBAL_DIR_SUFFIX bytes of the final
+        // segment's budget on the on-disk __XLDIR__ encoding.
+        let dir_budget = 255 - rustfs_utils::path::GLOBAL_DIR_SUFFIX.len();
+        assert!(check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget))).is_ok());
+        assert!(matches!(
+            check_bucket_and_object_names("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+    }
+
+    /// rustfs#5785 follow-up: the write path validates through
+    /// check_put_object_args, not check_bucket_and_object_names, so the same
+    /// budget has to hold there — otherwise an over-NAME_MAX PUT still reached
+    /// the disk layer and came back as InternalError 500.
+    #[test]
+    fn put_object_args_enforce_the_same_segment_budget() {
+        assert!(check_put_object_args("bucket", &"a".repeat(255)).is_ok());
+        assert!(matches!(
+            check_put_object_args("bucket", &"a".repeat(256)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        assert!(matches!(
+            check_put_object_args("bucket", &"\u{4e2d}".repeat(100)),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+        let segmented = ["b".repeat(200), "c".repeat(200), "d".repeat(200)].join("/");
+        assert!(check_put_object_args("bucket", &segmented).is_ok());
+        let dir_budget = 255 - rustfs_utils::path::GLOBAL_DIR_SUFFIX.len();
+        assert!(check_put_object_args("bucket", &format!("{}/", "e".repeat(dir_budget))).is_ok());
+        assert!(matches!(
+            check_put_object_args("bucket", &format!("{}/", "e".repeat(dir_budget + 1))),
+            Err(StorageError::ObjectNameInvalid(_, _))
+        ));
+    }
 
     // Test validation functions
     #[test]
@@ -435,6 +565,9 @@ mod tests {
         assert!(!is_valid_object_prefix("prefix/./other"));
         assert!(!is_valid_object_prefix("a/../b/../c"));
         assert!(!is_valid_object_prefix("a/./b/./c"));
+        assert!(!is_valid_object_prefix("\x0b./object"));
+        assert!(!is_valid_object_prefix("prefix/\x0b../object"));
+        assert!(!is_valid_object_prefix("\x0b.\\\\object"));
 
         // Invalid cases - double slashes
         assert!(!is_valid_object_prefix("prefix//with//double//slashes"));
@@ -452,6 +585,106 @@ mod tests {
     }
 
     #[test]
+    fn test_object_name_has_windows_incompatible_segment() {
+        // Segments ending in a dot are writable on NTFS but unreadable via Win32 paths.
+        assert!(object_name_has_windows_incompatible_segment("baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/dir2/baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/baddir./file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("file.txt."));
+
+        // Segments ending in a space.
+        assert!(object_name_has_windows_incompatible_segment("file.txt "));
+        assert!(object_name_has_windows_incompatible_segment("dir /file.txt"));
+
+        // Reserved DOS device names, bare and case-insensitive.
+        assert!(object_name_has_windows_incompatible_segment("NUL"));
+        assert!(object_name_has_windows_incompatible_segment("nul"));
+        assert!(object_name_has_windows_incompatible_segment("CON"));
+        assert!(object_name_has_windows_incompatible_segment("prn"));
+        assert!(object_name_has_windows_incompatible_segment("Aux"));
+        assert!(object_name_has_windows_incompatible_segment("COM1"));
+        assert!(object_name_has_windows_incompatible_segment("com9"));
+        assert!(object_name_has_windows_incompatible_segment("LPT1"));
+        assert!(object_name_has_windows_incompatible_segment("lpt9"));
+        assert!(object_name_has_windows_incompatible_segment("dir/NUL/file.txt"));
+
+        // Reserved device names with an extension still resolve to the device.
+        assert!(object_name_has_windows_incompatible_segment("NUL.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir/aux.log"));
+        assert!(object_name_has_windows_incompatible_segment("con.tar.gz"));
+        assert!(object_name_has_windows_incompatible_segment("com1.dat"));
+        assert!(object_name_has_windows_incompatible_segment("NUL .txt"));
+
+        // Backslash-separated segments are checked as well.
+        assert!(object_name_has_windows_incompatible_segment("dir\\baddir.\\file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir\\nul"));
+
+        // Valid names must not be flagged.
+        assert!(!object_name_has_windows_incompatible_segment("file.txt"));
+        assert!(!object_name_has_windows_incompatible_segment("dir.name/file"));
+        assert!(!object_name_has_windows_incompatible_segment("path/to/file.tar.gz"));
+        assert!(!object_name_has_windows_incompatible_segment("nullable"));
+        assert!(!object_name_has_windows_incompatible_segment("CONSOLE"));
+        assert!(!object_name_has_windows_incompatible_segment("com10"));
+        assert!(!object_name_has_windows_incompatible_segment("com0"));
+        assert!(!object_name_has_windows_incompatible_segment("lpt"));
+        assert!(!object_name_has_windows_incompatible_segment("aux-data/file"));
+        assert!(!object_name_has_windows_incompatible_segment("object with spaces inside"));
+        assert!(!object_name_has_windows_incompatible_segment(""));
+    }
+
+    #[test]
+    fn test_check_object_name_windows_incompatible_segments() {
+        // Rejected on Windows (would be written but unreadable, issue #3449);
+        // valid on non-Windows platforms.
+        for object in [
+            "baddir.",
+            "dir1/dir2/baddir.",
+            "dir1/baddir./file.txt",
+            "file.txt ",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "dir/LPT9.log",
+        ] {
+            let result = check_object_name_for_length_and_slash("test-bucket", object);
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_SEGMENT_REASON),
+                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
+            }
+        }
+
+        // Valid on every platform.
+        for object in ["file.txt", "dir.name/file", "nullable", "CONSOLE", "com10"] {
+            assert!(
+                check_object_name_for_length_and_slash("test-bucket", object).is_ok(),
+                "object name must be valid on all platforms: {object:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_check_object_name_windows_reserved_characters() {
+        // Keys containing Win32-reserved characters are rejected on Windows
+        // with a descriptive reason (issue #3299); valid elsewhere.
+        for object in ["path/*sUt*mykey", "a:b", "what?", "pipe|name", "quote\"d", "lt<gt>"] {
+            let result = check_object_name_for_length_and_slash("test-bucket", object);
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(&result, Err(StorageError::InvalidArgument(_, _, reason)) if reason == WINDOWS_RESERVED_CHARACTERS_REASON),
+                    "object name must be rejected on Windows with a descriptive reason: {object:?}, got {result:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
+            }
+        }
+    }
+
+    #[test]
     fn test_check_bucket_and_object_names() {
         // Valid names
         assert!(check_bucket_and_object_names("valid-bucket", "valid-object").is_ok());
@@ -465,10 +698,35 @@ mod tests {
     }
 
     #[test]
+    fn test_check_bucket_name_rejects_leading_and_trailing_whitespace() {
+        for bucket in [
+            " valid-bucket",
+            "valid-bucket ",
+            "valid-bucket\n",
+            "valid-bucket\u{b}",
+            "\u{c}valid-bucket\u{c}",
+        ] {
+            assert!(
+                check_valid_bucket_name_strict(bucket).is_err(),
+                "bucket name with leading or trailing whitespace must be rejected: {bucket:?}"
+            );
+            assert!(
+                check_valid_bucket_name(bucket).is_err(),
+                "legacy bucket validation must reject leading or trailing whitespace: {bucket:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_check_list_objs_args() {
         assert!(check_list_objs_args("valid-bucket", "", &None).is_ok());
         assert!(check_list_objs_args("", "", &None).is_err());
         assert!(check_list_objs_args("INVALID", "", &None).is_err());
+    }
+
+    #[test]
+    fn test_list_multipart_upload_marker_is_ignored_without_key_marker() {
+        assert!(check_list_multipart_args("valid-bucket", "", &None, &Some("not-base64!".to_string()), &None,).is_ok());
     }
 
     #[test]
@@ -525,5 +783,29 @@ mod tests {
         assert!(check_put_object_args("test-bucket", "test-object").is_ok());
         assert!(check_put_object_args("", "test-object").is_err());
         assert!(check_put_object_args("test-bucket", "").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn valid_object_prefixes_preserve_prefix_invariants(input in any::<String>()) {
+            if is_valid_object_prefix(&input) {
+                prop_assert!(!has_bad_path_component(&input));
+                prop_assert!(!input.contains("//"));
+                prop_assert!(!input.contains('\0'));
+            }
+        }
+
+        #[test]
+        fn valid_object_names_preserve_name_invariants(input in any::<String>()) {
+            if is_valid_object_name(&input) {
+                prop_assert!(!input.is_empty());
+                prop_assert!(is_valid_object_prefix(&input));
+            }
+        }
+
+        #[test]
+        fn object_name_validity_matches_prefix_validity_plus_non_empty(input in any::<String>()) {
+            prop_assert_eq!(is_valid_object_name(&input), !input.is_empty() && is_valid_object_prefix(&input));
+        }
     }
 }

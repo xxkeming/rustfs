@@ -28,17 +28,38 @@ categories = ["development-tools", "filesystem"]
 name = "metrics_pipeline"
 harness = false
 
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "rustfs-s3-ops/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-s3-ops/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-s3-ops/hotpath-cpu",
+]
+
 [dependencies]
+hotpath.workspace = true
 metrics = { workspace = true }
+rustfs-s3-ops = { workspace = true }
 num_cpus = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["sync","rt"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
 tracing = { workspace = true }
 sysinfo = { workspace = true }
 
 [dev-dependencies]
-criterion = { workspace = true }
-tokio = { workspace = true, features = ["test-util","rt","macros"] }
+criterion = { workspace = true, features = ["html_reports"] }
+metrics-util = { workspace = true, features = ["debugging"] }
+tokio = { workspace = true, features = ["test-util", "macros", "fs", "rt-multi-thread"] }
 
 [lints]
 workspace = true

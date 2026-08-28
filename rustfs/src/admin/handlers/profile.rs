@@ -12,34 +12,26 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::admin::{auth::validate_admin_request, router::Operation};
-use crate::auth::{check_key_valid, get_session_token};
-use crate::server::RemoteAddr;
-use http::header::CONTENT_TYPE;
-use http::{HeaderMap, StatusCode};
+use crate::admin::{auth::authorize_admin_request, router::Operation};
+use http::StatusCode;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use tracing::info;
 
+/// The pre-check keeps these endpoints' historical `AccessDenied` missing-credentials
+/// response; the shared gate reports `InvalidRequest` "get cred failed".
 pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result<()> {
-    let Some(input_cred) = req.credentials.as_ref() else {
+    if req.credentials.is_none() {
         return Err(s3_error!(AccessDenied, "Signature is required"));
-    };
+    }
 
-    let (cred, owner) =
-        check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
-    let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+    authorize_admin_request(req, vec![Action::AdminAction(AdminAction::ProfilingAdminAction)]).await?;
+    Ok(())
+}
 
-    validate_admin_request(
-        &req.headers,
-        &cred,
-        owner,
-        false,
-        vec![Action::AdminAction(AdminAction::ProfilingAdminAction)],
-        remote_addr,
-    )
-    .await
+pub(super) fn profile_not_implemented_response(message: String) -> S3Response<(StatusCode, Body)> {
+    S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message)))
 }
 
 pub struct TriggerProfileCPU {}
@@ -49,15 +41,8 @@ impl Operation for TriggerProfileCPU {
         authorize_profile_request(&req).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        let dur = std::time::Duration::from_secs(60);
-        match crate::profiling::dump_cpu_pprof_for(dur).await {
-            Ok(path) => {
-                let mut header = HeaderMap::new();
-                header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-            }
-            Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
-        }
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::local_cpu_pprof_unsupported_message()))
     }
 }
 
@@ -68,14 +53,8 @@ impl Operation for TriggerProfileMemory {
         authorize_profile_request(&req).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        match crate::profiling::dump_memory_pprof_now().await {
-            Ok(path) => {
-                let mut header = HeaderMap::new();
-                header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
-                Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-            }
-            Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
-        }
+        crate::profiling::log_memory_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::memory_pprof_unsupported_message()))
     }
 }
 

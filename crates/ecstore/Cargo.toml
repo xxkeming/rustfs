@@ -25,53 +25,148 @@ keywords = ["erasure-coding", "storage", "rustfs", "Minio", "solomon"]
 categories = ["web-programming", "development-tools", "filesystem"]
 documentation = "https://docs.rs/rustfs-ecstore/latest/rustfs_ecstore/"
 
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lints]
 workspace = true
 
 [features]
 default = []
+# Compiles the controlled list-objects namespace-journal chaos injector into a
+# production binary (it is always available to tests). Off by default so the
+# RUSTFS_LIST_OBJECTS_NAMESPACE_JOURNAL_CHAOS_* env vars cannot rewrite journal
+# state in a stock build (backlog#1832).
+list-chaos = []
+rio-v2 = ["dep:rustfs-rio-v2"]
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/async-channel",
+    "hotpath/parking_lot",
+    "hotpath/reqwest-0-13",
+    "rustfs-common/hotpath",
+    "rustfs-concurrency/hotpath",
+    "rustfs-config/hotpath",
+    "rustfs-credentials/hotpath",
+    "rustfs-data-usage/hotpath",
+    "rustfs-filemeta/hotpath",
+    "rustfs-io-metrics/hotpath",
+    "rustfs-lifecycle/hotpath",
+    "rustfs-lock/hotpath",
+    "rustfs-madmin/hotpath",
+    "rustfs-object-capacity/hotpath",
+    "rustfs-policy/hotpath",
+    "rustfs-protos/hotpath",
+    "rustfs-replication/hotpath",
+    "rustfs-rio/hotpath",
+    "rustfs-rio-v2?/hotpath",
+    "rustfs-s3-types/hotpath",
+    "rustfs-storage-api/hotpath",
+    "rustfs-utils/hotpath",
+    "rustfs-crypto/hotpath",
+]
+hotpath-alloc = [
+    "hotpath",
+    "hotpath/hotpath-alloc",
+    "rustfs-common/hotpath-alloc",
+    "rustfs-concurrency/hotpath-alloc",
+    "rustfs-config/hotpath-alloc",
+    "rustfs-credentials/hotpath-alloc",
+    "rustfs-data-usage/hotpath-alloc",
+    "rustfs-filemeta/hotpath-alloc",
+    "rustfs-io-metrics/hotpath-alloc",
+    "rustfs-lifecycle/hotpath-alloc",
+    "rustfs-lock/hotpath-alloc",
+    "rustfs-madmin/hotpath-alloc",
+    "rustfs-object-capacity/hotpath-alloc",
+    "rustfs-policy/hotpath-alloc",
+    "rustfs-protos/hotpath-alloc",
+    "rustfs-replication/hotpath-alloc",
+    "rustfs-rio/hotpath-alloc",
+    "rustfs-rio-v2?/hotpath-alloc",
+    "rustfs-s3-types/hotpath-alloc",
+    "rustfs-storage-api/hotpath-alloc",
+    "rustfs-utils/hotpath-alloc",
+    "rustfs-crypto/hotpath-alloc",
+]
+hotpath-cpu = [
+    "hotpath",
+    "hotpath/hotpath-cpu",
+    "rustfs-common/hotpath-cpu",
+    "rustfs-concurrency/hotpath-cpu",
+    "rustfs-config/hotpath-cpu",
+    "rustfs-credentials/hotpath-cpu",
+    "rustfs-data-usage/hotpath-cpu",
+    "rustfs-filemeta/hotpath-cpu",
+    "rustfs-io-metrics/hotpath-cpu",
+    "rustfs-lifecycle/hotpath-cpu",
+    "rustfs-lock/hotpath-cpu",
+    "rustfs-madmin/hotpath-cpu",
+    "rustfs-object-capacity/hotpath-cpu",
+    "rustfs-policy/hotpath-cpu",
+    "rustfs-protos/hotpath-cpu",
+    "rustfs-replication/hotpath-cpu",
+    "rustfs-rio/hotpath-cpu",
+    "rustfs-rio-v2?/hotpath-cpu",
+    "rustfs-s3-types/hotpath-cpu",
+    "rustfs-storage-api/hotpath-cpu",
+    "rustfs-utils/hotpath-cpu",
+    "rustfs-crypto/hotpath-cpu",
+]
+# Exposes shared lifecycle/tier test utilities (MockWarmBackend, fault
+# injection, xl.meta transition assertions) via `api::tier::test_util`.
+# Enable only from `[dev-dependencies]` (rustfs/backlog#1148 ilm-6).
+test-util = []
 
 [dependencies]
+hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 rustfs-rio.workspace = true
-rustfs-signer.workspace = true
-rustfs-checksums.workspace = true
-rustfs-config = { workspace = true, features = ["constants", "notify", "audit"] }
+rustfs-rio-v2 = { workspace = true, optional = true }
+rustfs-storage-api.workspace = true
+rustfs-config = { workspace = true, features = ["notify", "audit", "server-config-model"] }
+rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
+rustfs-heal-contracts.workspace = true
+rustfs-scanner-contracts.workspace = true
 rustfs-policy.workspace = true
 rustfs-protos.workspace = true
-rustfs-kms.workspace = true
-rustfs-s3-common = { workspace = true }
+rustfs-replication.workspace = true
+rustfs-lifecycle.workspace = true
+rustfs-s3-client = { workspace = true }
+rustfs-s3-types = { workspace = true }
+rustfs-data-usage.workspace = true
+rustfs-object-capacity.workspace = true
+rustfs-object-data-cache = { workspace = true, features = ["runtime-memory"] }
+arc-swap.workspace = true
 async-trait.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
 byteorder = { workspace = true }
-chrono.workspace = true
-glob = { workspace = true }
+chrono = { workspace = true, features = ["serde"] }
+jiff = { workspace = true, features = ["serde"] }
 thiserror.workspace = true
 flatbuffers.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
-serde.workspace = true
-time.workspace = true
+serde = { workspace = true, features = ["derive"] }
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 bytesize.workspace = true
-serde_json.workspace = true
-quick-xml = { workspace = true, features = ["serialize", "async-tokio"] }
-s3s.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
+s3s = { workspace = true, features = ["minio"] }
 http.workspace = true
 opentelemetry.workspace = true
 http-body = { workspace = true }
 http-body-util.workspace = true
 url.workspace = true
-uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
-reed-solomon-erasure = { workspace = true }
+uuid = { workspace = true, features = ["v4", "fast-rng", "serde", "macro-diagnostics"] }
+reed-solomon-erasure = { workspace = true, features = ["simd-accel"] }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
+moka = { workspace = true, features = ["future"] }
 rustfs-lock.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }
@@ -79,63 +174,94 @@ path-absolutize = { workspace = true }
 rmp.workspace = true
 rmp-serde.workspace = true
 tokio-util = { workspace = true, features = ["io", "compat"] }
-base64 = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
 hmac = { workspace = true }
-sha1 = { workspace = true }
 sha2 = { workspace = true }
 hex-simd = { workspace = true }
 tempfile.workspace = true
-hyper.workspace = true
-hyper-util.workspace = true
-hyper-rustls.workspace = true
-rustls.workspace = true
-tokio = { workspace = true, features = ["io-util", "sync", "signal","io-uring"] }
-tonic.workspace = true
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+hyper-rustls = { workspace = true, default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "http2", "aws-lc-rs"] }
+hostname.workspace = true
+rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls-pki-types.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "signal", "fs", "rt-multi-thread"] }
+tonic = { workspace = true, features = ["gzip", "deflate"] }
 xxhash-rust = { workspace = true, features = ["xxh64", "xxh3"] }
-tower.workspace = true
+tower = { workspace = true, features = ["timeout"] }
 async-channel.workspace = true
-enumset = { workspace = true }
 num_cpus = { workspace = true }
-rand.workspace = true
+rand = { workspace = true, features = ["serde"] }
 pin-project-lite.workspace = true
 md-5.workspace = true
 memmap2 = { workspace = true }
 libc.workspace = true
-rustix = { workspace = true }
+# "process" adds getrlimit for the io_uring fd-cache RLIMIT_NOFILE gate
+# (backlog#1178); "fs" comes from the workspace default.
+rustix = { workspace = true, features = ["process", "fs"] }
 rustfs-madmin.workspace = true
-rustfs-workers.workspace = true
 reqwest = { workspace = true }
-aes-gcm.workspace = true
-aws-sdk-s3 = { workspace = true }
+aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 urlencoding = { workspace = true }
-smallvec = { workspace = true }
-shadow-rs.workspace = true
+smallvec = { workspace = true, features = ["serde"] }
+shadow-rs = { workspace = true, default-features = false }
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true, features = ["http-1x"] }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
 google-cloud-storage = { workspace = true }
 google-cloud-auth = { workspace = true }
-aws-config = { workspace = true }
 faster-hex = { workspace = true }
 ratelimit = { workspace = true }
-aws-smithy-http-client.workspace = true
+aws-smithy-http-client = { workspace = true, default-features = false, features = ["rustls-aws-lc"] }
 
 # Observability and Metrics
 metrics = { workspace = true }
 
+# Runtime-probed io_uring read backend (backlog#1104). Linux-only, from
+# crates.io. The guard scripts/check_no_tokio_io_uring.sh allows an explicit
+# io-uring integration; only the tokio "io-uring" runtime feature is banned.
+[target.'cfg(target_os = "linux")'.dependencies]
+rustfs-uring = "0.2.1"
+
+[target.'cfg(windows)'.dependencies]
+winapi-util.workspace = true
+windows-sys = { workspace = true, features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_SystemServices",
+    "Win32_System_WindowsProgramming",
+] }
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_System_Ioctl"] }
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "test-util", "fs"] }
 criterion = { workspace = true, features = ["html_reports"] }
 temp-env = { workspace = true, features = ["async_closure"] }
-tracing-subscriber = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["json", "env-filter", "time"] }
+# Only for `pin_callsite_interest_for_test`, which registers a `NoSubscriber`
+# dispatcher to keep tracing's process-global callsite-interest cache honest.
+tracing-core = { workspace = true }
 serial_test = { workspace = true }
-opentelemetry_sdk = { workspace = true }
+metrics-util = { workspace = true, features = ["debugging"] }
+opentelemetry_sdk = { workspace = true, features = ["rt-tokio"] }
+proptest = "1"
+rcgen.workspace = true
+insta = { workspace = true, features = ["yaml", "json"] }
+rustfs-crypto = { workspace = true }
+tonic-prost = { workspace = true }
 
 [build-dependencies]
-shadow-rs = { workspace = true, features = ["build", "metadata"] }
+shadow-rs = { workspace = true, default-features = false, features = ["build", "metadata"] }
 
 [[bench]]
 name = "erasure_benchmark"
@@ -143,6 +269,14 @@ harness = false
 
 [[bench]]
 name = "comparison_benchmark"
+harness = false
+
+[[bench]]
+name = "rename_data_meta_benchmark"
+harness = false
+
+[[bench]]
+name = "single_block_non_inline_benchmark"
 harness = false
 
 [lib]

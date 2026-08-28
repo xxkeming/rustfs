@@ -32,10 +32,10 @@ use std::sync::LazyLock;
 /// let false_values = ["0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off", "disabled"];
 ///
 /// for val in true_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), true);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), true);
 /// }
 /// for val in false_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), false);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), false);
 /// }
 /// ```
 ///
@@ -236,12 +236,14 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9a-z]*\.\.\.[0-9a-z]*\})(.*)").unwrap());
+static ELLIPSES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").expect("operation should succeed"));
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";
 const CLOSE_BRACES: &str = "}";
 const ELLIPSES: &str = "...";
+const MAX_ELLIPSES_RANGE_SIZE: usize = 10_000;
 
 /// ellipses pattern, describes the range and also the
 /// associated prefix and suffixes.
@@ -350,7 +352,7 @@ impl ArgPattern {
 /// use rustfs_utils::string::find_ellipses_patterns;
 ///
 /// let pattern = "http://rustfs{2...3}/export/set{1...64}";
-/// let arg_pattern = find_ellipses_patterns(pattern).unwrap();
+/// let arg_pattern = find_ellipses_patterns(pattern).expect("operation should succeed");
 /// assert_eq!(arg_pattern.total_sizes(), 128);
 /// ```
 pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
@@ -358,7 +360,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
         Some(caps) => caps,
         None => {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     };
@@ -397,7 +399,7 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
             || p.suffix.contains(CLOSE_BRACES)
         {
             return Err(Error::other(format!(
-                "Invalid ellipsis format in ({arg}), Ellipsis range must be provided in format {{N...M}} where N and M are positive integers, M must be greater than N,  with an allowed minimum range of 4"
+                "Invalid ellipsis format. Ellipsis range must be provided in format {{N...M}} where N and M are decimal or hexadecimal positive integers, M must be greater than N, with a maximum expanded range size of {MAX_ELLIPSES_RANGE_SIZE}"
             )));
         }
     }
@@ -422,9 +424,30 @@ pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
 /// ```
 ///
 pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
-    let pattern = [ELLIPSES, OPEN_BRACES, CLOSE_BRACES];
+    s.iter().any(|v| {
+        let v = v.as_ref();
 
-    s.iter().any(|v| pattern.iter().any(|p| v.as_ref().contains(p)))
+        let mut remaining = v;
+        while let Some(start) = remaining.find(OPEN_BRACES) {
+            let after_start = &remaining[start + OPEN_BRACES.len()..];
+            let Some(end) = after_start.find(CLOSE_BRACES) else {
+                break;
+            };
+            // Dotted brace content covers both valid ellipsis patterns like
+            // {1...64} and invalid attempts like {1..64}, while excluding
+            // Windows Volume{GUID} paths (GUIDs use hyphens, not dots).
+            if after_start[..end].contains('.') {
+                return true;
+            }
+            remaining = &after_start[end + CLOSE_BRACES.len()..];
+        }
+
+        // Bare `...` without braces (e.g. "1...64") is still an ellipsis attempt.
+        if v.contains(ELLIPSES) {
+            return true;
+        }
+        false
+    })
 }
 
 /// Parses an ellipses range pattern of following style
@@ -432,6 +455,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// example:
 /// {1...64}
 /// {33...64}
+/// {0a...0f}
 ///
 /// # Arguments
 /// * `pattern` - A string slice representing the ellipses range pattern
@@ -446,7 +470,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// ```no_run
 /// use rustfs_utils::string::parse_ellipses_range;
 ///
-/// let range = parse_ellipses_range("{1...5}").unwrap();
+/// let range = parse_ellipses_range("{1...5}").expect("operation should succeed");
 /// assert_eq!(range, vec!["1", "2", "3", "4", "5"]);
 /// ```
 ///
@@ -468,17 +492,37 @@ pub fn parse_ellipses_range(pattern: &str) -> Result<Vec<String>> {
         return Err(Error::other("Invalid argument"));
     }
 
-    // TODO: Add support for hexadecimals.
-    let start = ellipses_range[0].parse::<usize>().map_err(Error::other)?;
-    let end = ellipses_range[1].parse::<usize>().map_err(Error::other)?;
+    let is_hex_range = ellipses_range
+        .iter()
+        .any(|value| value.bytes().any(|ch| matches!(ch, b'a'..=b'f' | b'A'..=b'F')));
+    let is_upper_hex_range = ellipses_range
+        .iter()
+        .any(|value| value.bytes().any(|ch| matches!(ch, b'A'..=b'F')));
+    let radix = if is_hex_range { 16 } else { 10 };
+    let start = usize::from_str_radix(ellipses_range[0], radix).map_err(Error::other)?;
+    let end = usize::from_str_radix(ellipses_range[1], radix).map_err(Error::other)?;
 
     if start > end {
         return Err(Error::other("Invalid argument:range start cannot be bigger than end"));
     }
 
-    let mut ret: Vec<String> = Vec::with_capacity(end - start + 1);
+    let range_size = end
+        .checked_sub(start)
+        .and_then(|size| size.checked_add(1))
+        .ok_or_else(|| Error::other("Invalid argument:range size overflow"))?;
+    if range_size > MAX_ELLIPSES_RANGE_SIZE {
+        return Err(Error::other("Invalid argument:range is too large"));
+    }
+
+    let mut ret: Vec<String> = Vec::with_capacity(range_size);
     for i in start..=end {
-        if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
+        if is_hex_range {
+            if is_upper_hex_range {
+                ret.push(format!("{i:0width$X}", width = ellipses_range[1].len()));
+            } else {
+                ret.push(format!("{i:0width$x}", width = ellipses_range[1].len()));
+            }
+        } else if ellipses_range[0].starts_with('0') && ellipses_range[0].len() > 1 {
             ret.push(format!("{:0width$}", i, width = ellipses_range[1].len()));
         } else {
             ret.push(format!("{i}"));
@@ -547,6 +591,10 @@ mod tests {
             ),
             (15, vec!["mydisk-{a...z}{1...20}"], true),
             (16, vec!["mydisk-{1...4}{1..2.}"], true),
+            // Windows Volume{GUID} paths must not match; GUIDs use hyphens, not dots.
+            (17, vec![r"\\?\Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}\"], false),
+            (18, vec![r"//./Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}/"], false),
+            (19, vec![r"\\?\Volume{9425a190-4bb3-11f1-86de-803253b6a8b8}\disk-{1..4}"], true),
         ];
 
         for (i, args, expected) in test_cases {
@@ -846,6 +894,18 @@ mod tests {
                     vec!["036"],
                 ],
             },
+            TestCase {
+                num: 22,
+                pattern: "{0a...0f}",
+                success: true,
+                want: vec![vec!["0a"], vec!["0b"], vec!["0c"], vec!["0d"], vec!["0e"], vec!["0f"]],
+            },
+            TestCase {
+                num: 23,
+                pattern: "{0A...0F}",
+                success: true,
+                want: vec![vec!["0A"], vec!["0B"], vec!["0C"], vec!["0D"], vec!["0E"], vec!["0F"]],
+            },
         ];
 
         for test_case in test_cases {
@@ -870,6 +930,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_find_ellipses_patterns_error_mentions_hex_ranges() {
+        let err = find_ellipses_patterns("{1..64}").unwrap_err();
+        assert!(err.to_string().contains("decimal or hexadecimal"), "unexpected error message: {err}");
+    }
+
+    #[test]
+    fn test_find_ellipses_patterns_leftover_brace_error_does_not_echo_input() {
+        let err = find_ellipses_patterns("http://:brace-secret@server/{1...2}}").unwrap_err();
+        assert!(
+            !err.to_string().contains("brace-secret"),
+            "ellipsis error leaked endpoint credentials: {err}"
+        );
+    }
+
+    #[test]
+    fn test_parse_ellipses_range_rejects_oversized_ranges() {
+        let err = parse_ellipses_range("{0...10000}").unwrap_err();
+        assert!(err.to_string().contains("range is too large"), "unexpected error message: {err}");
     }
 
     #[test]

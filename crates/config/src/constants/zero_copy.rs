@@ -12,94 +12,77 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy I/O configuration constants.
+//! Mmap-based read I/O configuration constants.
 //!
-//! This module defines environment variables and default values for zero-copy
-//! read operations, which use memory mapping (mmap) to avoid data copying.
+//! This module defines environment variables and default values for mmap-based
+//! read operations. Note: the legacy "zero_copy" env var is kept as a
+//! deprecated compatibility alias; the actual implementation performs
+//! mmap-then-copy, not true zero-copy.
 
 // =============================================================================
-// Zero-Copy Configuration
+// Mmap Read Configuration
 // =============================================================================
 
-/// Environment variable for zero-copy read enable.
+/// Environment variable for mmap-based read enable.
 ///
-/// When enabled, uses mmap (Unix) or optimized reads for zero-copy data access.
-/// This reduces memory copies from 3-4 to 1, lowering CPU usage by 20-30%
-/// and improving P95 latency by 15-25%.
+/// When enabled, uses mmap (Unix) or optimized reads for file access.
+/// This reduces memory copies from 3-4 to 1, lowering CPU usage and
+/// improving latency for large object reads.
 ///
-/// - Purpose: Enable or disable zero-copy read operations
+/// - Purpose: Enable or disable mmap-based read operations
 /// - Acceptable values: `"true"` / `"false"` (case-insensitive) or a boolean typed config
 /// - Semantics: When enabled, uses mmap on Unix systems for memory-mapped file reads;
 ///   falls back to regular I/O on non-Unix platforms or when mmap fails
-/// - Example: `export RUSTFS_OBJECT_ZERO_COPY_ENABLE=true`
-/// - Note: Zero-copy is safe for all workloads and provides significant performance
-///   benefits with minimal risk. Disable only if mmap-related issues are encountered.
+/// - Example: `export RUSTFS_OBJECT_MMAP_READ_ENABLE=true`
+pub const ENV_OBJECT_MMAP_READ_ENABLE: &str = "RUSTFS_OBJECT_MMAP_READ_ENABLE";
+
+/// Deprecated compatibility alias for mmap-based read enable.
+///
+/// Prefer [`ENV_OBJECT_MMAP_READ_ENABLE`]. When both variables are set, the
+/// canonical mmap-read variable takes precedence.
 pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
 
-/// Default: zero-copy reads are enabled.
+/// Default: mmap-based reads are enabled.
 ///
-/// Zero-copy uses memory mapping (mmap) on Unix systems to avoid data copying
-/// between kernel and user space. This provides:
-/// - Reduced memory copies: from 3-4 copies to 1 copy
-/// - Lower CPU usage: 20-30% reduction expected
-/// - Improved latency P95: 15-25% reduction expected
-/// - Increased throughput: 10-20% improvement expected
+/// Uses memory mapping (mmap) on Unix systems, then copies data into owned
+/// Bytes. This is faster than multiple read+copy passes but is NOT true
+/// zero-copy (the data is still copied once from the mmap region).
 ///
 /// On non-Unix platforms or when mmap fails, the system automatically falls back
 /// to regular I/O without errors.
-pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = true;
+pub const DEFAULT_OBJECT_MMAP_READ_ENABLE: bool = true;
 
-// =============================================================================
-// Direct I/O Configuration
-// =============================================================================
+/// Deprecated compatibility alias for mmap-based read default.
+///
+/// Prefer [`DEFAULT_OBJECT_MMAP_READ_ENABLE`].
+pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = DEFAULT_OBJECT_MMAP_READ_ENABLE;
 
-/// Environment variable for Direct I/O enable (Linux only).
+/// Environment variable capping the byte length a single mmap-copy read may
+/// materialize in memory.
 ///
-/// When enabled, uses O_DIRECT flag to bypass OS page cache for large files.
-/// This is only beneficial for specific workloads (databases, large sequential reads).
+/// The mmap-copy read path returns the whole requested range as one owned
+/// allocation before the first byte is served. GET/heal shard reads request
+/// the entire part span in one call, so for a large single-part object
+/// (e.g. a multi-gigabyte non-multipart upload) an uncapped mmap-copy read
+/// allocates the whole shard in memory — stalling first-byte latency past the
+/// disk-read timeout and OOM-killing memory-limited deployments
+/// (<https://github.com/rustfs/rustfs/issues/5123>). Reads longer than this
+/// cap fall back to the bounded streaming reader instead.
 ///
-/// - Purpose: Enable or disable Direct I/O for large file operations
-/// - Acceptable values: `"true"` / `"false"` (case-insensitive) or a boolean typed config
-/// - Semantics: When enabled, files larger than the threshold will use O_DIRECT flag;
-///   this bypasses the OS page cache and transfers data directly between disk and application
-/// - Example: `export RUSTFS_OBJECT_DIRECT_IO_ENABLE=true`
-/// - Note: Direct I/O is disabled by default because it's only beneficial for specific
-///   use cases. For most workloads, the OS page cache provides better performance.
-pub const ENV_OBJECT_DIRECT_IO_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_ENABLE";
+/// - Purpose: Bound per-shard-read memory for mmap-based reads
+/// - Acceptable values: byte count as an unsigned integer; `0` disables
+///   mmap-copy for all non-empty reads (every read streams)
+/// - Example: `export RUSTFS_OBJECT_MMAP_READ_MAX_LENGTH=8388608`
+pub const ENV_OBJECT_MMAP_READ_MAX_LENGTH: &str = "RUSTFS_OBJECT_MMAP_READ_MAX_LENGTH";
 
-/// Default: Direct I/O is disabled.
+/// Default mmap-copy read length cap: 32 MiB per shard read.
 ///
-/// Direct I/O is disabled by default because it's only beneficial for specific use cases:
-/// - Large file transfers (>128MB)
-/// - Databases with their own cache
-/// - Applications requiring predictable I/O latency
+/// Large enough that typical multipart part shards (parts up to a few hundred
+/// megabytes across the erasure set) keep the mmap fast path, small enough
+/// that whole-part reads of huge single-part objects stream instead of
+/// materializing gigabytes per shard.
 ///
-/// For most workloads, the OS page cache provides better performance through:
-/// - Read-ahead caching
-/// - Write buffering
-/// - Multi-use caching (same data cached for multiple operations)
-pub const DEFAULT_OBJECT_DIRECT_IO_ENABLE: bool = false;
-
-/// Environment variable for Direct I/O minimum file size threshold.
-///
-/// Files smaller than this size will use regular I/O even if Direct I/O is enabled.
-/// This avoids the overhead of Direct I/O for small files where the OS page cache
-/// is more effective.
-///
-/// - Purpose: Set the minimum file size for Direct I/O operations
-/// - Unit: Bytes
-/// - Valid values: any positive integer (default: 134,217,728 bytes = 128 MB)
-/// - Semantics: Only files larger than this threshold will use Direct I/O when enabled;
-///   smaller files use regular buffered I/O
-/// - Example: `export RUSTFS_OBJECT_DIRECT_IO_THRESHOLD=268435456`
-/// - Note: The default threshold of 128MB balances the overhead of Direct I/O setup
-///   against the benefits of bypassing the page cache for large files.
-pub const ENV_OBJECT_DIRECT_IO_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_THRESHOLD";
-
-/// Default Direct I/O threshold: 128 MB.
-///
-/// Only files larger than 128MB will use Direct I/O when enabled.
-/// Smaller files benefit from OS page cache.
-///
-/// Formula: 128 * 1024 * 1024 = 134,217,728 bytes
-pub const DEFAULT_OBJECT_DIRECT_IO_THRESHOLD: usize = 128 * 1024 * 1024;
+/// The cap bounds memory per shard reader, so a single part read can still
+/// materialize up to `data_shards x cap` bytes; raising the cap raises that
+/// per-request bound proportionally.
+pub const DEFAULT_OBJECT_MMAP_READ_MAX_LENGTH: usize = 32 * 1024 * 1024;

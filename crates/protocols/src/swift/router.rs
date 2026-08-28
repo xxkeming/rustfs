@@ -50,7 +50,6 @@ pub enum SwiftRoute {
 
 impl SwiftRoute {
     /// Get the account identifier from the route
-    #[allow(dead_code)] // Public API for future use
     pub fn account(&self) -> &str {
         match self {
             SwiftRoute::Account { account, .. } => account,
@@ -60,7 +59,6 @@ impl SwiftRoute {
     }
 
     /// Extract project_id from account string (removes AUTH_ prefix)
-    #[allow(dead_code)] // Public API for future use
     pub fn project_id(&self) -> Option<&str> {
         let account = self.account();
         ACCOUNT_PATTERN
@@ -84,20 +82,19 @@ impl SwiftRouter {
         Self { enabled, url_prefix }
     }
 
+    /// Return whether a URI matches the Swift route shape without allocating
+    /// decoded route components.
+    pub fn matches(&self, uri: &Uri) -> bool {
+        let Some(path) = self.route_path(uri) else {
+            return false;
+        };
+        let mut segments = path.trim_start_matches('/').split('/');
+        segments.next() == Some("v1") && segments.next().is_some_and(Self::is_valid_account)
+    }
+
     /// Parse a URI and return a SwiftRoute if it matches Swift URL pattern
     pub fn route(&self, uri: &Uri, method: Method) -> Option<SwiftRoute> {
-        if !self.enabled {
-            return None;
-        }
-
-        let path = uri.path();
-
-        // Strip optional prefix
-        let path = if let Some(prefix) = &self.url_prefix {
-            path.strip_prefix(&format!("/{}/", prefix))?
-        } else {
-            path
-        };
+        let path = self.route_path(uri)?;
 
         // Split path into segments - preserve empty segments to maintain object key fidelity
         // Swift allows trailing slashes and consecutive slashes in object names (e.g., "dir/" or "a//b")
@@ -174,6 +171,17 @@ impl SwiftRouter {
     /// Validate account format (must be AUTH_{uuid})
     fn is_valid_account(account: &str) -> bool {
         ACCOUNT_PATTERN.is_match(account)
+    }
+
+    fn route_path<'a>(&self, uri: &'a Uri) -> Option<&'a str> {
+        if !self.enabled {
+            return None;
+        }
+        let path = uri.path();
+        let Some(prefix) = &self.url_prefix else {
+            return Some(path);
+        };
+        path.strip_prefix('/')?.strip_prefix(prefix)?.strip_prefix('/')
     }
 }
 
@@ -279,6 +287,42 @@ mod tests {
         let route = router.route(&uri, Method::GET);
 
         assert_eq!(route, None);
+    }
+
+    #[test]
+    fn test_matches_agrees_with_route_without_decoding_components() {
+        let router = SwiftRouter::new(true, None);
+        for path in [
+            "/v1/AUTH_project",
+            "/v1/AUTH_project/",
+            "/v1/AUTH_project/container",
+            "/v1/AUTH_project/container/a%20long/object",
+            "//v1/AUTH_project/container/object",
+            "/v1/not-a-swift-account/object",
+            "/v1/AUTH_/object",
+            "/bucket/object",
+        ] {
+            let uri = path.parse().expect("Swift route test URI");
+            assert_eq!(
+                router.matches(&uri),
+                router.route(&uri, Method::GET).is_some(),
+                "classification must match full routing for {path}"
+            );
+        }
+
+        let prefixed_router = SwiftRouter::new(true, Some("swift".to_string()));
+        for path in [
+            "/swift/v1/AUTH_project/container",
+            "/swiftish/v1/AUTH_project/container",
+            "/v1/AUTH_project/container",
+        ] {
+            let uri = path.parse().expect("prefixed Swift route test URI");
+            assert_eq!(
+                prefixed_router.matches(&uri),
+                prefixed_router.route(&uri, Method::GET).is_some(),
+                "prefixed classification must match full routing for {path}"
+            );
+        }
     }
 
     #[test]

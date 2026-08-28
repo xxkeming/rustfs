@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
+use crate::admin::runtime_sources::current_action_credentials;
 use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
 use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -46,8 +46,14 @@ impl Operation for IsAdminHandler {
 
         let access_key_to_check = input_cred.access_key.clone();
 
+        // This endpoint reports a capability; it does not gate on one. The
+        // `is_allowed` result below becomes the `is_admin` field of a 200
+        // response — a caller without admin rights gets `{"is_admin": false}`,
+        // not a 403. Turning this into a rejection would change the API
+        // contract, so it must stay out of any shared-gate normalisation
+        // (backlog#1886).
         // Check if the user is admin: root user check, then evaluate through the policy engine
-        let is_admin = if let Some(sys_cred) = get_global_action_cred() {
+        let is_admin = if let Some(sys_cred) = current_action_credentials() {
             constant_time_eq(&access_key_to_check, &sys_cred.access_key)
                 || constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {
@@ -58,7 +64,8 @@ impl Operation for IsAdminHandler {
             true
         } else {
             let empty_claims = HashMap::new();
-            let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+            let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
+                .map_err(|_| s3_error!(InternalError, "iam not init"))?;
             let conditions = get_condition_values(&req.headers, &cred, None, None, None);
             iam_store
                 .is_allowed(&Args {

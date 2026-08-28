@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::filemeta::msgp_decode::MAX_MSGP_ELEMENT_SIZE;
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
-    merge_file_meta_versions,
+    merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
 };
 use arc_swap::ArcSwapOption;
 use rmp::Marker;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::str::from_utf8;
 use std::{
     fmt::Debug,
@@ -35,9 +37,14 @@ use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::spawn;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{debug, warn};
+use uuid::Uuid;
 
 const SLASH_SEPARATOR: &str = "/";
+pub const MAX_META_CACHE_HEAL_CANDIDATES: usize = 1024;
+/// Keep truncation continuations bounded while still giving the scanner a
+/// safe object-level retry for versions that did not fit in the candidate set.
+pub const MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS: usize = 64;
 
 #[derive(Clone, Debug, Default)]
 pub struct MetadataResolutionParams {
@@ -63,6 +70,50 @@ pub struct MetaCacheEntry {
 
     /// Indicates the entry can be reused and only one reference to metadata is expected.
     pub reusable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum MetaCacheHealCandidateKind {
+    Object,
+    DeleteMarker,
+    UnversionedObject,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MetaCacheHealCandidate {
+    pub object: String,
+    pub version_id: Option<Uuid>,
+    pub kind: MetaCacheHealCandidateKind,
+    /// Number of raw disk entries that carried this validated version.
+    pub replica_count: usize,
+}
+
+impl MetaCacheHealCandidate {
+    pub fn validated_version(&self) -> Option<Uuid> {
+        match self.kind {
+            MetaCacheHealCandidateKind::Object | MetaCacheHealCandidateKind::DeleteMarker => self.version_id,
+            MetaCacheHealCandidateKind::UnversionedObject => None,
+        }
+    }
+
+    pub fn is_unversioned(&self) -> bool {
+        self.kind == MetaCacheHealCandidateKind::UnversionedObject
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MetaCacheHealDiscovery {
+    pub candidates: Vec<MetaCacheHealCandidate>,
+    pub unverified_count: usize,
+    pub truncated: bool,
+    /// Object names whose validated version set exceeded the candidate cap.
+    /// The scanner retries these names without a version and with destructive
+    /// healing disabled; this is an explicit bounded continuation, not a
+    /// version claim.
+    pub truncated_objects: Vec<String>,
+    /// Validated candidates beyond the main cap, retained with exact version
+    /// identities so callers never fall back to a latest-version request.
+    pub truncated_candidates: Vec<MetaCacheHealCandidate>,
 }
 
 impl MetaCacheEntry {
@@ -156,7 +207,7 @@ impl MetaCacheEntry {
                 });
             }
 
-            let fi = fm.into_fileinfo(bucket, self.name.as_str(), "", false, false, true)?;
+            let fi = fm.into_fileinfo_without_part_checksums(bucket, self.name.as_str(), "", false, false)?;
             return Ok(fi);
         }
 
@@ -168,6 +219,7 @@ impl MetaCacheEntry {
             FileInfoOpts {
                 data: false,
                 include_free_versions: false,
+                include_part_checksums: false,
             },
         )
     }
@@ -188,7 +240,30 @@ impl MetaCacheEntry {
 
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
-        fm.into_file_info_versions(bucket, self.name.as_str(), false)
+        let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+        versions.free_versions.clear();
+        Ok(versions)
+    }
+
+    pub fn file_info_versions_with_free_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
+        if self.is_dir() {
+            return Ok(FileInfoVersions {
+                volume: bucket.to_string(),
+                name: self.name.clone(),
+                versions: vec![FileInfo {
+                    volume: bucket.to_string(),
+                    name: self.name.clone(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+
+        let mut fm = FileMeta::new();
+        fm.unmarshal_msg(&self.metadata)?;
+        // `get_file_info_versions(..., false)` is the existing path that
+        // separates persisted tier free-version records into `free_versions`.
+        fm.get_file_info_versions(bucket, self.name.as_str(), false)
     }
 
     pub fn matches(&self, other: Option<&MetaCacheEntry>, strict: bool) -> (Option<MetaCacheEntry>, bool) {
@@ -311,9 +386,227 @@ impl MetaCacheEntries {
         &self.0
     }
 
-    pub fn resolve(&self, mut params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+    pub fn resolve(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+        self.resolve_inner(params, false)
+    }
+
+    pub fn resolve_with_write_quorum(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+        self.resolve_inner(params, true)
+    }
+
+    /// Resolve the cross-disk UNION of every version present on ANY disk slot.
+    ///
+    /// This mirrors MinIO's global heal enumeration (cmd/global-heal.go
+    /// `healErasureSet` -> `listPathRaw` with `objQuorum = 1` feeding
+    /// `mergeEntries`/`mergeXLV2Versions`): at quorum 1 the merge is forced
+    /// strict and returns the union of all per-disk version streams, so a version
+    /// that survives on FEWER than read-quorum disks is still surfaced for
+    /// healing. Read-quorum resolution (`resolve` with `obj_quorum >= 2`) would
+    /// silently drop such a sub-quorum version, which is exactly the durability
+    /// gap this enumerator closes (backlog#920).
+    ///
+    /// `bucket` is only used to tag the merged entry; `strict:false` lets the
+    /// non-strict header reconciliation collapse equal-but-differently-signed
+    /// replicas of the SAME version id while still retaining genuinely distinct
+    /// version ids.
+    pub fn resolve_union(&self, bucket: &str) -> Option<MetaCacheEntry> {
+        self.resolve(MetadataResolutionParams {
+            dir_quorum: 1,
+            obj_quorum: 1,
+            requested_versions: 0,
+            bucket: bucket.to_string(),
+            strict: false,
+            candidates: Vec::new(),
+        })
+    }
+
+    /// Discover validated object/delete-marker versions and safe unversioned
+    /// inspection candidates in the raw entries without applying read quorum.
+    /// This is intentionally separate from [`Self::resolve`]: a sub-quorum
+    /// version is a valid heal target even though it must not participate in
+    /// normal reads or writes.
+    ///
+    /// The validated list is bounded and deduplicated by object, version id,
+    /// and metadata kind; each candidate retains the number of raw disk
+    /// entries that carried it so callers can classify sub-quorum versions.
+    /// Entries whose xl.meta cannot be decoded are counted separately for
+    /// discovery accounting; they never become versionless destructive heal
+    /// requests and do not consume the validated quota. An
+    /// [`MetaCacheHealCandidateKind::UnversionedObject`] is always consumed by
+    /// a non-destructive scanner request.
+    pub fn discover_heal_candidates(&self, bucket: &str, max_candidates: usize) -> MetaCacheHealDiscovery {
+        let limit = max_candidates.min(MAX_META_CACHE_HEAL_CANDIDATES);
+        if limit == 0 || bucket.is_empty() {
+            return MetaCacheHealDiscovery::default();
+        }
+
+        let mut discovery = MetaCacheHealDiscovery {
+            candidates: Vec::<MetaCacheHealCandidate>::with_capacity(limit.min(self.0.len())),
+            unverified_count: 0,
+            truncated: false,
+            truncated_objects: Vec::with_capacity(MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS.min(limit)),
+            truncated_candidates: Vec::new(),
+        };
+        let mut seen: HashMap<(String, Option<Uuid>, MetaCacheHealCandidateKind), usize> =
+            HashMap::with_capacity(limit.min(self.0.len()));
+
+        for entry in self.0.iter().flatten() {
+            if !valid_heal_candidate_name(bucket, entry) {
+                continue;
+            }
+
+            let meta = match FileMeta::load(&entry.metadata) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                    continue;
+                }
+            };
+            let mut entry_seen = HashSet::new();
+
+            for shallow in meta.versions {
+                let version = match shallow.parse_version_meta() {
+                    Ok(version) if version.valid() => version,
+                    Ok(_) | Err(_) => {
+                        discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                        continue;
+                    }
+                };
+                if version.free_version() {
+                    continue;
+                }
+
+                let payload_header = version.header();
+                if normalize_version_id(shallow.header.version_id) != normalize_version_id(payload_header.version_id)
+                    || shallow.header.version_type != payload_header.version_type
+                {
+                    discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                    continue;
+                }
+
+                let (kind, version_id) = match version.version_type {
+                    VersionType::Object
+                        if version.object.is_some() && version.delete_marker.is_none() && version.legacy_object.is_none() =>
+                    {
+                        match version.object.as_ref().and_then(|object| object.version_id) {
+                            Some(id) if !id.is_nil() => (MetaCacheHealCandidateKind::Object, Some(id)),
+                            Some(_) | None => (MetaCacheHealCandidateKind::UnversionedObject, None),
+                        }
+                    }
+                    VersionType::Delete
+                        if version.delete_marker.is_some() && version.object.is_none() && version.legacy_object.is_none() =>
+                    {
+                        let Some(id) = version.delete_marker.as_ref().and_then(|marker| marker.version_id) else {
+                            discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                            continue;
+                        };
+                        if id.is_nil() {
+                            discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                            continue;
+                        }
+                        (MetaCacheHealCandidateKind::DeleteMarker, Some(id))
+                    }
+                    VersionType::Legacy
+                        if version.legacy_object.is_some() && version.object.is_none() && version.delete_marker.is_none() =>
+                    {
+                        let Some(legacy) = version.legacy_object.as_ref() else {
+                            continue;
+                        };
+                        if legacy.version_id.is_empty() {
+                            (MetaCacheHealCandidateKind::UnversionedObject, None)
+                        } else {
+                            let Ok(id) = Uuid::parse_str(&legacy.version_id) else {
+                                discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                                continue;
+                            };
+                            if id.is_nil() {
+                                discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                                continue;
+                            }
+                            (MetaCacheHealCandidateKind::Object, Some(id))
+                        }
+                    }
+                    _ => {
+                        discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                        continue;
+                    }
+                };
+
+                if normalize_version_id(payload_header.version_id) != version_id {
+                    discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                    continue;
+                }
+
+                // `all_parts=true` is the trust-boundary check for versioned
+                // candidates. A null/legacy object may still need the old
+                // non-destructive inspection fallback when its part arrays
+                // are parseable but incomplete; never use that fallback for
+                // a candidate carrying a real version id.
+                let file_info = match version.clone().into_fileinfo(bucket, &entry.name, true) {
+                    Ok(file_info) => file_info,
+                    Err(_) if version_id.is_none() && matches!(kind, MetaCacheHealCandidateKind::UnversionedObject) => {
+                        discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                        match version.into_fileinfo(bucket, &entry.name, false) {
+                            Ok(file_info) => file_info,
+                            Err(_) => continue,
+                        }
+                    }
+                    Err(_) => {
+                        discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                        continue;
+                    }
+                };
+                if file_info.volume != bucket || file_info.name != entry.name {
+                    discovery.unverified_count = discovery.unverified_count.saturating_add(1);
+                    continue;
+                }
+
+                let candidate = MetaCacheHealCandidate {
+                    object: entry.name.clone(),
+                    version_id,
+                    kind,
+                    replica_count: 1,
+                };
+                let key = (candidate.object.clone(), candidate.version_id, candidate.kind.clone());
+                if entry_seen.contains(&key) {
+                    continue;
+                }
+                if let Some(index) = seen.get(&key).copied() {
+                    entry_seen.insert(key);
+                    discovery.candidates[index].replica_count = discovery.candidates[index].replica_count.saturating_add(1);
+                } else if discovery.candidates.len() >= limit {
+                    // Keep the validated candidate list bounded, but retain a
+                    // bounded object-level continuation so the scanner cannot
+                    // silently lose every version of a busy object.
+                    discovery.truncated = true;
+                    if discovery.truncated_objects.len() < MAX_META_CACHE_HEAL_TRUNCATED_OBJECTS
+                        && !discovery.truncated_objects.iter().any(|object| object == &candidate.object)
+                    {
+                        discovery.truncated_objects.push(candidate.object.clone());
+                    }
+                    if discovery.truncated_objects.iter().any(|object| object == &candidate.object) {
+                        discovery.truncated_candidates.push(candidate);
+                    }
+                    continue;
+                } else {
+                    entry_seen.insert(key.clone());
+                    seen.insert(key, discovery.candidates.len());
+                    discovery.candidates.push(candidate);
+                }
+            }
+        }
+
+        discovery
+    }
+
+    fn resolve_inner(&self, mut params: MetadataResolutionParams, enforce_write_quorum: bool) -> Option<MetaCacheEntry> {
         if self.0.is_empty() {
-            warn!("decommission_pool: entries resolve empty");
+            debug!(
+                bucket = %params.bucket,
+                dir_quorum = params.dir_quorum,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve skipped because there were no entries to reconcile"
+            );
             return None;
         }
 
@@ -327,21 +620,21 @@ impl MetaCacheEntries {
         for entry in self.0.iter().flatten() {
             let mut entry = entry.clone();
 
-            warn!("decommission_pool: entries resolve entry {:?}", entry.name);
+            debug!(entry = %entry.name, "metacache resolve examining candidate entry");
             if entry.name.is_empty() {
                 continue;
             }
             if entry.is_dir() {
                 dir_exists += 1;
                 selected = Some(entry.clone());
-                warn!("decommission_pool: entries resolve entry dir {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve observed directory candidate");
                 continue;
             }
 
             let xl = match entry.xl_meta() {
                 Ok(xl) => xl,
                 Err(e) => {
-                    warn!("decommission_pool: entries resolve entry xl_meta {:?}", e);
+                    debug!(entry = %entry.name, error = ?e, "metacache resolve skipped candidate with unreadable xl.meta");
                     continue;
                 }
             };
@@ -352,50 +645,92 @@ impl MetaCacheEntries {
             if selected.is_none() {
                 selected = Some(entry.clone());
                 objs_agree = 1;
-                warn!("decommission_pool: entries resolve entry selected {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve selected initial candidate");
                 continue;
             }
 
             if let (prefer, true) = entry.matches(selected.as_ref(), params.strict) {
                 selected = prefer;
                 objs_agree += 1;
-                warn!("decommission_pool: entries resolve entry prefer {:?}", entry.name);
+                debug!(entry = %entry.name, "metacache resolve preferred candidate during reconciliation");
                 continue;
             }
         }
 
         let Some(selected) = selected else {
-            warn!("decommission_pool: entries resolve entry no selected");
+            debug!(
+                bucket = %params.bucket,
+                dir_quorum = params.dir_quorum,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve could not select any candidate entry"
+            );
             return None;
         };
 
         if selected.is_dir() && dir_exists >= params.dir_quorum {
-            warn!("decommission_pool: entries resolve entry dir selected {:?}", selected.name);
+            debug!(
+                entry = %selected.name,
+                dir_exists,
+                dir_quorum = params.dir_quorum,
+                "metacache resolve selected directory candidate after quorum reconciliation"
+            );
             return Some(selected);
         }
 
-        // If we would never be able to reach read quorum.
+        // If we would never be able to reach the required object quorum.
         if objs_valid < params.obj_quorum {
-            warn!(
-                "decommission_pool: entries resolve entry not enough objects {} < {}",
-                objs_valid, params.obj_quorum
+            debug!(
+                objs_valid,
+                obj_quorum = params.obj_quorum,
+                "metacache resolve did not have enough valid object candidates to satisfy quorum"
             );
             return None;
         }
 
         if objs_agree == objs_valid {
-            warn!("decommission_pool: entries resolve entry all agree {} == {}", objs_agree, objs_valid);
-            return Some(selected);
+            let required_quorum = if enforce_write_quorum {
+                selected
+                    .cached
+                    .as_ref()
+                    .and_then(|cached| cached.versions.first())
+                    .map(|version| version.write_quorum(params.obj_quorum).max(params.obj_quorum))
+                    .unwrap_or(params.obj_quorum)
+            } else {
+                params.obj_quorum
+            };
+
+            if objs_agree >= required_quorum {
+                debug!(
+                    selected = %selected.name,
+                    objs_agree,
+                    objs_valid,
+                    "metacache resolve reused selected candidate because all valid object entries agreed"
+                );
+                return Some(selected);
+            }
         }
 
         let Some(cached) = selected.cached else {
-            warn!("decommission_pool: entries resolve entry no cached");
+            debug!(selected = %selected.name, "metacache resolve could not merge because selected candidate had no cached metadata");
             return None;
         };
 
-        let versions = merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates);
+        let versions = if enforce_write_quorum {
+            merge_file_meta_versions_with_write_quorum(
+                params.obj_quorum,
+                params.strict,
+                params.requested_versions,
+                &params.candidates,
+            )
+        } else {
+            merge_file_meta_versions(params.obj_quorum, params.strict, params.requested_versions, &params.candidates)
+        };
         if versions.is_empty() {
-            warn!("decommission_pool: entries resolve entry no versions");
+            debug!(
+                selected = %selected.name,
+                requested_versions = params.requested_versions,
+                "metacache resolve produced no merged versions after reconciliation"
+            );
             return None;
         }
 
@@ -408,7 +743,11 @@ impl MetaCacheEntries {
         let metadata = match merged_cached.marshal_msg() {
             Ok(meta) => meta,
             Err(e) => {
-                warn!("decommission_pool: entries resolve entry marshal_msg {:?}", e);
+                warn!(
+                    selected = %selected.name,
+                    error = ?e,
+                    "metacache resolve failed to marshal merged metadata entry"
+                );
                 return None;
             }
         };
@@ -422,13 +761,45 @@ impl MetaCacheEntries {
             metadata,
         };
 
-        warn!("decommission_pool: entries resolve entry selected {:?}", new_selected.name);
+        debug!(
+            selected = %new_selected.name,
+            candidate_count = params.candidates.len(),
+            obj_quorum = params.obj_quorum,
+            "metacache resolve produced merged metadata entry after reconciling disagreeing candidates"
+        );
         Some(new_selected)
     }
 
     pub fn first_found(&self) -> (Option<MetaCacheEntry>, usize) {
         (self.0.iter().find(|x| x.is_some()).cloned().unwrap_or_default(), self.0.len())
     }
+}
+
+fn valid_heal_candidate_name(bucket: &str, entry: &MetaCacheEntry) -> bool {
+    if bucket.is_empty()
+        || entry.name.is_empty()
+        || entry.is_dir()
+        || (cfg!(windows) && entry.name.contains('\\'))
+        || entry.name.chars().any(char::is_control)
+    {
+        return false;
+    }
+
+    // Validate raw key components without normalizing them. The scanner maps
+    // accepted keys to filesystem paths later, so dot components and empty
+    // internal components must be rejected before that boundary. A final
+    // empty component is retained for valid keys ending in '/'.
+    let mut components = entry.name.split('/').peekable();
+    while let Some(component) = components.next() {
+        if component == "." || component == ".." || (component.is_empty() && components.peek().is_some()) {
+            return false;
+        }
+    }
+    true
+}
+
+fn normalize_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
+    version_id.filter(|id| !id.is_nil())
 }
 
 #[derive(Debug, Default)]
@@ -523,6 +894,7 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.init().await?;
         rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
         self.flush().await?;
         Ok(())
@@ -551,25 +923,36 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
-        let ext_size = read_size + self.offset;
-
-        let extra = ext_size - self.offset;
-        if self.buf.capacity() >= ext_size {
-            // Extend the buffer if we have enough space.
-            self.buf.resize(ext_size, 0);
-        } else {
-            self.buf.extend(vec![0u8; extra]);
+        // `read_size` is usually a length decoded from the stream itself, so
+        // it is untrusted: a corrupted length prefix must yield a decode
+        // error instead of a huge allocation that aborts the process
+        // (see rustfs/rustfs#2715).
+        if read_size > MAX_MSGP_ELEMENT_SIZE {
+            let err = Error::other(format!(
+                "metacache stream corrupt: element length {read_size} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+            ));
+            self.err = Some(err.clone());
+            return Err(err);
         }
 
         let pref = self.offset;
+        let ext_size = pref + read_size;
+
+        if self.buf.len() < ext_size {
+            let extra = ext_size - self.buf.len();
+            if let Err(e) = self.buf.try_reserve(extra) {
+                let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+                self.err = Some(err.clone());
+                return Err(err);
+            }
+            self.buf.resize(ext_size, 0);
+        }
 
         self.rd.read_exact(&mut self.buf[pref..ext_size]).await?;
 
         self.offset += read_size;
 
-        let data = &self.buf[pref..ext_size];
-
-        Ok(data)
+        Ok(&self.buf[pref..ext_size])
     }
 
     fn reset(&mut self) {
@@ -865,7 +1248,7 @@ impl<T: Clone + Debug + Send + Sync + 'static> Cache<T> {
 mod tests {
     use super::*;
     use crate::test_data::create_real_xlmeta;
-    use crate::{FileMetaVersion, MetaDeleteMarker};
+    use crate::{FileMetaVersion, MetaDeleteMarker, MetaObjectV1, MetaObjectV1Erasure, MetaObjectV1Stat, TRANSITION_COMPLETE};
     use std::collections::HashMap;
     use std::io::Cursor;
     use std::sync::{
@@ -901,6 +1284,337 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    #[tokio::test]
+    async fn empty_writer_emits_a_valid_stream() {
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.close().await.expect("empty stream should close");
+
+        let mut reader = MetacacheReader::new(Cursor::new(output.into_inner()));
+        assert!(reader.read_all().await.expect("empty stream should decode").is_empty());
+    }
+
+    fn corrupt_stream_with_metadata_len(len_marker: u8, len: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        rmp::encode::write_str(&mut data, "object").unwrap();
+        // Hand-written bin/str length prefix claiming an absurd payload size.
+        data.push(len_marker);
+        data.extend_from_slice(&len.to_be_bytes());
+        data
+    }
+
+    /// Regression test for rustfs/rustfs#2715: a corrupted metadata length
+    /// prefix must surface as a decode error instead of attempting a huge
+    /// allocation that aborts the process.
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_bin_length_prefix() {
+        // 0xc6 = bin32 marker.
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt bin length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+
+        // The reader must stay in the error state instead of retrying.
+        assert!(r.peek().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_str_length_prefix() {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        // 0xdb = str32 marker with an absurd object-name length.
+        data.push(0xdb);
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt str length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_reader_skip_rejects_corrupt_length_prefix() {
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        assert!(r.skip(1).await.is_err(), "skip over a corrupt length prefix must fail");
+    }
+
+    /// Large-but-legitimate records (well above typical sizes, below the
+    /// corruption guard) must still round-trip.
+    #[tokio::test]
+    async fn test_reader_accepts_large_legitimate_metadata() {
+        let entry = MetaCacheEntry {
+            name: "big-object".to_string(),
+            metadata: vec![0xab; 4 << 20],
+            cached: None,
+            reusable: false,
+        };
+
+        let mut f = Cursor::new(Vec::new());
+        let mut w = MetacacheWriter::new(&mut f);
+        w.write(std::slice::from_ref(&entry)).await.unwrap();
+        w.close().await.unwrap();
+
+        let mut r = MetacacheReader::new(Cursor::new(f.into_inner()));
+        let decoded = r.read_all().await.unwrap();
+        assert_eq!(decoded, vec![entry]);
+    }
+
+    #[test]
+    fn file_info_versions_with_free_versions_includes_persisted_tier_cleanup_records() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create free-version metadata");
+
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("metadata should marshal"),
+            ..Default::default()
+        };
+
+        let normal = entry.file_info_versions("bucket").expect("normal versions should parse");
+        assert!(normal.free_versions.is_empty());
+
+        let with_free = entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("versions with free versions should parse");
+        assert_eq!(with_free.free_versions.len(), 1);
+        assert!(with_free.free_versions[0].tier_free_version());
+        assert_eq!(with_free.free_versions[0].transitioned_objname, "remote/object");
+        assert_eq!(with_free.free_versions[0].transition_tier, "WARM");
+        assert_eq!(with_free.free_versions[0].transition_version_id, Some(remote_version_id));
+    }
+
+    #[test]
+    fn file_info_versions_excludes_free_versions_from_visible_version_count() {
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let delete_marker_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("transitioned object version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create a free-version record");
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(delete_marker_id),
+            deleted: true,
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("delete marker should be added");
+
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("metadata should marshal"),
+            ..Default::default()
+        };
+
+        let normal = entry.file_info_versions("bucket").expect("normal versions should parse");
+        assert_eq!(normal.versions.len(), 1);
+        assert!(normal.free_versions.is_empty());
+        assert!(normal.versions[0].deleted);
+        assert_eq!(normal.versions[0].num_versions, 1);
+
+        let with_free = entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("versions with free versions should parse");
+        assert_eq!(with_free.versions.len(), 1);
+        assert_eq!(with_free.free_versions.len(), 1);
+        assert_eq!(with_free.versions[0].num_versions, 1);
+        assert_eq!(with_free.free_versions[0].num_versions, 1);
+    }
+
+    #[test]
+    fn transitioned_delete_persists_recoverable_free_version_after_metadata_roundtrip() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should persist free-version metadata");
+        let encoded = fm.marshal_msg().expect("metadata should marshal");
+        let mut decoded = FileMeta::new();
+        decoded
+            .unmarshal_msg(&encoded)
+            .expect("metadata should survive process restart roundtrip");
+
+        let versions = decoded
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions with free versions should parse");
+
+        assert!(versions.versions.is_empty());
+        assert_eq!(versions.free_versions.len(), 1);
+        let free_version = &versions.free_versions[0];
+        assert_eq!(free_version.version_id, Some(free_version_id));
+        assert!(free_version.tier_free_version());
+        assert_eq!(free_version.transitioned_objname, "remote/object");
+        assert_eq!(free_version.transition_version_id, Some(remote_version_id));
+        assert_eq!(free_version.transition_tier, "WARM");
+    }
+
+    #[test]
+    fn skip_tier_free_version_does_not_persist_cleanup_record() {
+        let version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(Uuid::new_v4()),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&Uuid::new_v4().to_string());
+        delete_fi.set_skip_tier_free_version();
+
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete with skip flag should remove the local version");
+        let versions = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions should parse after skipped cleanup");
+
+        assert!(versions.free_versions.is_empty());
+        assert_eq!(versions.versions.len(), 1);
+        assert!(versions.versions[0].deleted);
+        assert!(!versions.versions[0].tier_free_version());
+    }
+
+    #[test]
+    fn worker_style_free_version_delete_removes_persisted_cleanup_record() {
+        let version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let mut fm = FileMeta::new();
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(version_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should persist free-version metadata");
+
+        let mut free_delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(free_version_id),
+            deleted: true,
+            ..Default::default()
+        };
+        free_delete_fi.set_tier_free_version();
+
+        fm.delete_version(&free_delete_fi)
+            .expect("worker-style free-version delete should remove the cleanup record");
+        let versions = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("versions should parse after free-version cleanup");
+
+        assert!(versions.free_versions.is_empty());
+        assert_eq!(versions.versions.len(), 1);
+        assert!(versions.versions[0].deleted);
+        assert!(!versions.versions[0].tier_free_version());
     }
 
     #[test]
@@ -959,6 +1673,761 @@ mod tests {
         assert_eq!(decoded.versions.len(), base_versions);
         assert_eq!(decoded.versions, cached.versions);
         assert_ne!(extended_versions, cached.versions.len());
+    }
+
+    fn metacache_entry_with_mod_time(mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            size: 1,
+            mod_time: Some(mod_time),
+            metadata,
+            ..Default::default()
+        })
+        .expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_with_erasure(
+        mod_time: OffsetDateTime,
+        etag: &str,
+        data_blocks: usize,
+        parity_blocks: usize,
+    ) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut fi = FileInfo::new("object", data_blocks, parity_blocks);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = 1;
+        fi.mod_time = Some(mod_time);
+        fi.metadata = metadata;
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_with_erasure_versions(versions: &[(OffsetDateTime, &str, usize, usize)]) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        for (idx, (mod_time, etag, data_blocks, parity_blocks)) in versions.iter().enumerate() {
+            let mut metadata = HashMap::new();
+            metadata.insert("etag".to_string(), (*etag).to_string());
+
+            let mut fi = FileInfo::new("object", *data_blocks, *parity_blocks);
+            fi.volume = "bucket".to_string();
+            fi.name = "object".to_string();
+            let version_idx = u128::try_from(idx + 1).expect("test version index should fit u128");
+            fi.version_id = Some(Uuid::from_u128(version_idx));
+            fi.versioned = true;
+            fi.size = 1;
+            fi.mod_time = Some(*mod_time);
+            fi.metadata = metadata;
+
+            meta.add_version(fi).expect("test file metadata should accept object version");
+        }
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn metacache_entry_without_header_ec(mut entry: MetaCacheEntry) -> MetaCacheEntry {
+        let mut cached = entry.cached.take().expect("test entry should have cached metadata");
+        for version in cached.versions.iter_mut() {
+            version.header.ec_m = 0;
+            version.header.ec_n = 0;
+        }
+        entry.metadata = cached.marshal_msg().expect("test file metadata should marshal");
+        entry.cached = Some(cached);
+        entry
+    }
+
+    fn metacache_dir_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// Build an entry holding a single object version with an explicit version id
+    /// and mod_time, so a set of these can model DISJOINT per-disk version sets.
+    fn metacache_entry_single_version(version_u128: u128, mod_time: OffsetDateTime, etag: &str) -> MetaCacheEntry {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), etag.to_string());
+
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.version_id = Some(Uuid::from_u128(version_u128));
+        fi.versioned = true;
+        fi.size = 1;
+        fi.mod_time = Some(mod_time);
+        fi.metadata = metadata;
+
+        let mut meta = FileMeta::new();
+        meta.add_version(fi).expect("test file metadata should accept object version");
+        let encoded = meta.marshal_msg().expect("test file metadata should marshal");
+
+        MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    /// backlog#920: `resolve_union` surfaces a version present on a SINGLE slot
+    /// among four, while `resolve` at read-quorum (obj_quorum=2) drops it. This
+    /// documents the exact sub-quorum durability gap the disk-walk closes.
+    #[test]
+    fn resolve_union_surfaces_single_disk_version() {
+        let t0 = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let t1 = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+
+        // Slot 0 carries a UNIQUE version (0xBEEF) present nowhere else; the other
+        // three slots agree on a shared version (0xCAFE). Read-quorum sees only
+        // the shared one; union must see BOTH.
+        let unique = metacache_entry_single_version(0xBEEF, t1, "unique-etag");
+        let shared_a = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_b = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+        let shared_c = metacache_entry_single_version(0xCAFE, t0, "shared-etag");
+
+        let entries = || {
+            MetaCacheEntries(vec![
+                Some(unique.clone()),
+                Some(shared_a.clone()),
+                Some(shared_b.clone()),
+                Some(shared_c.clone()),
+            ])
+        };
+
+        let union = entries().resolve_union("bucket").expect("union must resolve an entry");
+        let union_meta = union.cached.expect("union entry keeps cached metadata");
+        let union_ids: std::collections::HashSet<Option<Uuid>> =
+            union_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "union must surface the single-slot version: {union_ids:?}"
+        );
+        assert!(
+            union_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "union must also keep the shared version: {union_ids:?}"
+        );
+
+        // Read-quorum resolution (obj_quorum=2) drops the single-slot version.
+        let read_quorum = entries()
+            .resolve(MetadataResolutionParams {
+                obj_quorum: 2,
+                dir_quorum: 2,
+                strict: false,
+                ..Default::default()
+            })
+            .expect("read-quorum must still resolve the shared version");
+        let rq_meta = read_quorum.cached.expect("read-quorum entry keeps cached metadata");
+        let rq_ids: std::collections::HashSet<Option<Uuid>> = rq_meta.versions.iter().map(|v| v.header.version_id).collect();
+        assert!(
+            !rq_ids.contains(&Some(Uuid::from_u128(0xBEEF))),
+            "read-quorum must DROP the single-slot version (the gap): {rq_ids:?}"
+        );
+        assert!(
+            rq_ids.contains(&Some(Uuid::from_u128(0xCAFE))),
+            "read-quorum must keep the shared version: {rq_ids:?}"
+        );
+    }
+
+    #[test]
+    fn discover_heal_candidates_keeps_sub_quorum_versions_and_deduplicates() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let entries = MetaCacheEntries(vec![
+            Some(metacache_entry_single_version(1, now, "one")),
+            Some(metacache_entry_single_version(2, now, "two")),
+            Some(metacache_entry_single_version(2, now, "two")),
+            Some(metacache_entry_single_version(3, now, "three")),
+        ]);
+
+        let discovery = entries.discover_heal_candidates("bucket", 16);
+        let ids: std::collections::HashSet<Uuid> = discovery
+            .candidates
+            .iter()
+            .filter_map(|candidate| candidate.version_id)
+            .collect();
+        assert_eq!(
+            ids,
+            [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(discovery.candidates.len(), 3, "duplicate tied versions must be emitted once");
+        assert_eq!(
+            discovery
+                .candidates
+                .iter()
+                .find(|candidate| candidate.version_id == Some(Uuid::from_u128(2)))
+                .expect("duplicate version should be discovered")
+                .replica_count,
+            2
+        );
+    }
+
+    #[test]
+    fn discover_heal_candidates_does_not_count_duplicate_versions_within_one_entry() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut meta = FileMeta::load(&metacache_entry_single_version(1, now, "duplicate").metadata)
+            .expect("duplicate fixture should decode");
+        meta.versions.push(meta.versions[0].clone());
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: meta.marshal_msg().expect("duplicate metadata should marshal"),
+            cached: Some(meta),
+            reusable: false,
+        };
+
+        let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 16);
+        let candidate = discovery
+            .candidates
+            .iter()
+            .find(|candidate| candidate.version_id == Some(Uuid::from_u128(1)))
+            .expect("duplicate fixture should be discovered");
+        assert_eq!(candidate.replica_count, 1);
+    }
+
+    #[test]
+    fn discover_heal_candidates_covers_divergent_quorum_boundaries_n2_n4_n6() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+
+        for (disk_count, quorum) in [(2usize, 1usize), (4, 2), (6, 3)] {
+            let target_id = Uuid::from_u128(0x1000 + disk_count as u128);
+            for target_replicas in [quorum.saturating_sub(1), quorum, quorum + 1] {
+                let entries = (0..disk_count)
+                    .map(|disk| {
+                        let version_id = if disk < target_replicas {
+                            target_id
+                        } else {
+                            Uuid::from_u128(0x2000 + disk as u128)
+                        };
+                        Some(metacache_entry_single_version(version_id.as_u128(), now, "divergent"))
+                    })
+                    .collect();
+                let discovery = MetaCacheEntries(entries).discover_heal_candidates("bucket", 32);
+                let target = discovery
+                    .candidates
+                    .iter()
+                    .find(|candidate| candidate.version_id == Some(target_id));
+                assert_eq!(target.is_some(), target_replicas > 0, "N={disk_count}, replicas={target_replicas}");
+                if let Some(target) = target {
+                    assert_eq!(target.replica_count, target_replicas);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discover_heal_candidates_separates_delete_markers_and_preserves_unversioned_objects() {
+        let mut marker_meta = FileMeta::new();
+        marker_meta
+            .add_version(FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                version_id: Some(Uuid::from_u128(99)),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+                ..Default::default()
+            })
+            .expect("delete marker should be added");
+        let marker = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: marker_meta.marshal_msg().expect("delete marker metadata should marshal"),
+            cached: Some(marker_meta),
+            reusable: false,
+        };
+
+        let unversioned_entry = metacache_entry_with_mod_time(
+            OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"),
+            "unversioned",
+        );
+        let discovery = MetaCacheEntries(vec![Some(marker), Some(unversioned_entry)]).discover_heal_candidates("bucket", 16);
+        assert!(discovery.candidates.iter().any(|candidate| {
+            candidate.kind == MetaCacheHealCandidateKind::DeleteMarker && candidate.version_id == Some(Uuid::from_u128(99))
+        }));
+        assert!(discovery.candidates.iter().any(|candidate| {
+            candidate.kind == MetaCacheHealCandidateKind::UnversionedObject && candidate.version_id.is_none()
+        }));
+    }
+
+    #[test]
+    fn discover_heal_candidates_rejects_delete_markers_without_ids() {
+        let mut marker_meta = FileMeta::new();
+        marker_meta
+            .add_version(FileInfo {
+                volume: "bucket".to_string(),
+                name: "object".to_string(),
+                deleted: true,
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+                ..Default::default()
+            })
+            .expect("nil delete marker should be added");
+        let discovery = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: marker_meta.marshal_msg().expect("nil marker metadata should marshal"),
+            cached: Some(marker_meta),
+            reusable: false,
+        })])
+        .discover_heal_candidates("bucket", 16);
+
+        assert!(
+            !discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.kind == MetaCacheHealCandidateKind::DeleteMarker)
+        );
+        assert!(discovery.unverified_count >= 1);
+    }
+
+    #[test]
+    fn discover_heal_candidates_skips_free_versions() {
+        let object_id = Uuid::from_u128(100);
+        let free_id = Uuid::from_u128(101);
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(Uuid::from_u128(102)),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("transitioned object should be added");
+        let mut delete = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_id),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        };
+        delete.set_tier_free_version_id(&free_id.to_string());
+        meta.delete_version(&delete).expect("free version should be persisted");
+
+        let discovery = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: meta.marshal_msg().expect("free version metadata should marshal"),
+            cached: Some(meta),
+            reusable: false,
+        })])
+        .discover_heal_candidates("bucket", 16);
+        assert!(discovery.candidates.is_empty());
+    }
+
+    #[test]
+    fn discover_heal_candidates_preserves_unversioned_legacy_object() {
+        let legacy = MetaObjectV1 {
+            version: "1.0.1".to_string(),
+            format: "xl".to_string(),
+            stat: MetaObjectV1Stat {
+                size: 1,
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+                name: "object".to_string(),
+                ..Default::default()
+            },
+            erasure: MetaObjectV1Erasure {
+                data_blocks: 4,
+                parity_blocks: 2,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let version = FileMetaVersion {
+            version_type: VersionType::Legacy,
+            legacy_object: Some(legacy),
+            ..Default::default()
+        };
+        let mut meta = FileMeta::new();
+        meta.versions
+            .push(FileMetaShallowVersion::try_from(version).expect("legacy metadata should marshal"));
+        let discovery = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: meta.marshal_msg().expect("legacy metadata should marshal"),
+            cached: Some(meta),
+            reusable: false,
+        })])
+        .discover_heal_candidates("bucket", 16);
+        assert!(discovery.candidates.iter().any(|candidate| {
+            candidate.kind == MetaCacheHealCandidateKind::UnversionedObject && candidate.version_id.is_none()
+        }));
+    }
+
+    #[test]
+    fn discover_heal_candidates_rejects_nil_and_malformed_metadata_and_is_bounded() {
+        let now = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let mut nil = metacache_entry_single_version(1, now, "nil");
+        let mut nil_meta = FileMeta::load(&nil.metadata).expect("nil fixture should decode");
+        let mut nil_version = nil_meta.versions[0]
+            .parse_version_meta()
+            .expect("nil fixture version should decode");
+        nil_version.object.as_mut().expect("object fixture").version_id = Some(Uuid::nil());
+        nil_meta.versions[0] = FileMetaShallowVersion::try_from(nil_version).expect("nil fixture should marshal");
+        nil.metadata = nil_meta.marshal_msg().expect("nil fixture metadata should marshal");
+
+        let mut mismatched = metacache_entry_single_version(2, now, "mismatched");
+        let mut mismatched_meta = FileMeta::load(&mismatched.metadata).expect("mismatched fixture should decode");
+        mismatched_meta.versions[0].header.version_id = Some(Uuid::from_u128(200));
+        mismatched.metadata = mismatched_meta.marshal_msg().expect("mismatched metadata should marshal");
+
+        let mut short_parts = metacache_entry_single_version(3, now, "short-parts");
+        let mut short_parts_meta = FileMeta::load(&short_parts.metadata).expect("short-parts fixture should decode");
+        let mut short_parts_version = short_parts_meta.versions[0]
+            .parse_version_meta()
+            .expect("short-parts fixture version should decode");
+        let object = short_parts_version.object.as_mut().expect("object fixture");
+        object.part_numbers = vec![1];
+        object.part_actual_sizes = vec![1];
+        object.part_sizes.clear();
+        short_parts_meta.versions[0] = FileMetaShallowVersion::try_from(short_parts_version).expect("short-parts should marshal");
+        short_parts.metadata = short_parts_meta.marshal_msg().expect("short-parts metadata should marshal");
+
+        let mut short_unversioned = metacache_entry_with_mod_time(now, "short-unversioned");
+        let mut short_unversioned_meta =
+            FileMeta::load(&short_unversioned.metadata).expect("short-unversioned fixture should decode");
+        let mut short_unversioned_version = short_unversioned_meta.versions[0]
+            .parse_version_meta()
+            .expect("short-unversioned version should decode");
+        let unversioned_object = short_unversioned_version.object.as_mut().expect("unversioned object fixture");
+        unversioned_object.part_numbers = vec![1];
+        unversioned_object.part_actual_sizes = vec![1];
+        unversioned_object.part_sizes.clear();
+        short_unversioned_meta.versions[0] =
+            FileMetaShallowVersion::try_from(short_unversioned_version).expect("short-unversioned should marshal");
+        short_unversioned.metadata = short_unversioned_meta
+            .marshal_msg()
+            .expect("short-unversioned metadata should marshal");
+
+        let mut malformed = nil.clone();
+        malformed.name = "malformed".to_string();
+        malformed.metadata = vec![1, 2, 3];
+
+        let entries = MetaCacheEntries(
+            std::iter::once(Some(nil))
+                .chain(std::iter::once(Some(mismatched)))
+                .chain(std::iter::once(Some(short_parts)))
+                .chain(std::iter::once(Some(short_unversioned)))
+                .chain(std::iter::once(Some(malformed)))
+                .chain((0..32).map(|id| Some(metacache_entry_single_version(id + 10, now, "bounded"))))
+                .collect(),
+        );
+        let discovery = entries.discover_heal_candidates("bucket", 5);
+        assert!(discovery.candidates.len() <= 5);
+        assert!(discovery.truncated, "bounded discovery must expose dropped candidates");
+        assert!(
+            discovery
+                .truncated_candidates
+                .iter()
+                .all(|candidate| candidate.version_id.is_some()),
+            "overflow candidates must retain exact version identities"
+        );
+        assert!(
+            discovery.truncated_objects.iter().any(|object| object == "object"),
+            "bounded discovery must expose an object-level safe continuation"
+        );
+        assert!(
+            !discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.version_id == Some(Uuid::nil()))
+        );
+        assert!(
+            !discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.version_id == Some(Uuid::from_u128(2)))
+        );
+        assert!(
+            !discovery
+                .candidates
+                .iter()
+                .any(|candidate| candidate.version_id == Some(Uuid::from_u128(3)))
+        );
+        assert!(discovery.candidates.iter().any(|candidate| {
+            candidate.kind == MetaCacheHealCandidateKind::UnversionedObject && candidate.version_id.is_none()
+        }));
+        assert!(
+            discovery.unverified_count >= 1,
+            "malformed and rejected metadata must remain observable during discovery"
+        );
+
+        for invalid_name in [
+            "../object",
+            "./object",
+            "object/../other",
+            "object//name",
+            "object\u{0001}name",
+            "object\0name",
+        ] {
+            let mut entry = metacache_entry_single_version(400, now, invalid_name);
+            entry.name = invalid_name.to_string();
+            let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
+            assert!(
+                discovery.candidates.is_empty(),
+                "invalid key should not become a heal candidate: {invalid_name:?}"
+            );
+        }
+
+        #[cfg(windows)]
+        {
+            let mut entry = metacache_entry_single_version(400, now, "object\\name");
+            entry.name = "object\\name".to_string();
+            assert!(
+                MetaCacheEntries(vec![Some(entry)])
+                    .discover_heal_candidates("bucket", 5)
+                    .candidates
+                    .is_empty(),
+                "backslash is a path separator on Windows"
+            );
+        }
+
+        #[cfg(not(windows))]
+        {
+            let mut entry = metacache_entry_single_version(400, now, "object\\name");
+            entry.name = "object\\name".to_string();
+            assert_eq!(
+                MetaCacheEntries(vec![Some(entry)])
+                    .discover_heal_candidates("bucket", 5)
+                    .candidates
+                    .len(),
+                1,
+                "backslash is object-key data on Unix"
+            );
+        }
+
+        for valid_name in ["trailing/", "prefix/object"] {
+            let mut entry = metacache_entry_single_version(401, now, valid_name);
+            entry.name = valid_name.to_string();
+            let discovery = MetaCacheEntries(vec![Some(entry)]).discover_heal_candidates("bucket", 5);
+            assert_eq!(discovery.candidates.len(), 1, "raw S3 key should remain opaque: {valid_name:?}");
+        }
+    }
+
+    #[test]
+    fn resolve_rejects_partial_latest_and_returns_committed_previous_metadata() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_mod_time(old_mod_time, "old-etag");
+        let new_entry = metacache_entry_with_mod_time(new_mod_time, "new-etag");
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should still satisfy write quorum");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_rejects_low_parity_partial_latest_below_required_object_quorum() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 7, 1);
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_rejects_zero_parity_partial_latest_below_required_object_quorum() {
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 0);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_accepts_low_parity_latest_at_required_object_quorum() {
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry.clone()),
+            Some(new_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("latest metadata should resolve after satisfying its own write quorum");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(new_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new-etag"));
+    }
+
+    #[test]
+    fn resolve_skips_low_parity_partial_latest_and_returns_committed_previous_version() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
+        let new_and_old_entry =
+            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)]);
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should resolve after rejecting partial latest");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_skips_legacy_header_low_parity_partial_latest_using_payload_quorum() {
+        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
+        let new_and_old_entry = metacache_entry_without_header_ec(metacache_entry_with_erasure_versions(&[
+            (old_mod_time, "old-etag", 4, 4),
+            (new_mod_time, "new-etag", 7, 1),
+        ]));
+
+        let resolved = MetaCacheEntries(vec![
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry.clone()),
+            Some(new_and_old_entry),
+            Some(old_entry.clone()),
+            Some(old_entry),
+        ])
+        .resolve_with_write_quorum(MetadataResolutionParams {
+            obj_quorum: 5,
+            requested_versions: 1,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        })
+        .expect("previous committed metadata should resolve after rejecting legacy-header partial latest");
+
+        let info = resolved
+            .to_fileinfo("bucket")
+            .expect("resolved committed metadata should decode as file info");
+        assert_eq!(info.mod_time, Some(old_mod_time));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+    }
+
+    #[test]
+    fn resolve_rejects_partial_directory_below_dir_quorum() {
+        let partial_dir = metacache_dir_entry("prefix/");
+
+        let resolved = MetaCacheEntries(vec![Some(partial_dir.clone()), Some(partial_dir)]).resolve(MetadataResolutionParams {
+            dir_quorum: 5,
+            obj_quorum: 5,
+            bucket: "bucket".to_string(),
+            strict: true,
+            ..Default::default()
+        });
+
+        assert!(resolved.is_none());
     }
 
     fn build_hashmap_cache(update_size: usize) -> Arc<Cache<HashMap<usize, usize>>> {
@@ -1271,5 +2740,98 @@ mod tests {
             .expect_err("refresh error should be propagated when return_last_good is false");
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // backlog#900: metacache boundaries live outside the HTTP CatchPanicLayer
+    // (background / listing chains). A corrupt-part xl.meta must yield Err,
+    // not panic, so it cannot poison a worker.
+    // ------------------------------------------------------------------
+
+    fn corrupt_parts_filemeta() -> FileMeta {
+        use crate::{ChecksumAlgo, ErasureAlgo, MetaObject, VersionType};
+        let mut fm = FileMeta::new();
+        fm.add_version_filemata(FileMetaVersion {
+            version_type: VersionType::Object,
+            object: Some(MetaObject {
+                version_id: Some(Uuid::new_v4()),
+                erasure_algorithm: ErasureAlgo::ReedSolomon,
+                erasure_m: 2,
+                erasure_n: 2,
+                erasure_block_size: 1 << 20,
+                bitrot_checksum_algo: ChecksumAlgo::HighwayHash,
+                part_numbers: vec![1, 2],
+                part_sizes: vec![10], // corrupt: shorter than part_numbers
+                part_actual_sizes: vec![10, 20],
+                mod_time: Some(time::OffsetDateTime::now_utc()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+        .expect("add version");
+        // Round-trip once so the corrupt array survives exactly like on disk.
+        FileMeta::load(&fm.marshal_msg().expect("marshal")).expect("load")
+    }
+
+    #[test]
+    fn metacache_to_fileinfo_returns_err_not_panic_on_corrupt_parts() {
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: Vec::new(),
+            cached: Some(corrupt_parts_filemeta()),
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.to_fileinfo("bucket")));
+        let inner = caught.expect("to_fileinfo must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt from metacache boundary");
+    }
+
+    #[test]
+    fn metacache_file_info_versions_returns_err_not_panic_on_corrupt_parts() {
+        // file_info_versions reads self.metadata (not cached), so fill marshaled bytes.
+        let bytes = corrupt_parts_filemeta().marshal_msg().expect("marshal");
+        let entry = MetaCacheEntry {
+            name: "obj".to_string(),
+            metadata: bytes,
+            cached: None,
+            reusable: false,
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| entry.file_info_versions("bucket")));
+        let inner = caught.expect("file_info_versions must not panic");
+        assert!(matches!(inner, Err(Error::FileCorrupt)), "expected FileCorrupt");
+    }
+
+    #[test]
+    fn metacache_to_fileinfo_ignores_part_checksum_sidecar_regardless_of_cache_state() {
+        let mut meta = FileMeta::load(&create_real_xlmeta().expect("create real xl.meta")).expect("load real xl.meta");
+        let version_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").expect("valid fixture version id");
+        let (index, mut version) = meta.find_version(Some(version_id)).expect("find fixture object version");
+        rustfs_utils::http::insert_bytes(
+            &mut version.object.as_mut().expect("fixture object").meta_sys,
+            rustfs_utils::http::SUFFIX_PART_CHECKSUMS,
+            b"not-json".to_vec(),
+        );
+        meta.versions[index] = FileMetaShallowVersion::try_from(version).expect("replace fixture object version");
+        let encoded = meta.marshal_msg().expect("marshal object metadata");
+
+        let uncached = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded.clone(),
+            cached: None,
+            reusable: false,
+        }
+        .to_fileinfo("bucket")
+        .expect("uncached metacache conversion must stay lazy");
+        let cached = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: encoded,
+            cached: Some(meta),
+            reusable: false,
+        }
+        .to_fileinfo("bucket")
+        .expect("cached metacache conversion must stay lazy");
+
+        assert_eq!(cached, uncached);
+        assert!(cached.parts.iter().all(|part| part.checksums.is_none()));
     }
 }

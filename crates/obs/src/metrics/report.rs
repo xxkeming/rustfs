@@ -15,11 +15,14 @@
 use crate::metrics::schema::{MetricDescriptor, MetricType};
 use metrics::{counter, describe_counter, describe_gauge, describe_histogram, gauge};
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 
 static NAME_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
 static HELP_CACHE: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+/// Metric names already handed to `describe_*!`. The metadata never changes, so
+/// each name is described once instead of on every collection cycle.
+static DESCRIBED: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
 
 fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
     let cache = cache.get_or_init(Default::default);
@@ -34,36 +37,65 @@ fn intern_string(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: 
     }
 }
 
-fn into_static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &str) -> &'static str {
-    intern_string(cache, value)
+/// Resolve a metric name/help `Cow` to a `&'static str`, skipping the intern
+/// lock+leak when it is already borrowed (the common case for statically-named
+/// metrics); only owned strings pay the intern cost.
+// The `&Cow` is intentional: we must inspect the borrowed-vs-owned variant to
+// return the existing `&'static str` without interning, so `&str` will not do.
+#[allow(clippy::ptr_arg)]
+fn static_str(cache: &OnceLock<Mutex<HashMap<String, &'static str>>>, value: &Cow<'static, str>) -> &'static str {
+    match value {
+        Cow::Borrowed(s) => s,
+        Cow::Owned(s) => intern_string(cache, s),
+    }
 }
 
-pub fn report_metrics(metrics: &[PrometheusMetric]) {
-    for metric in metrics {
-        let name = into_static_str(&NAME_CACHE, &metric.name);
-        let help = into_static_str(&HELP_CACHE, &metric.help);
-
-        match metric.metric_type {
+/// Hand a metric name to `describe_*!` only the first time it is seen. The
+/// metadata (help text) never changes, so describing on every collection cycle
+/// only re-locks the recorder's metadata map. The help is resolved lazily, so an
+/// already-described metric costs one `HashSet` probe and nothing else.
+// `&Cow` mirrors `static_str`, which needs the borrowed-vs-owned variant.
+#[allow(clippy::ptr_arg)]
+fn describe_metric_once(name: &'static str, metric_type: MetricType, help: &Cow<'static, str>) {
+    let described = DESCRIBED.get_or_init(Default::default);
+    let mut described = described.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if described.insert(name) {
+        let help = static_str(&HELP_CACHE, help);
+        match metric_type {
             MetricType::Counter => describe_counter!(name, help),
             MetricType::Gauge => describe_gauge!(name, help),
             MetricType::Histogram => describe_histogram!(name, help),
         }
+    }
+}
 
-        let labels: Vec<(String, String)> = metric.labels.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+fn counter_value_from_f64(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
 
+    if value >= u64::MAX as f64 {
+        Some(u64::MAX)
+    } else {
+        Some(value as u64)
+    }
+}
+
+pub fn report_metrics(metrics: &[PrometheusMetric]) {
+    for metric in metrics {
+        let name = static_str(&NAME_CACHE, &metric.name);
+        describe_metric_once(name, metric.metric_type, &metric.help);
+
+        // `metric.labels` is already `[(&'static str, Cow<'static, str>)]`, so emit
+        // straight from it — no per-cycle `Vec<(String, String)>` clone.
         match metric.metric_type {
             MetricType::Counter => {
-                let counter = counter!(name, &labels);
-                counter.absolute(metric.value as u64);
+                if let Some(value) = counter_value_from_f64(metric.value) {
+                    counter!(name, &metric.labels).absolute(value);
+                }
             }
-            MetricType::Gauge => {
-                let gauge = gauge!(name, &labels);
-                gauge.set(metric.value);
-            }
-            MetricType::Histogram => {
-                let histogram = metrics::histogram!(name, &labels);
-                histogram.record(metric.value);
-            }
+            MetricType::Gauge => gauge!(name, &metric.labels).set(metric.value),
+            MetricType::Histogram => metrics::histogram!(name, &metric.labels).record(metric.value),
         }
     }
 }
@@ -113,21 +145,18 @@ impl PrometheusMetric {
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_label(mut self, key: &'static str, value: impl Into<Cow<'static, str>>) -> Self {
         self.labels.push((key, value.into()));
         self
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_label_owned(mut self, key: &'static str, value: String) -> Self {
         self.labels.push((key, Cow::Owned(value)));
         self
     }
 
     #[inline]
-    #[allow(dead_code)]
     pub fn with_labels(mut self, labels: Vec<(&'static str, Cow<'static, str>)>) -> Self {
         self.labels = labels;
         self
@@ -167,5 +196,18 @@ mod tests {
             assert_eq!(metric.name, expected_name);
             assert_eq!(metric.metric_type, metric_type);
         }
+    }
+
+    #[test]
+    fn counter_value_from_f64_rejects_negative_and_nan_inputs() {
+        assert_eq!(counter_value_from_f64(-1.0), None);
+        assert_eq!(counter_value_from_f64(f64::NAN), None);
+        assert_eq!(counter_value_from_f64(f64::NEG_INFINITY), None);
+    }
+
+    #[test]
+    fn counter_value_from_f64_clamps_large_values() {
+        assert_eq!(counter_value_from_f64(42.0), Some(42));
+        assert_eq!(counter_value_from_f64(u64::MAX as f64 * 2.0), Some(u64::MAX));
     }
 }

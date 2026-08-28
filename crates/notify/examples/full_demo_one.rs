@@ -17,14 +17,14 @@ mod base;
 use base::{LogLevel, init_logger};
 use rustfs_config::EnableState::On;
 use rustfs_config::notify::{DEFAULT_TARGET, NOTIFY_MQTT_SUB_SYS, NOTIFY_WEBHOOK_SUB_SYS};
+use rustfs_config::server_config::{Config, KV, KVS};
 use rustfs_config::{
     DEFAULT_LIMIT, ENABLE_KEY, MQTT_BROKER, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_TOPIC, MQTT_USERNAME,
     WEBHOOK_AUTH_TOKEN, WEBHOOK_ENDPOINT, WEBHOOK_QUEUE_DIR, WEBHOOK_QUEUE_LIMIT,
 };
-use rustfs_ecstore::config::{Config, KV, KVS};
 use rustfs_notify::{BucketNotificationConfig, Event, NotificationError};
 use rustfs_notify::{initialize, notification_system};
-use rustfs_s3_common::EventName;
+use rustfs_s3_types::EventName;
 use rustfs_targets::arn::TargetID;
 use std::sync::Arc;
 use std::time::Duration;

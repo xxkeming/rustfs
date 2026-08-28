@@ -30,7 +30,7 @@ use crate::{QueryError, QueryResult};
 
 use super::Query;
 use super::logical_planner::Plan;
-use super::session::SessionCtx;
+use super::session::{QueryExecutionTracker, SessionCtx};
 
 pub struct PhaseTimer {
     phase_name: &'static str,
@@ -117,6 +117,15 @@ impl Output {
         }
     }
 
+    pub fn into_record_batch_stream(self) -> QueryResult<SendableRecordBatchStream> {
+        match self {
+            Self::StreamData(stream) => Ok(stream),
+            Self::Nil(_) => Err(QueryError::NotImplemented {
+                err: "empty select output stream".to_string(),
+            }),
+        }
+    }
+
     pub async fn num_rows(self) -> usize {
         match self.chunk_result().await {
             Ok(rb) => rb.iter().map(|e| e.num_rows()).sum(),
@@ -163,6 +172,7 @@ pub struct QueryStateMachine {
     pub session: SessionCtx,
     pub query: Query,
 
+    query_tracker: Option<QueryExecutionTracker>,
     state: RwLock<QueryState>,
     start: Instant,
 }
@@ -186,9 +196,29 @@ impl QueryStateMachine {
         Self {
             session,
             query,
+            query_tracker: None,
             state: RwLock::new(QueryState::ACCEPTING),
             start: Instant::now(),
         }
+    }
+
+    pub fn begin_tracked(query: Query, session: SessionCtx, query_tracker: QueryExecutionTracker) -> QueryResult<Self> {
+        if !session.is_bound_to(&query_tracker) {
+            return Err(QueryError::Cancel);
+        }
+        let mut state_machine = Self::begin(query, session);
+        state_machine.query_tracker = Some(query_tracker);
+        Ok(state_machine)
+    }
+
+    pub fn query_tracker(&self) -> Option<&QueryExecutionTracker> {
+        self.query_tracker.as_ref()
+    }
+
+    pub fn tracker_matches_session(&self) -> bool {
+        self.query_tracker
+            .as_ref()
+            .is_some_and(|query_tracker| self.session.is_bound_to(query_tracker))
     }
 
     pub fn begin_analyze(&self) {
@@ -219,17 +249,14 @@ impl QueryStateMachine {
     }
 
     pub fn finish(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FINISHED));
     }
 
     pub fn cancel(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::CANCELLED));
     }
 
     pub fn fail(&self) {
-        // TODO
         self.translate_to(QueryState::DONE(DONE::FAILED));
     }
 

@@ -19,6 +19,7 @@ impl FileMeta {
         !matches!(Self::check_xl2_v1(buf), Err(_e))
     }
 
+    #[hotpath::measure(impl_type = "FileMeta")]
     pub fn load(buf: &[u8]) -> Result<FileMeta> {
         let mut xl = FileMeta::default();
         xl.unmarshal_msg(buf)?;
@@ -43,12 +44,17 @@ impl FileMeta {
     }
 
     pub fn check_xl2_v1(buf: &[u8]) -> Result<(&[u8], u16, u16)> {
+        // A file too short to hold the XL2 magic, or one that carries the
+        // wrong magic, is not merely unreadable — it is affirmative evidence
+        // of a torn or foreign write. Classify it as FileCorrupt so quorum
+        // and listing code can distinguish deterministic damage from
+        // transient IO faults (issue #5716).
         if buf.len() < 8 {
-            return Err(Error::other("xl file header not exists"));
+            return Err(Error::FileCorrupt);
         }
 
         if buf[0..4] != XL_FILE_HEADER {
-            return Err(Error::other("xl file header err"));
+            return Err(Error::FileCorrupt);
         }
 
         let major = byteorder::LittleEndian::read_u16(&buf[4..6]);
@@ -91,7 +97,20 @@ impl FileMeta {
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
         if crc != meta_crc {
-            return Err(Error::other("xl file crc check failed"));
+            error!(
+                event = "filemeta_xl_crc_mismatch",
+                component = "filemeta",
+                expected_crc = meta_crc,
+                actual_crc = crc,
+                "xl.meta payload failed its CRC check"
+            );
+            // Error::FileCorrupt, not a generic error, for the same reason
+            // check_xl2_v1 classifies a bad magic as FileCorrupt: heal
+            // classification (should_heal_object_on_disk) recognises
+            // corruption only by the DiskError::FileCorrupt variant this
+            // converts to. As a generic error the drive is skipped,
+            // heal_object reports ok, and on-disk bitrot is never repaired.
+            return Err(Error::FileCorrupt);
         }
 
         Ok((meta, inline_data))
@@ -111,14 +130,12 @@ impl FileMeta {
         Ok((bin_len, remaining))
     }
 
+    #[hotpath::measure(impl_type = "FileMeta")]
     pub fn unmarshal_msg(&mut self, buf: &[u8]) -> Result<u64> {
         let i = buf.len() as u64;
 
         // check version, buf = buf[8..]
-        let (buf, _, _) = Self::check_xl2_v1(buf).map_err(|e| {
-            error!("failed to check XL2 v1 format: {}", e);
-            e
-        })?;
+        let (buf, _, _) = Self::check_xl2_v1(buf)?;
 
         if buf.len() < 5 {
             error!(
@@ -156,8 +173,16 @@ impl FileMeta {
         let meta_crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
 
         if crc != meta_crc {
-            error!("xl file crc check failed: expected CRC {:#x}, got {:#x}", meta_crc, crc);
-            return Err(Error::other("xl file crc check failed"));
+            error!(
+                event = "filemeta_xl_crc_mismatch",
+                component = "filemeta",
+                expected_crc = meta_crc,
+                actual_crc = crc,
+                "xl.meta payload failed its CRC check"
+            );
+            // See is_indexed_meta: the FileCorrupt variant is what makes heal
+            // classify this drive as needing metadata repair.
+            return Err(Error::FileCorrupt);
         }
 
         if !buf.is_empty() {
@@ -179,6 +204,22 @@ impl FileMeta {
 
             self.meta_ver = meta_ver;
 
+            // `versions_len` is decoded from a potentially corrupted buffer.
+            // Every version contributes at least two msgpack bin headers to
+            // `meta`, so a count larger than the remaining bytes is corrupt;
+            // reject it before sizing any allocation from it (rustfs/rustfs#2715).
+            if versions_len > meta.len() {
+                error!(
+                    "corrupt xl.meta: version count {} exceeds remaining metadata size {}",
+                    versions_len,
+                    meta.len()
+                );
+                return Err(Error::other(format!(
+                    "corrupt xl.meta: version count {versions_len} exceeds metadata size {}",
+                    meta.len()
+                )));
+            }
+
             self.versions = Vec::with_capacity(versions_len);
 
             let mut cur: Cursor<&[u8]> = Cursor::new(meta);
@@ -188,6 +229,11 @@ impl FileMeta {
                     Error::other(format!("failed to read binary length for version header: {e}"))
                 })? as usize;
 
+                let remaining = meta.len().saturating_sub(cur.position() as usize);
+                if bin_len > remaining {
+                    error!("corrupt xl.meta: version header length {} exceeds remaining {} bytes", bin_len, remaining);
+                    return Err(Error::other("corrupt xl.meta: version header length exceeds metadata size"));
+                }
                 let mut header_buf = vec![0u8; bin_len];
 
                 cur.read_exact(&mut header_buf)?;
@@ -203,6 +249,14 @@ impl FileMeta {
                     Error::other(format!("failed to read binary length for version metadata: {e}"))
                 })? as usize;
 
+                let remaining = meta.len().saturating_sub(cur.position() as usize);
+                if bin_len > remaining {
+                    error!(
+                        "corrupt xl.meta: version metadata length {} exceeds remaining {} bytes",
+                        bin_len, remaining
+                    );
+                    return Err(Error::other("corrupt xl.meta: version metadata length exceeds metadata size"));
+                }
                 let mut ver_meta_buf = vec![0u8; bin_len];
                 cur.read_exact(&mut ver_meta_buf)?;
 
@@ -242,14 +296,18 @@ impl FileMeta {
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
-            let header_buf = &buf[start..end];
+            let header_buf = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("corrupt xl.meta: version header segment out of range"))?;
 
             cur.set_position(end as u64);
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
-            let ver_meta_buf = &buf[start..end];
+            let ver_meta_buf = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("corrupt xl.meta: version metadata segment out of range"))?;
 
             cur.set_position(end as u64);
 
@@ -291,6 +349,7 @@ impl FileMeta {
         }
     }
 
+    #[hotpath::measure(impl_type = "FileMeta")]
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut wr = Vec::new();
 

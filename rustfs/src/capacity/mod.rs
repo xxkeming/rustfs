@@ -32,7 +32,6 @@
 //! - `RUSTFS_CAPACITY_SAMPLE_RATE` - Sampling rate for metrics (default: 200)
 //! - `RUSTFS_CAPACITY_METRICS_INTERVAL` - Metrics summary logging interval (default: 600s)
 //! - `RUSTFS_CAPACITY_FOLLOW_SYMLINKS` - Follow symlinks during traversal (default: false)
-//! - `RUSTFS_CAPACITY_MAX_SYMLINK_DEPTH` - Max symlink depth (default: 3)
 //! - `RUSTFS_CAPACITY_ENABLE_DYNAMIC_TIMEOUT` - Enable dynamic timeout (default: true)
 //! - `RUSTFS_CAPACITY_MIN_TIMEOUT` - Minimum timeout (default: 2s)
 //! - `RUSTFS_CAPACITY_MAX_TIMEOUT` - Maximum timeout (default: 15s)
@@ -54,6 +53,6 @@ pub mod capacity_integration;
 pub mod service;
 
 pub use service::{
-    capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,
-    refresh_or_join_admin_disks, resolve_admin_used_capacity, spawn_refresh_if_needed_admin_disks,
+    capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks,
+    init_capacity_management_for_local_disks_managed, record_capacity_write,
 };

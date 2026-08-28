@@ -1,118 +1,255 @@
-# RustFS Agent Instructions (Global)
+# RustFS Agent Instructions
 
-This root file keeps repository-wide rules only.
-Use the nearest subdirectory `AGENTS.md` for path-specific guidance.
+This file contains repository-wide rules. Use the nearest subdirectory
+`AGENTS.md` for path-specific invariants.
 
-## Rule Precedence
+## Precedence
 
 1. System/developer instructions.
-2. Current user/task instructions.
-3. The nearest `AGENTS.md` in the current path.
-4. This file (global defaults).
+2. The current user request.
+3. The nearest `AGENTS.md`.
+4. This file.
 
-If repo-level instructions conflict, follow the nearest file and keep behavior aligned with CI.
+## Operating Model
 
-## Execution Discipline
+- Inquiry, diagnosis, review, and planning tasks are read-only unless the user
+  explicitly requests changes.
+- For implementation, read the relevant code, tests, and local guidance, then
+  make the smallest change that satisfies the request.
+- State assumptions only when they affect behavior or verification. Ask only
+  when a wrong assumption would materially change the result.
+- Do not load every skill or inspect unrelated modules preemptively. Select a
+  skill only when its description directly matches the request or changed
+  surface.
+- Avoid repeated reads and equivalent verification commands once enough
+  evidence exists.
 
-- Read the relevant existing code, tests, and local guidance before changing behavior.
-- State assumptions when they affect the implementation or verification path.
-- If a task has multiple plausible interpretations, list the options briefly and choose the narrowest reasonable path; ask when the ambiguity would make the change risky.
-- For multi-step work, keep the plan minimal and tied to verifiable outcomes.
-- Avoid redundant file reads, repeated commands, and unnecessary exploratory work once enough context is available.
-- A good result is a minimal diff with clear assumptions, no over-engineering, and independent verification.
+## Worktree and Disk Hygiene
 
-## Communication and Language
+- Start implementation from the latest `origin/main` and confirm the requested
+  change is not already present.
+- An existing clean, isolated task worktree is sufficient. Create another
+  worktree only when the current checkout is shared, dirty with unrelated work,
+  or belongs to another task.
+- Never commit from a shared checkout. Use an `overtrue/` feature branch unless
+  the user requests another name.
+- Check free space before artifact-heavy builds, tests, coverage, or downloads.
+  Re-check before a broad gate when space is tight.
+- Remove only task-owned temporary/build artifacts. Never delete another task's
+  worktree or uncommitted data.
+- At handoff, mention disk or cleanup details only when they affected execution
+  or artifacts/worktrees remain intentionally.
 
-- Respond in the same language used by the requester.
-- Keep source code, comments, commit messages, and PR title/body in English.
-- Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
+## Change Style
 
-## Skill Usage
+- Preserve existing control flow unless changing it is required for correctness.
+- Prefer a direct local edit over new files, wrappers, managers, or speculative
+  abstractions.
+- Add a helper only when it removes current duplication, names a real domain
+  boundary, or isolates a non-trivial invariant.
+- Remove an in-scope path superseded by the change. If compatibility requires it,
+  adapt at the boundary to one canonical core and use the repository's
+  `RUSTFS_COMPAT_TODO` policy.
+- Comments explain non-obvious invariants or reasons. Do not narrate code or
+  record change history.
+- Mention unrelated problems when useful; do not fix them in a narrow task.
 
-- Do not use the `rust-refactor-helper` skill in any scenario.
+## Reuse and Boundary Rules
 
-## Change Style for Existing Logic
-
-- Prefer direct, local code over extracting one-off helpers.
-- Extract a helper only when logic is reused or the extraction materially clarifies a non-trivial flow.
-- Solve only the requested problem; do not add speculative features, configurability, or adjacent improvements.
-- Prefer editing existing code over rewriting files or reshaping unrelated logic.
-- Modify only what is required and remove only artifacts introduced by your own changes.
-- Preserve the existing control-flow and logic shape when fixing bugs or addressing review comments, especially in init, distributed coordination, locking, metadata, and concurrency paths.
-- Do not refactor existing code only to make it easier to unit test.
-- Keep fixes narrowly aligned with the requested behavior; avoid semantic-adjacent rewrites while touching sensitive paths.
-- Keep code elegant, concise, and direct. Prefer minimal, readable implementations over over-engineering and excessive abstraction. Use comments to clarify non-obvious intent and invariants, not to compensate for unclear code.
-- Mention unrelated issues when useful, but do not fix them as part of a narrow task.
-
-## Constant and String Usage
-
-- Before introducing new string literals, search for existing constants/enums that already represent the same semantic value.
-- Reuse existing constants for protocol labels, error identifiers, header keys, event names, metric names, command tags, and similar fixed tokens.
-- If a new string is truly unique, define a local constant near related logic and avoid scattering the literal across multiple sites.
-- When changing existing behavior, keep naming and format consistency by aligning with established project constants.
+- Before adding helpers, constants, fixtures, or wrappers, search the touched
+  crate, the domain-owning crate, `crates/utils`, `crates/common`, and relevant
+  direct dependencies.
+- Reuse requires matching semantics: normalization, error types, deadlines,
+  durability, and compatibility must fit the call site. A narrowly named local
+  helper is better than forced reuse with different semantics.
+- Validate untrusted input at its trust boundary, then trust the validated type.
+  Values crossing disk, RPC, persistence, or version boundaries remain
+  untrusted at every consumer.
+- Re-check boundary values immediately before destructive actions such as
+  delete, overwrite, or quorum decisions.
+- Every new branch needs a concrete triggering input/state. For decoded or peer
+  data, corruption and mixed-version input are valid triggers.
+- Required values must return a typed error when absent or corrupt; do not use a
+  default that converts corruption into a plausible result.
+- Attach error context once where it is actionable. Do not erase typed errors
+  below aggregation or quorum layers.
 
 ## Sources of Truth
 
-- Workspace layout and crate membership: `Cargo.toml` (`[workspace].members`)
-- Local quality commands: `Makefile` and `.config/make/`
-- CI quality gates: `.github/workflows/ci.yml`
-- PR template: `.github/pull_request_template.md`
+- Workspace membership: `Cargo.toml`.
+- Local gates: `Makefile` and `.config/make/`.
+- CI gates: `.github/workflows/ci.yml`.
+- PR format: `.github/pull_request_template.md`.
+- Architecture routing: `ARCHITECTURE.md` and `docs/architecture/README.md`.
+- Agent skills: `.agents/skills/*/SKILL.md`.
 
-Avoid duplicating long crate lists or command matrices in instruction files.
-Reference the source files above instead.
+Do not commit one-shot plans, trackers, migration ledgers, benchmark snapshots,
+or agent scratch notes. Durable architecture belongs under `docs/architecture/`,
+operations under `docs/operations/`, and testing references under
+`docs/testing/`. `scripts/check_no_planning_docs.sh` enforces this boundary.
 
-## Verification Before PR
+## Verification
 
-Convert changes into independently verifiable outcomes. Prefer focused tests for behavior changes and run the relevant checks before declaring completion.
+Select checks from the final task-owned diff. Scoped `AGENTS.md` files may add a
+concrete path-specific check, but must not replace this tiering with a generic
+full-workspace gate.
 
-For code changes, run and pass the following before opening a PR:
+### Documentation and Instructions
 
-```bash
-make pre-commit
-```
+For prose, comments, agent instructions, and skill metadata that cannot affect
+runtime/build output:
 
-Before pushing code changes, make sure formatting is clean:
+- Run `git diff --check`.
+- Run the relevant documentation guard or skill validator when applicable.
+- Skip Cargo formatting, compilation, Clippy, tests, `make pre-commit`, and
+  `make pre-pr`.
 
-- Run `cargo fmt --all`.
-- Run `cargo fmt --all --check` and ensure no files are modified unexpectedly.
+### Non-Behavioral Source Changes
 
-If `make` is unavailable, run the equivalent checks defined under `.config/make/`.
-Documentation-only or instruction-only changes are exempt from the verification commands above (including the `.config/make/` equivalents), though any installed git pre-commit hooks (for example, from `make setup-hooks`) may still run on commit unless explicitly skipped.
-After build-based verification completes, clean generated build artifacts before wrapping up to avoid unnecessary disk usage.
-Do not open a PR with code changes when the required checks fail.
+- Run the formatter/validator for the changed language.
+- Add compilation or doctests only when syntax or executable examples changed.
+
+### Localized Behavior Changes
+
+- Run `cargo fmt --all --check` for Rust changes.
+- Run the narrowest test that exercises the changed behavior.
+- Add package-scoped `cargo check` or Clippy only for targets, features, public
+  APIs, error handling, or control flow not compiled by the focused test.
+- Use `make pre-commit` only when its repository-wide fast checks add confidence
+  beyond the focused checks.
+
+### Broad or High-Risk Changes
+
+After the required adversarial review, run `make pre-pr` when targeted coverage
+cannot bound the impact, including dependency/toolchain/build-matrix changes,
+unbounded cross-crate APIs, or locking, durability, erasure coding, replication,
+RPC, IAM/KMS/auth, cryptography, on-disk/on-wire, and S3-visible behavior.
+
+`make pre-pr` includes `make pre-commit`; never run both for the same unchanged
+diff. Do not repeat a check already covered by a successful umbrella gate.
+Rerun only checks affected by later edits.
+
+Never weaken a gate to get green: do not add baselines/allowances, suppress
+lints, ignore tests, or relax assertions unless changing that policy is itself
+the reviewed task. Follow `docs/testing/README.md` for flaky tests.
+
+## Adversarial Validation
+
+Adversarial validation applies to final implementation diffs, explicitly
+requested adversarial/design reviews, and agent-instruction changes that alter
+execution. Ordinary questions, diagnoses, status reports, non-adversarial code
+reviews, and low-risk planning do not trigger it.
+
+Risk and review shape:
+
+- **Exempt:** documentation, comments, formatting, or typos with no runtime,
+  build, test, or agent-execution effect.
+- **Mechanical:** renames, moves, test/tooling-only changes, and agent-rule
+  changes. Run correctness and simplicity lenses.
+- **Standard:** localized behavior changes. Run one integrated final-diff pass
+  covering correctness, simplicity, and test coverage; add only domain lenses
+  matched by the diff.
+- **High risk / substantial PR review:** high risk includes locking,
+  erasure/quorum/heal, replication, multipart, RPC, lifecycle/tiering,
+  persistence/fsync, IAM/KMS/auth, cryptography, on-disk/on-wire formats, and
+  S3-visible semantics. Cover all applicable lenses using exactly two
+  independent reviewers when delegation is explicitly authorized. Split the
+  lenses between them. Otherwise perform two fresh sequential passes.
+
+Available domain lenses are security, concurrency/durability, compatibility,
+and performance. Select `.agents/skills/adversarial-validation/SKILL.md` for an
+explicit adversarial request, a high-risk change, or a substantial PR review;
+then read only its matching role references. A routine standard pass does not
+load the playbook unless the reviewer needs a RustFS-specific probe.
+
+A finding must name a concrete input/state/interleaving and wrong outcome, or a
+specific missing regression check, with `file:line`. Resolve it by fixing the
+diff or rebutting it with code-path/test/invariant evidence. After a non-trivial
+fix, rerun only affected lenses.
+
+For high-risk PRs, record one concise verdict per covered lens in the PR body.
+
+## Pull Request Lifecycle
+
+- Creating or updating a PR includes one immediate snapshot of checks,
+  mergeability, reviews, and unresolved threads.
+- Unless the user explicitly requests monitoring, a release workflow requires
+  it, or an automation already owns it, hand off after the PR is open with the
+  current state and next event to watch. Do not delay ordinary handoff with
+  fixed quiet-period sleeps.
+- For requested monitoring, use event-driven or bounded waits. Report only state
+  changes, actionable failures, or a meaningful prolonged delay.
+- Investigate failures/comments before changing code. Fix task-attributable
+  issues, rerun affected verification, push, reply or resolve the thread, then
+  resume the requested monitor.
+- Never merge without required reviewer approval or explicit authority.
+- After an observed merge, verify the commit reached the base, then clean the
+  task worktree/branch when safe. Preserve unmerged work for closed PRs unless
+  deletion was explicitly authorized.
 
 ## Git and PR Baseline
 
-- Use feature branches based on the latest `main`.
-- Follow Conventional Commits, with subject length <= 72 characters.
-- Keep PR title and description in English.
-- Use `.github/pull_request_template.md` and keep all section headings.
-- Use `N/A` for non-applicable template sections.
-- Include verification commands in the PR description.
-- When using `gh pr create`/`gh pr edit`, use `--body-file` instead of inline `--body` for multiline markdown.
-- Do not include the literal sequence `\n` in any GitHub issue, pull request, or discussion comment.
-- After fixing code review comments or CI findings, always mark corresponding review
-  comments/threads as resolved before returning to the user.
-- In handling review comments, confirm the underlying issue before changing code.
-  If a suggested change is not appropriate for behavior or risk, reply with a
-  concise rationale instead of blindly applying it.
+- Follow Conventional Commits; keep the subject at most 72 characters.
+- Source comments, commits, PR titles, and PR bodies are in English.
+- Keep every heading from `.github/pull_request_template.md`; use `N/A` where
+  needed and include commands actually run.
+- Use `--body-file` for multiline `gh pr create`/`gh pr edit` content.
+- PR/issue/discussion content must not contain the literal sequence `\n` or
+  hard-wrapped prose paragraphs.
+- Do not include local absolute paths or tool-specific labels/prefixes in GitHub
+  content.
+- Resolve review threads after the underlying issue is fixed. If declining a
+  suggestion, reply with a short evidence-based reason.
 
 ## Security Baseline
 
 - Never commit secrets, credentials, or key material.
 - Use environment variables or vault tooling for sensitive configuration.
-- For localhost-sensitive tests, verify proxy settings to avoid traffic leakage.
+- For localhost-sensitive tests, bypass proxies explicitly.
+- Untrusted S3 XML/JSON, lifecycle, policy, replication, and RPC structures use
+  strict deserialization where compatibility permits. Security-critical
+  defaults require explicit validation.
 
-## Scoped Guidance in This Repository
+## Logging
 
-- `.github/AGENTS.md`
-- `crates/AGENTS.md`
-- `crates/config/AGENTS.md`
-- `crates/ecstore/AGENTS.md`
-- `crates/e2e_test/AGENTS.md`
-- `crates/iam/AGENTS.md`
-- `crates/kms/AGENTS.md`
-- `crates/policy/AGENTS.md`
-- `crates/targets/AGENTS.md`
-- `rustfs/src/admin/AGENTS.md`
-- `rustfs/src/storage/AGENTS.md`
+For every added or edited `tracing` call:
+
+- Reuse the module's `EVENT_*`, `LOG_COMPONENT_*`, and `LOG_SUBSYSTEM_*`
+  constants and field shape.
+- Put fields first and a short label last.
+- Use `error` for behavior/security failure, `warn` for degradation/fallback,
+  `info` for low-frequency lifecycle, `debug` for diagnostics, and `trace` for
+  repetitive request/object success paths.
+- Never log secrets, credential payloads, or merged configs.
+
+Use `.agents/skills/rustfs-logging-governance/SKILL.md` for logging changes.
+
+## Cross-Cutting Storage Invariants
+
+- Write internal object metadata under both `x-rustfs-internal-<suffix>` and
+  `x-minio-internal-<suffix>` using
+  `crates/utils/src/http/metadata_compat.rs` helpers.
+- Read binary UUID metadata with
+  `.and_then(|v| Uuid::from_slice(&v).ok()).filter(|u| !u.is_nil())`; absent,
+  empty, and nil all mean no value.
+- Remote-tier version `None` or `""` means an unversioned bucket; send no
+  `versionId` on tier GET/DELETE.
+- `DataUsageCacheInfo` and `DataUsageEntry` keep their hand-written map
+  serialization and new fields remain `#[serde(default)]` for older readers.
+
+## Naming
+
+Use Rust API naming: `SCREAMING_SNAKE_CASE` constants/statics, `snake_case`
+functions/variables, and `PascalCase` types. Do not rename unrelated existing
+violations.
+
+## Scoped Guidance
+
+Before editing, locate the nearest instructions with:
+
+```bash
+git ls-files '*AGENTS.md'
+```
+
+The nearest file wins for domain invariants. Keep generic workflow and
+validation policy in this root file.

@@ -12,29 +12,107 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
-    StoreError, Target, TargetLog,
+    StoreError, Target,
     arn::TargetID,
     error::TargetError,
-    store::{Key, QueueStore, Store},
+    runtime::tls::{
+        ReloadableTargetTls, TargetTlsInputSet, TlsReloadAdapter, config::ReloadApplyMode, fingerprint::TargetTlsGeneration,
+        validate::validate_tls_material,
+    },
+    store::{Key, Store},
     target::{
         ChannelTargetType, EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliveryCounters, TargetDeliverySnapshot,
-        TargetType, queue_store_subdir_name,
+        TargetTlsState, TargetType, build_queued_payload, build_target_tls_fingerprint, is_connectivity_error,
+        open_target_queue_store, persist_queued_payload_to_store,
     },
 };
 use async_trait::async_trait;
-use rustfs_config::audit::AUDIT_STORE_EXTENSION;
-use rustfs_config::notify::NOTIFY_STORE_EXTENSION;
-use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
-use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SecurityConfig};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
-use std::{marker::PhantomData, path::PathBuf, sync::Arc, time::Duration};
+use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError, KafkaCode};
+use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SaslConfig, SecurityConfig};
+use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::{fmt, future::Future, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
 
+pub(crate) const KAFKA_SASL_PLAIN: &str = "PLAIN";
+pub(crate) const KAFKA_SASL_SCRAM_SHA_256: &str = "SCRAM-SHA-256";
+pub(crate) const KAFKA_SASL_SCRAM_SHA_512: &str = "SCRAM-SHA-512";
+const KAFKA_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct KafkaDeliveryAttempt<'a> {
+    armed: bool,
+    poisoned: &'a AtomicBool,
+}
+
+impl KafkaDeliveryAttempt<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for KafkaDeliveryAttempt<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.poisoned.store(true, Ordering::Release);
+        }
+    }
+}
+
+fn kafka_delivery_timeout() -> TargetError {
+    TargetError::Timeout(format!("Kafka delivery timed out after {KAFKA_DELIVERY_TIMEOUT:?}"))
+}
+
+async fn with_serialized_kafka_delivery<P, T, Select, SelectFuture, Deliver, DeliveryFuture, Invalidate, InvalidateFuture>(
+    delivery_lock: &Mutex<()>,
+    delivery_poisoned: &AtomicBool,
+    select_producer: Select,
+    deliver: Deliver,
+    invalidate: Invalidate,
+) -> Result<T, TargetError>
+where
+    P: Send,
+    T: Send,
+    Select: FnOnce() -> SelectFuture + Send,
+    SelectFuture: Future<Output = Result<P, TargetError>> + Send,
+    Deliver: FnOnce(P) -> DeliveryFuture + Send,
+    DeliveryFuture: Future<Output = Result<T, TargetError>> + Send,
+    Invalidate: Fn() -> InvalidateFuture + Send,
+    InvalidateFuture: Future<Output = ()> + Send,
+{
+    let deadline = tokio::time::Instant::now() + KAFKA_DELIVERY_TIMEOUT;
+    let _delivery_guard = tokio::time::timeout_at(deadline, delivery_lock.lock())
+        .await
+        .map_err(|_| kafka_delivery_timeout())?;
+    let mut attempt = KafkaDeliveryAttempt {
+        armed: true,
+        poisoned: delivery_poisoned,
+    };
+
+    if delivery_poisoned.load(Ordering::Acquire) {
+        tokio::time::timeout_at(deadline, invalidate())
+            .await
+            .map_err(|_| kafka_delivery_timeout())?;
+        delivery_poisoned.store(false, Ordering::Release);
+    }
+
+    let result = tokio::time::timeout_at(deadline, async { deliver(select_producer().await?).await })
+        .await
+        .map_err(|_| kafka_delivery_timeout())?;
+    if result.as_ref().is_err_and(is_connectivity_error) {
+        tokio::time::timeout_at(deadline, invalidate())
+            .await
+            .map_err(|_| kafka_delivery_timeout())?;
+        delivery_poisoned.store(false, Ordering::Release);
+    }
+    attempt.disarm();
+    result
+}
+
 /// Arguments for configuring a Kafka target
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct KafkaArgs {
     /// Whether the target is enabled
     pub enable: bool,
@@ -52,12 +130,72 @@ pub struct KafkaArgs {
     pub tls_client_cert: String,
     /// Optional path to client private key for mTLS
     pub tls_client_key: String,
+    /// Whether to enable SASL authentication over the TLS transport
+    pub sasl_enable: bool,
+    /// SASL mechanism (PLAIN, SCRAM-SHA-256, or SCRAM-SHA-512)
+    pub sasl_mechanism: String,
+    /// SASL username
+    pub sasl_username: String,
+    /// SASL password
+    pub sasl_password: String,
     /// The directory to store events in case of failure
     pub queue_dir: String,
     /// The maximum number of events to store
     pub queue_limit: u64,
     /// The target type (audit or notify)
     pub target_type: TargetType,
+}
+
+impl fmt::Debug for KafkaArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("KafkaArgs")
+            .field("enable", &self.enable)
+            .field("brokers", &self.brokers)
+            .field("topic", &self.topic)
+            .field("acks", &self.acks)
+            .field("tls_enable", &self.tls_enable)
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_client_cert", &self.tls_client_cert)
+            .field(
+                "tls_client_key",
+                if self.tls_client_key.is_empty() {
+                    &""
+                } else {
+                    &"***REDACTED***"
+                },
+            )
+            .field("sasl_enable", &self.sasl_enable)
+            .field("sasl_mechanism", &self.sasl_mechanism)
+            .field("sasl_username", &self.sasl_username)
+            .field(
+                "sasl_password",
+                if self.sasl_password.is_empty() {
+                    &""
+                } else {
+                    &"***REDACTED***"
+                },
+            )
+            .field("queue_dir", &self.queue_dir)
+            .field("queue_limit", &self.queue_limit)
+            .field("target_type", &self.target_type)
+            .finish()
+    }
+}
+
+fn normalize_kafka_sasl_mechanism(mechanism: &str) -> Result<&'static str, TargetError> {
+    let mechanism = mechanism.trim();
+    if mechanism.is_empty() || mechanism.eq_ignore_ascii_case(KAFKA_SASL_PLAIN) {
+        return Ok(KAFKA_SASL_PLAIN);
+    }
+    if mechanism.eq_ignore_ascii_case(KAFKA_SASL_SCRAM_SHA_256) {
+        return Ok(KAFKA_SASL_SCRAM_SHA_256);
+    }
+    if mechanism.eq_ignore_ascii_case(KAFKA_SASL_SCRAM_SHA_512) {
+        return Ok(KAFKA_SASL_SCRAM_SHA_512);
+    }
+    Err(TargetError::Configuration(
+        "kafka sasl_mechanism must be one of: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512".to_string(),
+    ))
 }
 
 impl KafkaArgs {
@@ -85,6 +223,24 @@ impl KafkaArgs {
             ));
         }
 
+        if self.sasl_enable {
+            if !self.tls_enable {
+                return Err(TargetError::Configuration(
+                    "kafka sasl_enable requires tls_enable for SASL_SSL".to_string(),
+                ));
+            }
+            normalize_kafka_sasl_mechanism(&self.sasl_mechanism)?;
+            if self.sasl_username.is_empty() || self.sasl_password.is_empty() {
+                return Err(TargetError::Configuration(
+                    "kafka sasl_username and sasl_password must be specified when sasl_enable is true".to_string(),
+                ));
+            }
+        } else if !self.sasl_mechanism.is_empty() || !self.sasl_username.is_empty() || !self.sasl_password.is_empty() {
+            return Err(TargetError::Configuration(
+                "kafka sasl_enable must be true when SASL fields are specified".to_string(),
+            ));
+        }
+
         if !self.queue_dir.is_empty() {
             let path = std::path::Path::new(&self.queue_dir);
             if !path.is_absolute() {
@@ -94,37 +250,96 @@ impl KafkaArgs {
 
         Ok(())
     }
+
+    pub(crate) fn security_config(&self, validate_tls_files: bool) -> Result<Option<SecurityConfig>, TargetError> {
+        if !self.tls_enable && !self.sasl_enable {
+            return Ok(None);
+        }
+
+        let mut security = SecurityConfig::new();
+        if !self.tls_ca.is_empty() {
+            if validate_tls_files {
+                let certs = load_cert_bundle_der_bytes(&self.tls_ca)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_ca: {e}")))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_ca did not contain any parsable certificates".to_string(),
+                    ));
+                }
+            }
+            security = security.with_ca_cert(self.tls_ca.clone());
+        }
+        if !self.tls_client_cert.is_empty() && !self.tls_client_key.is_empty() {
+            if validate_tls_files {
+                let certs = load_cert_bundle_der_bytes(&self.tls_client_cert)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_client_cert: {e}")))?;
+                if certs.is_empty() {
+                    return Err(TargetError::Configuration(
+                        "Kafka tls_client_cert did not contain any parsable certificates".to_string(),
+                    ));
+                }
+                let _ = load_private_key(&self.tls_client_key)
+                    .map_err(|e| TargetError::Configuration(format!("Failed to parse Kafka tls_client_key: {e}")))?;
+            }
+            security = security.with_client_cert(self.tls_client_cert.clone(), self.tls_client_key.clone());
+        }
+        if self.sasl_enable {
+            security = security.with_sasl(SaslConfig::new(
+                normalize_kafka_sasl_mechanism(&self.sasl_mechanism)?.to_string(),
+                self.sasl_username.clone(),
+                self.sasl_password.clone(),
+            ));
+        }
+
+        Ok(Some(security))
+    }
 }
 
 /// A target that sends events to an Apache Kafka topic
 pub struct KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: KafkaArgs,
     store: Option<Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>>,
     producer: Arc<Mutex<Option<Arc<AsyncProducer>>>>,
+    delivery_lock: Arc<Mutex<()>>,
+    delivery_poisoned: Arc<AtomicBool>,
+    tls_state: Arc<Mutex<TargetTlsState>>,
+    /// Adapter that bridges this target to the TLS reload coordinator.
+    /// When `Some`, the target uses coordinator-managed material; when `None`,
+    /// it falls back to inline fingerprint-based change detection.
+    tls_adapter: Option<TlsReloadAdapter<Arc<AsyncProducer>>>,
     delivery_counters: Arc<TargetDeliveryCounters>,
     _phantom: PhantomData<E>,
 }
 
 impl<E> KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn map_kafka_error(err: KafkaError, context: &str) -> TargetError {
-        match err {
-            KafkaError::Connection(ConnectionError::NoHostReachable) => TargetError::NotConnected,
-            KafkaError::Connection(ConnectionError::Timeout(_)) => TargetError::Timeout(format!("{context}: {err}")),
-            KafkaError::Connection(_) => TargetError::Network(format!("{context}: {err}")),
+        // Prefer the client's own retriable classification so transient broker
+        // states (leader election / NotLeaderForPartition, coordinator load,
+        // network blips, RequestTimedOut) are retried via store replay instead of
+        // being dropped as permanent failures (backlog#973).
+        if err.is_retriable() {
+            return match &err {
+                KafkaError::Connection(ConnectionError::Timeout(_)) | KafkaError::Kafka(KafkaCode::RequestTimedOut) => {
+                    TargetError::Timeout(format!("{context}: {err}"))
+                }
+                _ => TargetError::NotConnected,
+            };
+        }
+
+        // Non-retriable errors: configuration problems are permanent config
+        // errors; everything else (e.g. UnknownTopicOrPartition, authorization
+        // failures, oversize messages) is a permanent request-level failure.
+        match &err {
             KafkaError::Config(_) => TargetError::Configuration(format!("{context}: {err}")),
             _ => TargetError::Request(format!("{context}: {err}")),
         }
-    }
-
-    fn is_connection_error(err: &TargetError) -> bool {
-        matches!(err, TargetError::NotConnected | TargetError::Timeout(_) | TargetError::Network(_))
     }
 
     /// Creates a new KafkaTarget
@@ -134,25 +349,14 @@ where
 
         let target_id = TargetID::new(id, ChannelTargetType::Kafka.as_str().to_string());
 
-        let queue_store = if !args.queue_dir.is_empty() {
-            let queue_dir =
-                PathBuf::from(&args.queue_dir).join(queue_store_subdir_name(ChannelTargetType::Kafka.as_str(), &target_id.id));
-
-            let extension = match args.target_type {
-                TargetType::AuditLog => AUDIT_STORE_EXTENSION,
-                TargetType::NotifyEvent => NOTIFY_STORE_EXTENSION,
-            };
-
-            let store = QueueStore::<QueuedPayload>::new(queue_dir, args.queue_limit, extension);
-            if let Err(e) = store.open() {
-                error!("Failed to open store for Kafka target {}: {}", target_id.id, e);
-                return Err(TargetError::Storage(format!("{e}")));
-            }
-
-            Some(Box::new(store) as Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send + Sync>)
-        } else {
-            None
-        };
+        let queue_store = open_target_queue_store(
+            &args.queue_dir,
+            args.queue_limit,
+            args.target_type,
+            ChannelTargetType::Kafka.as_str(),
+            &target_id,
+            "Failed to open store for Kafka target",
+        )?;
 
         info!(target_id = %target_id.id, "Kafka target created");
         Ok(KafkaTarget {
@@ -160,6 +364,10 @@ where
             args,
             store: queue_store,
             producer: Arc::new(Mutex::new(None)),
+            delivery_lock: Arc::new(Mutex::new(())),
+            delivery_poisoned: Arc::new(AtomicBool::new(false)),
+            tls_state: Arc::new(Mutex::new(TargetTlsState::default())),
+            tls_adapter: None,
             delivery_counters: Arc::new(TargetDeliveryCounters::default()),
             _phantom: PhantomData,
         })
@@ -174,17 +382,10 @@ where
         };
 
         let mut config = AsyncProducerConfig::new()
-            .with_ack_timeout(Duration::from_secs(30))
+            .with_ack_timeout(KAFKA_DELIVERY_TIMEOUT)
             .with_required_acks(acks);
 
-        if self.args.tls_enable {
-            let mut security = SecurityConfig::new();
-            if !self.args.tls_ca.is_empty() {
-                security = security.with_ca_cert(self.args.tls_ca.clone());
-            }
-            if !self.args.tls_client_cert.is_empty() && !self.args.tls_client_key.is_empty() {
-                security = security.with_client_cert(self.args.tls_client_cert.clone(), self.args.tls_client_key.clone());
-            }
+        if let Some(security) = self.args.security_config(true)? {
             config = config.with_security(security);
         }
 
@@ -194,12 +395,47 @@ where
     }
 
     async fn get_or_build_producer(&self) -> Result<Arc<AsyncProducer>, TargetError> {
-        let mut cached = self.producer.lock().await;
-        if let Some(producer) = cached.as_ref() {
-            return Ok(Arc::clone(producer));
+        // Adapter-managed path: use the material directly from the TLS reload adapter.
+        if let Some(adapter) = &self.tls_adapter {
+            let producer: Arc<AsyncProducer> = (*adapter.current_material()).clone();
+
+            // Ensure the producer is also stored locally so that close() can drain it.
+            {
+                let mut guard = self.producer.lock().await;
+                *guard = Some(Arc::clone(&producer));
+            }
+            return Ok(producer);
         }
 
+        // Inline fingerprint fallback path (no coordinator).
+        let next_fingerprint =
+            build_target_tls_fingerprint(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key).await?;
+        let tls_changed = {
+            let tls_state_guard = self.tls_state.lock().await;
+            tls_state_guard.needs_update(&next_fingerprint)
+        };
+        if tls_changed {
+            let mut cached = self.producer.lock().await;
+            *cached = None;
+            self.tls_state.lock().await.refresh(next_fingerprint);
+        }
+
+        {
+            let cached = self.producer.lock().await;
+            if let Some(producer) = cached.as_ref() {
+                return Ok(Arc::clone(producer));
+            }
+        }
+
+        // Build the producer without holding the cache lock so a slow connect
+        // does not block other senders (which only need to read the cache).
+        // Re-check the cache after building in case another task raced us
+        // (backlog#983).
         let producer = Arc::new(self.build_producer().await?);
+        let mut cached = self.producer.lock().await;
+        if let Some(existing) = cached.as_ref() {
+            return Ok(Arc::clone(existing));
+        }
         *cached = Some(Arc::clone(&producer));
         Ok(producer)
     }
@@ -207,30 +443,12 @@ where
     async fn invalidate_cached_producer(&self) {
         let mut cached = self.producer.lock().await;
         *cached = None;
+        self.tls_state.lock().await.reset();
     }
 
     /// Serializes the event and builds a QueuedPayload
     fn build_queued_payload(&self, event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError> {
-        let object_name = crate::target::decode_object_name(&event.object_name)?;
-        let key = format!("{}/{}", event.bucket_name, object_name);
-
-        let log = TargetLog {
-            event_name: event.event_name,
-            key,
-            records: vec![event.data.clone()],
-        };
-
-        let body = serde_json::to_vec(&log).map_err(|e| TargetError::Serialization(format!("Failed to serialize event: {e}")))?;
-
-        let meta = QueuedPayloadMeta::new(
-            event.event_name,
-            event.bucket_name.clone(),
-            event.object_name.clone(),
-            "application/json",
-            body.len(),
-        );
-
-        Ok(QueuedPayload::new(meta, body))
+        build_queued_payload(event)
     }
 
     /// Sends the raw body to Kafka
@@ -245,15 +463,26 @@ where
             "Sending Kafka payload"
         );
 
-        let producer = self.get_or_build_producer().await?;
-
-        if let Err(err) = producer.send(&Record::from_value(&self.args.topic, body.as_slice())).await {
-            let mapped = Self::map_kafka_error(err, "Failed to send message to Kafka");
-            if Self::is_connection_error(&mapped) {
-                self.invalidate_cached_producer().await;
-            }
-            return Err(mapped);
-        }
+        // rustfs-kafka-async does not validate response correlation IDs. Keep
+        // producer selection, send, and timeout invalidation serialized so a
+        // waiter cannot reuse a connection with an unread timed-out response.
+        with_serialized_kafka_delivery(
+            &self.delivery_lock,
+            &self.delivery_poisoned,
+            || self.get_or_build_producer(),
+            |producer| async move {
+                // Use "<bucket>/<object>" as the message key so all events for the same
+                // object hash to the same partition and preserve per-object ordering
+                // across multiple partitions (backlog#983).
+                let partition_key = format!("{}/{}", meta.bucket_name, meta.object_name);
+                producer
+                    .send(&Record::from_key_value(&self.args.topic, partition_key, body.as_slice()))
+                    .await
+                    .map_err(|err| Self::map_kafka_error(err, "Failed to send message to Kafka"))
+            },
+            || self.invalidate_cached_producer(),
+        )
+        .await?;
 
         debug!(target_id = %self.id, topic = %self.args.topic, "Event published to Kafka topic");
         self.delivery_counters.record_success();
@@ -267,6 +496,10 @@ where
             args: self.args.clone(),
             store: self.store.as_ref().map(|s| s.boxed_clone()),
             producer: Arc::clone(&self.producer),
+            delivery_lock: Arc::clone(&self.delivery_lock),
+            delivery_poisoned: Arc::clone(&self.delivery_poisoned),
+            tls_state: Arc::clone(&self.tls_state),
+            tls_adapter: self.tls_adapter.clone(),
             delivery_counters: Arc::clone(&self.delivery_counters),
             _phantom: PhantomData,
         })
@@ -276,7 +509,7 @@ where
 #[async_trait]
 impl<E> Target<E> for KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -297,16 +530,9 @@ where
         };
 
         if let Some(store) = &self.store {
-            let encoded = match queued.encode() {
-                Ok(encoded) => encoded,
-                Err(err) => {
-                    self.delivery_counters.record_final_failure();
-                    return Err(TargetError::Storage(format!("Failed to encode queued payload: {err}")));
-                }
-            };
-            if let Err(e) = store.put_raw(&encoded) {
+            if let Err(e) = persist_queued_payload_to_store(store.as_ref(), &queued) {
                 self.delivery_counters.record_final_failure();
-                return Err(TargetError::Storage(format!("Failed to save event to store: {e}")));
+                return Err(e);
             }
             debug!("Event saved to store for Kafka target: {}", self.id);
             Ok(())
@@ -336,6 +562,13 @@ where
     }
 
     async fn close(&self) -> Result<(), TargetError> {
+        {
+            let mut guard = self.producer.lock().await;
+            *guard = None;
+        }
+
+        self.tls_state.lock().await.reset();
+
         info!("Kafka target closed: {}", self.id);
         Ok(())
     }
@@ -353,8 +586,11 @@ where
     }
 
     fn delivery_snapshot(&self) -> TargetDeliverySnapshot {
-        self.delivery_counters
-            .snapshot(self.store.as_deref().map_or(0, |store| store.len() as u64))
+        self.delivery_counters.snapshot(
+            self.store.as_deref().map_or(0, |store| store.len() as u64),
+            // Kafka targets record no terminal failures and keep no failed store.
+            0,
+        )
     }
 
     fn record_final_failure(&self) {
@@ -362,9 +598,52 @@ where
     }
 }
 
+/// Coordinated TLS hot-reload implementation for Kafka targets.
+///
+/// The coordinator calls these methods on a background poll loop to detect
+/// TLS file changes and rebuild the producer without restarting.
+#[async_trait]
+impl<E> ReloadableTargetTls for KafkaTarget<E>
+where
+    E: PluginEvent,
+{
+    type Material = Arc<AsyncProducer>;
+
+    fn tls_input_set(&self) -> TargetTlsInputSet {
+        TargetTlsInputSet {
+            ca_path: self.args.tls_ca.clone(),
+            client_cert_path: self.args.tls_client_cert.clone(),
+            client_key_path: self.args.tls_client_key.clone(),
+            target_label: format!("kafka:{}", self.id.id),
+        }
+    }
+
+    async fn build_tls_material(&self) -> Result<Self::Material, TargetError> {
+        let producer = self.build_producer().await?;
+        Ok(Arc::new(producer))
+    }
+
+    async fn apply_tls_material(
+        &self,
+        _generation: TargetTlsGeneration,
+        material: Arc<Self::Material>,
+        _mode: ReloadApplyMode,
+    ) -> Result<(), TargetError> {
+        let mut guard = self.producer.lock().await;
+        *guard = Some((*material).clone());
+        Ok(())
+    }
+
+    async fn validate_tls_files(&self) -> Result<(), TargetError> {
+        validate_tls_material(&self.args.tls_ca, &self.args.tls_client_cert, &self.args.tls_client_key)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use tokio::sync::Notify;
 
     fn base_args() -> KafkaArgs {
         KafkaArgs {
@@ -376,10 +655,166 @@ mod tests {
             tls_ca: String::new(),
             tls_client_cert: String::new(),
             tls_client_key: String::new(),
+            sasl_enable: false,
+            sasl_mechanism: String::new(),
+            sasl_username: String::new(),
+            sasl_password: String::new(),
             queue_dir: String::new(),
             queue_limit: 0,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_invalidates_before_the_next_delivery_selects_a_producer() {
+        let delivery_lock = Arc::new(Mutex::new(()));
+        let delivery_poisoned = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicUsize::new(1));
+        let first_entered = Arc::new(Notify::new());
+
+        let first = {
+            let delivery_lock = Arc::clone(&delivery_lock);
+            let delivery_poisoned = Arc::clone(&delivery_poisoned);
+            let generation = Arc::clone(&generation);
+            let first_entered = Arc::clone(&first_entered);
+            tokio::spawn(async move {
+                with_serialized_kafka_delivery(
+                    &delivery_lock,
+                    &delivery_poisoned,
+                    {
+                        let generation = Arc::clone(&generation);
+                        move || async move { Ok(generation.load(Ordering::SeqCst)) }
+                    },
+                    move |selected| async move {
+                        assert_eq!(selected, 1);
+                        first_entered.notify_one();
+                        std::future::pending::<Result<usize, TargetError>>().await
+                    },
+                    move || {
+                        let generation = Arc::clone(&generation);
+                        async move { generation.store(2, Ordering::SeqCst) }
+                    },
+                )
+                .await
+            })
+        };
+
+        first_entered.notified().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let second = {
+            let delivery_lock = Arc::clone(&delivery_lock);
+            let delivery_poisoned = Arc::clone(&delivery_poisoned);
+            let generation = Arc::clone(&generation);
+            tokio::spawn(async move {
+                with_serialized_kafka_delivery(
+                    &delivery_lock,
+                    &delivery_poisoned,
+                    {
+                        let generation = Arc::clone(&generation);
+                        move || async move { Ok(generation.load(Ordering::SeqCst)) }
+                    },
+                    |selected| async move { Ok(selected) },
+                    move || {
+                        let generation = Arc::clone(&generation);
+                        async move { generation.store(2, Ordering::SeqCst) }
+                    },
+                )
+                .await
+            })
+        };
+
+        assert!(matches!(
+            first.await.expect("first delivery task should not panic"),
+            Err(TargetError::Timeout(_))
+        ));
+        assert_eq!(
+            second
+                .await
+                .expect("second delivery task should not panic")
+                .expect("second delivery should succeed"),
+            2,
+            "the waiter must select a fresh producer generation after timeout invalidation"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delivery_deadline_includes_waiting_for_the_serialization_lock() {
+        let delivery_lock = Arc::new(Mutex::new(()));
+        let delivery_poisoned = AtomicBool::new(false);
+        let selected = Arc::new(AtomicBool::new(false));
+        let _held = delivery_lock.lock().await;
+
+        let error = with_serialized_kafka_delivery(
+            &delivery_lock,
+            &delivery_poisoned,
+            {
+                let selected = Arc::clone(&selected);
+                move || async move {
+                    selected.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            |()| async { Ok(()) },
+            || async {},
+        )
+        .await
+        .expect_err("lock admission must share the absolute delivery deadline");
+
+        assert!(matches!(error, TargetError::Timeout(_)));
+        assert!(!selected.load(Ordering::SeqCst), "a timed-out waiter must not select a producer");
+        assert!(!delivery_poisoned.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancelled_delivery_poisons_the_connection_before_the_next_selection() {
+        let delivery_lock = Arc::new(Mutex::new(()));
+        let delivery_poisoned = Arc::new(AtomicBool::new(false));
+        let generation = Arc::new(AtomicUsize::new(1));
+        let first_entered = Arc::new(Notify::new());
+        let first = {
+            let delivery_lock = Arc::clone(&delivery_lock);
+            let delivery_poisoned = Arc::clone(&delivery_poisoned);
+            let first_entered = Arc::clone(&first_entered);
+            tokio::spawn(async move {
+                with_serialized_kafka_delivery(
+                    &delivery_lock,
+                    &delivery_poisoned,
+                    || async { Ok(1usize) },
+                    move |_| async move {
+                        first_entered.notify_one();
+                        std::future::pending::<Result<(), TargetError>>().await
+                    },
+                    || async {},
+                )
+                .await
+            })
+        };
+        first_entered.notified().await;
+        first.abort();
+        assert!(first.await.expect_err("first delivery should be cancelled").is_cancelled());
+        assert!(delivery_poisoned.load(Ordering::Acquire));
+
+        let selected = with_serialized_kafka_delivery(
+            &delivery_lock,
+            &delivery_poisoned,
+            {
+                let generation = Arc::clone(&generation);
+                move || async move { Ok(generation.load(Ordering::SeqCst)) }
+            },
+            |selected| async move { Ok(selected) },
+            {
+                let generation = Arc::clone(&generation);
+                move || {
+                    let generation = Arc::clone(&generation);
+                    async move { generation.store(2, Ordering::SeqCst) }
+                }
+            },
+        )
+        .await
+        .expect("the next delivery should recover from cancellation poisoning");
+
+        assert_eq!(selected, 2);
+        assert!(!delivery_poisoned.load(Ordering::Acquire));
     }
 
     #[test]
@@ -433,5 +868,118 @@ mod tests {
             ..base_args()
         };
         assert!(args.validate().is_err());
+    }
+
+    #[test]
+    fn test_validate_sasl_requires_tls() {
+        let args = KafkaArgs {
+            sasl_enable: true,
+            sasl_mechanism: KAFKA_SASL_SCRAM_SHA_512.to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("SASL without TLS should fail");
+        assert!(err.to_string().contains("requires tls_enable"));
+    }
+
+    #[test]
+    fn test_validate_sasl_requires_username_and_password() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: KAFKA_SASL_PLAIN.to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: String::new(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("SASL credentials should be paired");
+        assert!(err.to_string().contains("sasl_username and sasl_password"));
+    }
+
+    #[test]
+    fn test_validate_sasl_rejects_unsupported_mechanism() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: "OAUTHBEARER".to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+        let err = args.validate().expect_err("unsupported SASL mechanism should fail");
+        assert!(err.to_string().contains("sasl_mechanism must be one of"));
+    }
+
+    #[test]
+    fn test_security_config_includes_sasl() {
+        let args = KafkaArgs {
+            tls_enable: true,
+            sasl_enable: true,
+            sasl_mechanism: "scram-sha-512".to_string(),
+            sasl_username: "user".to_string(),
+            sasl_password: "secret".to_string(),
+            ..base_args()
+        };
+
+        let security = args
+            .security_config(false)
+            .expect("valid security config")
+            .expect("security should be configured");
+        let sasl = security.sasl_config().expect("SASL should be configured");
+
+        assert_eq!(sasl.mechanism(), KAFKA_SASL_SCRAM_SHA_512);
+        assert_eq!(sasl.username(), "user");
+        assert_eq!(sasl.password(), "secret");
+    }
+
+    #[test]
+    fn map_kafka_error_treats_transient_broker_states_as_retriable() {
+        // Leader election / metadata staleness must be retried, not dropped
+        // as a permanent failure (backlog#973).
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::NotLeaderForPartition), "send"),
+            TargetError::NotConnected
+        ));
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::LeaderNotAvailable), "send"),
+            TargetError::NotConnected
+        ));
+        // RequestTimedOut is retriable and surfaced as a timeout.
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::RequestTimedOut), "send"),
+            TargetError::Timeout(_)
+        ));
+    }
+
+    #[test]
+    fn map_kafka_error_treats_permanent_broker_states_as_request_error() {
+        // A missing topic/partition is a permanent condition; retrying would
+        // storm the broker.
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Kafka(KafkaCode::UnknownTopicOrPartition), "send"),
+            TargetError::Request(_)
+        ));
+        assert!(matches!(
+            KafkaTarget::<serde_json::Value>::map_kafka_error(KafkaError::Config("bad".to_string()), "send"),
+            TargetError::Configuration(_)
+        ));
+    }
+
+    #[test]
+    fn test_debug_redacts_sasl_password_and_tls_key() {
+        let rendered = format!(
+            "{:?}",
+            KafkaArgs {
+                tls_client_key: "/tmp/client.key".to_string(),
+                sasl_enable: true,
+                sasl_password: "super-secret".to_string(),
+                ..base_args()
+            }
+        );
+
+        assert!(!rendered.contains("super-secret"));
+        assert!(!rendered.contains("/tmp/client.key"));
+        assert!(rendered.contains("***REDACTED***"));
     }
 }

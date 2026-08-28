@@ -14,25 +14,38 @@
 
 //! Admin application use-case contracts.
 
-use crate::app::context::{AppContext, get_global_app_context};
-use crate::capacity::resolve_admin_used_capacity;
+use super::storage_api::admin_usecase::admin::get_server_info;
+use super::storage_api::admin_usecase::capacity::{
+    DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity,
+    get_total_usable_capacity_free,
+};
+use super::storage_api::admin_usecase::contract::StorageAdminApi;
+use super::storage_api::admin_usecase::contract::bucket::{BucketOperations as _, BucketOptions};
+use super::storage_api::admin_usecase::data_usage::{
+    apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached,
+};
+use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
+use crate::app::runtime_sources::{
+    AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
+};
+use crate::cluster_snapshot::{
+    ClusterReadOnlySnapshot, ClusterRuntimeStatusSnapshot, cluster_read_only_snapshot_from_endpoint_pools,
+    collect_cluster_read_only_snapshot,
+};
 use crate::error::ApiError;
-use rustfs_common::data_usage::DataUsageInfo;
-use rustfs_ecstore::admin_server_info::get_server_info;
-use rustfs_ecstore::data_usage::load_data_usage_from_backend;
-use rustfs_ecstore::endpoints::EndpointServerPools;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free};
-use rustfs_ecstore::store_api::StorageAPI;
-use rustfs_madmin::{Disk, InfoMessage, StorageInfo};
+use crate::server::collect_dependency_readiness_report as collect_runtime_dependency_readiness_report;
+use crate::shared_types::DependencyReadiness;
+use rustfs_data_usage::DataUsageInfo;
+use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, OnceLock};
-use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use std::collections::HashSet;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
+pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
+pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
@@ -49,12 +62,6 @@ impl std::fmt::Debug for QueryServerInfoResponse {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct DependencyReadiness {
-    pub storage_ready: bool,
-    pub iam_ready: bool,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryPoolStatusRequest {
     pub pool: String,
@@ -62,7 +69,51 @@ pub struct QueryPoolStatusRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct AdminPoolListItem {
+pub struct AdminPoolDecommissionInfo {
+    #[serde(rename = "startTime", with = "time::serde::rfc3339::option")]
+    pub start_time: Option<time::OffsetDateTime>,
+    #[serde(rename = "startSize")]
+    pub start_size: usize,
+    #[serde(rename = "totalSize")]
+    pub total_size: usize,
+    #[serde(rename = "currentSize")]
+    pub current_size: usize,
+    #[serde(rename = "complete")]
+    pub complete: bool,
+    #[serde(rename = "failed")]
+    pub failed: bool,
+    #[serde(rename = "canceled")]
+    pub canceled: bool,
+    #[serde(rename = "queued")]
+    pub queued: bool,
+    #[serde(rename = "queuedBuckets")]
+    pub queued_buckets: Vec<String>,
+    #[serde(rename = "decommissionedBuckets")]
+    pub decommissioned_buckets: Vec<String>,
+    #[serde(rename = "bucket")]
+    pub bucket: String,
+    #[serde(rename = "prefix")]
+    pub prefix: String,
+    #[serde(rename = "object")]
+    pub object: String,
+    #[serde(rename = "stage")]
+    pub stage: String,
+    #[serde(rename = "objectsDecommissioned")]
+    pub items_decommissioned: usize,
+    #[serde(rename = "objectsDecommissionedFailed")]
+    pub items_decommission_failed: usize,
+    #[serde(rename = "bytesDecommissioned")]
+    pub bytes_done: usize,
+    #[serde(rename = "bytesDecommissionedFailed")]
+    pub bytes_failed: usize,
+    #[serde(rename = "waitingReason")]
+    pub waiting_reason: Option<String>,
+    #[serde(rename = "unresolvedEntries", skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_entries: Vec<DecommissionUnresolvedEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminPoolStatus {
     #[serde(rename = "id")]
     pub id: usize,
     #[serde(rename = "cmdline")]
@@ -79,8 +130,34 @@ pub struct AdminPoolListItem {
     pub used: f64,
     #[serde(rename = "status")]
     pub status: String,
+    #[serde(rename = "decommissionStatus")]
+    pub decommission_status: String,
+    #[serde(rename = "rebalanceStatus")]
+    pub rebalance_status: String,
     #[serde(rename = "decommissionInfo")]
-    pub decommission: Option<PoolDecommissionInfo>,
+    pub decommission: Option<AdminPoolDecommissionInfo>,
+}
+
+pub type AdminPoolListItem = AdminPoolStatus;
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminDecommissionPoolStatus {
+    #[serde(rename = "id")]
+    pub id: usize,
+    #[serde(rename = "cmdline")]
+    pub cmd_line: String,
+    #[serde(rename = "status")]
+    pub status: String,
+    #[serde(rename = "poolStatus")]
+    pub pool_status: String,
+    #[serde(rename = "decommissionInfo")]
+    pub decommission: Option<AdminPoolDecommissionInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AdminDecommissionStatus {
+    #[serde(rename = "pools")]
+    pub pools: Vec<AdminDecommissionPoolStatus>,
 }
 
 #[derive(Clone, Default)]
@@ -88,21 +165,24 @@ pub struct DefaultAdminUsecase {
     context: Option<Arc<AppContext>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct StorageReadinessCacheEntry {
-    captured_at: Instant,
-    storage_ready: bool,
-}
-
 impl DefaultAdminUsecase {
-    const DISK_STATE_OK: &'static str = "ok";
-    const DISK_STATE_UNFORMATTED: &'static str = "unformatted";
-    const RUNTIME_STATE_RETURNING: &'static str = "returning";
-    const POOL_STATUS_ACTIVE: &'static str = "active";
     const POOL_STATUS_CANCELED: &'static str = "canceled";
     const POOL_STATUS_COMPLETE: &'static str = "complete";
     const POOL_STATUS_FAILED: &'static str = "failed";
+    const POOL_STATUS_QUEUED: &'static str = "queued";
     const POOL_STATUS_RUNNING: &'static str = "running";
+    const POOL_STATUS_UNKNOWN: &'static str = "unknown";
+    const POOL_STATE_ACTIVE: &'static str = "active";
+    const POOL_STATE_BLOCKED: &'static str = "blocked";
+    const POOL_STATE_DECOMMISSIONED: &'static str = "decommissioned";
+    const POOL_STATE_DECOMMISSIONING: &'static str = "decommissioning";
+    const POOL_STATE_REBALANCING: &'static str = "rebalancing";
+    const REBALANCE_STATUS_COMPLETED: &'static str = "completed";
+    const REBALANCE_STATUS_FAILED: &'static str = "failed";
+    const REBALANCE_STATUS_NONE: &'static str = "none";
+    const REBALANCE_STATUS_STARTED: &'static str = "started";
+    const REBALANCE_STATUS_STOPPING: &'static str = "stopping";
+    const REBALANCE_STATUS_STOPPED: &'static str = "stopped";
 
     #[cfg(test)]
     pub fn without_context() -> Self {
@@ -111,12 +191,16 @@ impl DefaultAdminUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
     fn endpoints(&self) -> Option<EndpointServerPools> {
         self.context.as_ref().and_then(|context| context.endpoints().handle())
+    }
+
+    fn object_store(&self) -> Option<Arc<ECStore>> {
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
@@ -132,30 +216,109 @@ impl DefaultAdminUsecase {
         Self::app_error(code, message)
     }
 
+    fn map_data_usage_load_result<E>(result: Result<DataUsageInfo, E>) -> AdminUsecaseResult<DataUsageInfo> {
+        result.map_err(|_| Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed"))
+    }
+
+    /// Narrow a snapshot to the buckets it actually measured, or discard it.
+    ///
+    /// The wire shape must never let a partial snapshot read as a confirmed
+    /// zero, but blanking the whole document to serve that rule costs far more
+    /// than it protects: a single freshly created bucket is by definition
+    /// absent from the last completed scan, so every bucket creation used to
+    /// zero out usage reporting for the entire deployment until the next cycle
+    /// covered it (rustfs#5806).
+    ///
+    /// Keep what was measured instead. Buckets the scan did not cover stay
+    /// absent from `buckets_usage` — absent already means "unknown" on the
+    /// wire, distinct from a present zero — and the snapshot is marked
+    /// non-converged so clients can tell it is not the whole namespace. A
+    /// snapshot that is structurally incomplete, or that measured nothing the
+    /// namespace still contains, carries no usable information and is dropped
+    /// exactly as before.
+    fn narrow_data_usage_snapshot_to_measured_buckets(info: &mut DataUsageInfo, buckets: impl IntoIterator<Item = String>) {
+        if !info.is_complete_bucket_usage_snapshot() {
+            *info = DataUsageInfo::default();
+            return;
+        }
+
+        let current_buckets: HashSet<String> = buckets.into_iter().filter(|bucket| !bucket.starts_with('.')).collect();
+        // Buckets deleted since the scan must not linger in the response.
+        info.buckets_usage.retain(|bucket, _| current_buckets.contains(bucket));
+        info.bucket_sizes.retain(|bucket, _| current_buckets.contains(bucket));
+
+        if info.buckets_usage.is_empty() && !current_buckets.is_empty() {
+            *info = DataUsageInfo::default();
+            return;
+        }
+
+        let covers_namespace = current_buckets.len() == info.buckets_usage.len();
+        info.buckets_count = info.buckets_usage.len() as u64;
+        if !covers_namespace {
+            // Some bucket in the namespace was never measured, so the totals
+            // below are a floor rather than the converged truth.
+            info.usage_snapshot_converged = Some(false);
+        }
+    }
+
+    async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
+        store.refresh_rebalance_status_meta().await.map_err(|err| {
+            error!("refresh rebalance metadata for pool status failed: {:?}", err);
+            ApiError::from(err)
+        })
+    }
+
+    async fn refresh_pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
+        store.refresh_pool_status_meta().await.map_err(|err| {
+            error!("refresh pool metadata for pool status failed: {:?}", err);
+            ApiError::from(err)
+        })
+    }
+
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
         let info = get_server_info(req.include_pools).await;
         Ok(QueryServerInfoResponse { info })
     }
 
     pub async fn execute_query_storage_info(&self) -> AdminUsecaseResult<StorageInfo> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        Ok(store.storage_info().await)
+        Ok(StorageAdminApi::storage_info(store.as_ref()).await)
     }
 
     pub async fn execute_query_data_usage_info(&self) -> AdminUsecaseResult<DataUsageInfo> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        let mut info = load_data_usage_from_backend(store.clone()).await.map_err(|e| {
-            error!("load_data_usage_from_backend failed {:?}", e);
-            Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
-        })?;
+        Self::query_data_usage_info_with_store(store).await
+    }
 
-        let storage_info = store.storage_info().await;
+    /// Serve the last persisted scanner snapshot plus an authoritative
+    /// single-process overlay. Distributed nodes must not promote their
+    /// process-local absolute counters to cluster-wide bucket totals.
+    /// This path never triggers a live full-version listing
+    /// (rustfs/backlog#1306); freshness is owned by the scanner.
+    pub(crate) async fn query_data_usage_info_with_store(store: Arc<ECStore>) -> AdminUsecaseResult<DataUsageInfo> {
+        let mut info = Self::map_data_usage_load_result(load_admin_data_usage_from_backend_cached(store.clone()).await)?;
+        apply_bucket_usage_memory_overlay(&mut info).await;
+        let buckets = store
+            .list_bucket(&BucketOptions {
+                cached: true,
+                no_metadata: true,
+                ..Default::default()
+            })
+            .await
+            .map_err(|_| Self::app_error(S3ErrorCode::InternalError, "list_bucket failed"))?;
+        // Serve what the scan measured; buckets it never reached stay absent
+        // (absent means unknown on the wire, unlike a present zero) and the
+        // snapshot is flagged non-converged. See rustfs#5806 for why blanking
+        // the whole document instead was worse than the rule it enforced.
+        Self::narrow_data_usage_snapshot_to_measured_buckets(&mut info, buckets.into_iter().map(|bucket| bucket.name));
+
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
 
         // Keep the same capacity correction behavior as the previous admin handler implementation.
         const MAX_REASONABLE_CAPACITY: u64 = 100_000 * 1024 * 1024 * 1024 * 1024; // 100 PiB
@@ -211,8 +374,7 @@ impl DefaultAdminUsecase {
             info.total_free_capacity = free_u64;
         }
 
-        info.total_used_capacity =
-            resolve_admin_used_capacity(&storage_info.disks, info.total_capacity.saturating_sub(info.total_free_capacity)).await;
+        info.total_used_capacity = info.total_capacity.saturating_sub(info.total_free_capacity);
         debug!(
             "Capacity statistics: total={:.2} TiB, free={:.2} TiB, used={:.2} TiB",
             info.total_capacity as f64 / (1024.0_f64.powi(4)),
@@ -224,7 +386,7 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_pool_statuses(&self) -> AdminUsecaseResult<Vec<PoolStatus>> {
-        let Some(store) = new_object_layer_fn() else {
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
@@ -232,9 +394,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         };
 
-        if endpoints.legacy() {
-            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
-        }
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
 
         let mut pool_statuses = Vec::new();
         for (idx, _) in endpoints.as_ref().iter().enumerate() {
@@ -246,22 +406,22 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_pools(&self) -> AdminUsecaseResult<Vec<AdminPoolListItem>> {
+        let Some(store) = self.object_store() else {
+            return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
+        };
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Ok(pool_statuses.into_iter().map(Self::pool_list_item_from_status).collect())
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let mut items = Vec::with_capacity(pool_statuses.len());
+        for status in pool_statuses {
+            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            items.push(Self::pool_list_item_from_status(status, rebalance_status));
+        }
+        Ok(items)
     }
 
-    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<PoolStatus> {
-        let Some(endpoints) = self.endpoints() else {
-            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
-        };
-
-        if endpoints.legacy() {
-            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
-        }
-
+    fn resolve_pool_index(&self, req: &QueryPoolStatusRequest, endpoints: &EndpointServerPools) -> AdminUsecaseResult<usize> {
         let has_idx = if req.by_id {
-            let idx = req.pool.parse::<usize>().unwrap_or_default();
-            if idx < endpoints.as_ref().len() { Some(idx) } else { None }
+            Self::parse_pool_idx_by_id(&req.pool, endpoints.as_ref().len())
         } else {
             endpoints.get_pool_idx(&req.pool)
         };
@@ -271,14 +431,77 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::InvalidArgument));
         };
 
-        let Some(store) = new_object_layer_fn() else {
+        Ok(idx)
+    }
+
+    pub async fn execute_query_pool_status(&self, req: QueryPoolStatusRequest) -> AdminUsecaseResult<AdminPoolStatus> {
+        let Some(endpoints) = self.endpoints() else {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        }
+
+        let idx = self.resolve_pool_index(&req, &endpoints)?;
+
+        let Some(store) = self.object_store() else {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
-        store.status(idx).await.map_err(ApiError::from)
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(idx).await.map_err(ApiError::from)?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = store.pool_rebalance_status(idx).await;
+        Ok(Self::pool_list_item_from_status(status, rebalance_status))
     }
 
-    fn pool_list_item_from_status(status: PoolStatus) -> AdminPoolListItem {
+    pub async fn execute_list_decommission_status(&self) -> AdminUsecaseResult<AdminDecommissionStatus> {
+        let Some(store) = self.object_store() else {
+            return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
+        };
+        let Some(endpoints) = self.endpoints() else {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        };
+        if endpoints.legacy() {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        }
+        let pool_statuses = self.execute_list_pool_statuses().await?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let mut pools = Vec::with_capacity(pool_statuses.len());
+        for status in pool_statuses {
+            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            pools.push(Self::decommission_pool_status_from_status(status, rebalance_status));
+        }
+        Ok(AdminDecommissionStatus { pools })
+    }
+
+    pub async fn execute_query_decommission_status(
+        &self,
+        req: QueryPoolStatusRequest,
+    ) -> AdminUsecaseResult<AdminDecommissionPoolStatus> {
+        let Some(endpoints) = self.endpoints() else {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        };
+
+        if endpoints.legacy() {
+            return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
+        }
+
+        let idx = self.resolve_pool_index(&req, &endpoints)?;
+
+        let Some(store) = self.object_store() else {
+            return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
+        };
+
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
+        let status = store.status(idx).await.map_err(ApiError::from)?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
+        let rebalance_status = store.pool_rebalance_status(idx).await;
+        Ok(Self::decommission_pool_status_from_status(status, rebalance_status))
+    }
+
+    fn pool_list_item_from_status(status: PoolStatus, rebalance_status: (RebalStatus, bool)) -> AdminPoolListItem {
         let PoolStatus {
             id,
             cmd_line,
@@ -288,8 +511,12 @@ impl DefaultAdminUsecase {
         let total_size = decommission.as_ref().map(|info| info.total_size).unwrap_or_default();
         let current_size = decommission.as_ref().map(|info| info.current_size).unwrap_or_default();
         let used_size = total_size.saturating_sub(current_size);
+        let decommission = decommission.filter(PoolDecommissionInfo::has_decommission_state);
+        let decommission_status = Self::pool_decommission_status(decommission.as_ref());
+        let rebalance_status = Self::pool_rebalance_status(rebalance_status);
+        let pool_state = Self::pool_lifecycle_state(decommission.as_ref(), rebalance_status);
 
-        AdminPoolListItem {
+        AdminPoolStatus {
             id,
             cmd_line,
             last_update,
@@ -297,19 +524,116 @@ impl DefaultAdminUsecase {
             current_size,
             used_size,
             used: Self::used_ratio(total_size, used_size),
-            status: Self::pool_list_status(decommission.as_ref()).to_string(),
-            decommission,
+            status: pool_state.to_string(),
+            decommission_status: decommission_status.to_string(),
+            rebalance_status: rebalance_status.to_string(),
+            decommission: decommission.map(Self::admin_decommission_info_from_pool),
         }
     }
 
-    fn pool_list_status(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
+    fn pool_lifecycle_state(decommission: Option<&PoolDecommissionInfo>, rebalance_status: &'static str) -> &'static str {
+        match decommission {
+            Some(info) if info.complete => Self::POOL_STATE_DECOMMISSIONED,
+            Some(info) if info.failed || info.canceled => Self::POOL_STATE_BLOCKED,
+            Some(info) if !info.has_decommission_state() && Self::rebalance_status_is_active(rebalance_status) => {
+                Self::POOL_STATE_REBALANCING
+            }
+            Some(info) if !info.has_decommission_state() => Self::POOL_STATE_ACTIVE,
+            Some(_) => Self::POOL_STATE_DECOMMISSIONING,
+            None if Self::rebalance_status_is_active(rebalance_status) => Self::POOL_STATE_REBALANCING,
+            None => Self::POOL_STATE_ACTIVE,
+        }
+    }
+
+    fn pool_decommission_status(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
         match decommission {
             Some(info) if info.complete => Self::POOL_STATUS_COMPLETE,
             Some(info) if info.failed => Self::POOL_STATUS_FAILED,
             Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
+            Some(info) if info.queued => Self::POOL_STATUS_QUEUED,
             Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
-            _ => Self::POOL_STATUS_ACTIVE,
+            Some(info) if !info.has_decommission_state() => Self::REBALANCE_STATUS_NONE,
+            Some(_) => Self::POOL_STATUS_UNKNOWN,
+            None => Self::REBALANCE_STATUS_NONE,
         }
+    }
+
+    fn rebalance_status_is_active(status: &'static str) -> bool {
+        matches!(status, Self::REBALANCE_STATUS_STARTED | Self::REBALANCE_STATUS_STOPPING)
+    }
+
+    fn pool_rebalance_status((status, stopping): (RebalStatus, bool)) -> &'static str {
+        if stopping {
+            return Self::REBALANCE_STATUS_STOPPING;
+        }
+
+        match status {
+            RebalStatus::None => Self::REBALANCE_STATUS_NONE,
+            RebalStatus::Started => Self::REBALANCE_STATUS_STARTED,
+            RebalStatus::Completed => Self::REBALANCE_STATUS_COMPLETED,
+            RebalStatus::Stopped => Self::REBALANCE_STATUS_STOPPED,
+            RebalStatus::Failed => Self::REBALANCE_STATUS_FAILED,
+        }
+    }
+
+    fn decommission_pool_status_from_status(
+        status: PoolStatus,
+        rebalance_status: (RebalStatus, bool),
+    ) -> AdminDecommissionPoolStatus {
+        let PoolStatus {
+            id,
+            cmd_line,
+            decommission,
+            ..
+        } = status;
+        let decommission = decommission.filter(PoolDecommissionInfo::has_decommission_state);
+        let status = Self::pool_decommission_status(decommission.as_ref()).to_string();
+        let rebalance_status = Self::pool_rebalance_status(rebalance_status);
+        let pool_status = Self::pool_lifecycle_state(decommission.as_ref(), rebalance_status).to_string();
+
+        AdminDecommissionPoolStatus {
+            id,
+            cmd_line,
+            status,
+            pool_status,
+            decommission: decommission.map(Self::admin_decommission_info_from_pool),
+        }
+    }
+
+    fn admin_decommission_info_from_pool(info: PoolDecommissionInfo) -> AdminPoolDecommissionInfo {
+        let waiting_reason = Self::decommission_waiting_reason(&info).map(str::to_string);
+        AdminPoolDecommissionInfo {
+            start_time: info.start_time,
+            start_size: info.start_size,
+            total_size: info.total_size,
+            current_size: info.current_size,
+            complete: info.complete,
+            failed: info.failed,
+            canceled: info.canceled,
+            queued: info.queued,
+            queued_buckets: info.queued_buckets,
+            decommissioned_buckets: info.decommissioned_buckets,
+            bucket: info.bucket,
+            prefix: info.prefix,
+            object: info.object,
+            stage: info.stage,
+            items_decommissioned: info.items_decommissioned,
+            items_decommission_failed: info.items_decommission_failed,
+            bytes_done: info.bytes_done,
+            bytes_failed: info.bytes_failed,
+            waiting_reason,
+            unresolved_entries: info.unresolved_entries,
+        }
+    }
+
+    fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
+        if !info.has_decommission_state() || info.complete || info.failed || info.canceled || info.start_time.is_some() {
+            return None;
+        }
+        if info.queued {
+            return Some("queued");
+        }
+        Some("waiting_for_worker")
     }
 
     fn used_ratio(total_size: usize, used_size: usize) -> f64 {
@@ -320,168 +644,132 @@ impl DefaultAdminUsecase {
         used_size as f64 / total_size as f64
     }
 
-    fn disk_is_online_for_readiness(disk: &Disk) -> bool {
-        let state_is_acceptable = disk.state.eq_ignore_ascii_case(Self::DISK_STATE_OK)
-            || disk.state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
-            || disk.state.eq_ignore_ascii_case(Self::DISK_STATE_UNFORMATTED);
-
-        if let Some(runtime_state) = disk.runtime_state.as_deref() {
-            let runtime_state_is_acceptable = runtime_state.eq_ignore_ascii_case(rustfs_madmin::ITEM_ONLINE)
-                || runtime_state.eq_ignore_ascii_case(Self::RUNTIME_STATE_RETURNING);
-            return runtime_state_is_acceptable && state_is_acceptable;
-        }
-
-        state_is_acceptable
-    }
-
-    fn health_readiness_cache_ttl() -> Duration {
-        Duration::from_millis(rustfs_utils::get_env_u64(
-            rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS,
-            rustfs_config::DEFAULT_HEALTH_READINESS_CACHE_TTL_MS,
-        ))
-    }
-
-    fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
-        static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
-        CACHE.get_or_init(|| Mutex::new(None))
-    }
-
-    async fn load_cached_storage_readiness() -> Option<bool> {
-        let ttl = Self::health_readiness_cache_ttl();
-        if ttl.is_zero() {
-            return None;
-        }
-
-        let cache = Self::storage_readiness_cache().lock().await;
-        let entry = cache.as_ref()?;
-        if entry.captured_at.elapsed() <= ttl {
-            return Some(entry.storage_ready);
-        }
-
-        None
-    }
-
-    async fn update_storage_readiness_cache(storage_ready: bool) {
-        if Self::health_readiness_cache_ttl().is_zero() {
-            return;
-        }
-
-        let mut cache = Self::storage_readiness_cache().lock().await;
-        *cache = Some(StorageReadinessCacheEntry {
-            captured_at: Instant::now(),
-            storage_ready,
-        });
-    }
-
-    fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
-        if set_drive_count == 0 {
-            return 1;
-        }
-
-        let data_drives = info
-            .backend
-            .standard_sc_data
-            .get(pool_idx)
-            .copied()
-            .filter(|count| *count > 0)
-            .unwrap_or_else(|| (set_drive_count / 2).max(1));
-
-        let parity_drives = if let Some(drives_per_set) = info.backend.drives_per_set.get(pool_idx).copied() {
-            drives_per_set.saturating_sub(data_drives)
-        } else if let Some(parity) = info.backend.standard_sc_parities.get(pool_idx).copied() {
-            parity
-        } else if let Some(parity) = info.backend.standard_sc_parity {
-            parity
-        } else {
-            set_drive_count.saturating_sub(data_drives)
-        };
-
-        let mut write_quorum = data_drives;
-        if data_drives == parity_drives {
-            write_quorum += 1;
-        }
-        write_quorum.max(1)
-    }
-
-    fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
-        if info.disks.is_empty() {
-            return false;
-        }
-
-        let mut total_online = 0usize;
-        let mut set_online_counts: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut set_drive_counts: HashMap<(usize, usize), usize> = HashMap::new();
-        let mut seen_disks: HashSet<(String, String, i32, i32, i32)> = HashSet::new();
-
-        for disk in &info.disks {
-            if disk.pool_index < 0 || disk.set_index < 0 {
-                continue;
-            }
-
-            let dedup_key = (
-                disk.endpoint.clone(),
-                disk.drive_path.clone(),
-                disk.pool_index,
-                disk.set_index,
-                disk.disk_index,
-            );
-            if !seen_disks.insert(dedup_key) {
-                continue;
-            }
-
-            let pool_idx = disk.pool_index as usize;
-            let set_idx = disk.set_index as usize;
-            let key = (pool_idx, set_idx);
-            *set_drive_counts.entry(key).or_default() += 1;
-
-            if Self::disk_is_online_for_readiness(disk) {
-                total_online += 1;
-                *set_online_counts.entry(key).or_default() += 1;
-            }
-        }
-
-        if total_online == 0 {
-            return false;
-        }
-
-        if set_drive_counts.is_empty() {
-            return false;
-        }
-
-        set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
-            let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
-            let write_quorum = Self::pool_write_quorum(info, pool_idx, set_drive_count);
-            online >= write_quorum
-        })
+    fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
+        let idx = pool.parse::<usize>().ok()?;
+        (idx < endpoint_count).then_some(idx)
     }
 
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        let iam_ready = self.context.as_ref().map(|context| context.iam().is_ready()).unwrap_or(false);
-        let storage_ready = if let Some(cached) = Self::load_cached_storage_readiness().await {
-            cached
-        } else {
-            let computed = if let Some(store) = new_object_layer_fn() {
-                let storage_info = store.storage_info().await;
-                Self::storage_ready_from_runtime_state(&storage_info)
-            } else {
-                false
-            };
-            Self::update_storage_readiness_cache(computed).await;
-            computed
-        };
-
-        DependencyReadiness {
-            storage_ready,
-            iam_ready: iam_ready && storage_ready,
+        let report = collect_runtime_dependency_readiness_report().await;
+        if let Some(endpoint_pools) = current_endpoints_handle() {
+            let runtime_status = ClusterRuntimeStatusSnapshot::from_readiness_report(report);
+            return cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status)
+                .runtime_status
+                .readiness;
         }
+        report.readiness
+    }
+
+    pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
+        let endpoint_pools = current_endpoints_handle()?;
+        collect_cluster_read_only_snapshot(&endpoint_pools).await
+    }
+
+    pub fn cluster_snapshot_route(&self) -> &'static str {
+        ADMIN_CLUSTER_SNAPSHOT_ROUTE
+    }
+
+    pub fn runtime_capabilities_route(&self) -> &'static str {
+        ADMIN_RUNTIME_CAPABILITIES_ROUTE
+    }
+
+    pub fn extensions_catalog_route(&self) -> &'static str {
+        ADMIN_EXTENSIONS_CATALOG_ROUTE
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::storage_api::admin_usecase::capacity::{DecommissionUnresolvedEntry, PoolDecommissionInfo, PoolStatus};
     use super::*;
-    use rustfs_ecstore::pools::{PoolDecommissionInfo, PoolStatus};
     use time::OffsetDateTime;
+    use tracing_subscriber::{Layer, Registry, layer::Context, prelude::*};
+
+    struct RejectEvents;
+
+    impl<S> Layer<S> for RejectEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(&self, _event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            panic!("data usage error mapping must not emit a duplicate event");
+        }
+    }
+
+    #[test]
+    fn data_usage_load_error_is_generic_and_not_logged_again() {
+        let subscriber = Registry::default().with(RejectEvents);
+
+        tracing::subscriber::with_default(subscriber, || {
+            let err = DefaultAdminUsecase::map_data_usage_load_result::<&str>(Err("sensitive disk path"))
+                .expect_err("load failure must reach the response");
+            assert_eq!(err.code, S3ErrorCode::InternalError);
+            assert_eq!(err.message, "load_data_usage_from_backend failed");
+        });
+    }
+
+    /// rustfs#5806: a bucket the last scan never reached must not blank the
+    /// usage the scan *did* measure — that turned every bucket creation into a
+    /// deployment-wide usage blackout until the next cycle.
+    #[test]
+    fn partial_snapshot_keeps_measured_buckets_and_flags_non_convergence() {
+        let measured = |name: &str| {
+            let mut info = DataUsageInfo {
+                last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+                usage_snapshot_complete: true,
+                buckets_count: 1,
+                objects_total_count: 7,
+                ..Default::default()
+            };
+            info.buckets_usage.insert(name.to_string(), Default::default());
+            info.bucket_sizes.insert(name.to_string(), 160);
+            info
+        };
+
+        // A brand-new bucket the scan never saw: keep bucket-a, omit bucket-new,
+        // and say so via the convergence flag.
+        let mut info = measured("bucket-a");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
+            &mut info,
+            ["bucket-a".to_string(), "bucket-new".to_string(), ".rustfs.sys".to_string()],
+        );
+        assert!(info.buckets_usage.contains_key("bucket-a"), "measured usage must survive");
+        assert!(!info.buckets_usage.contains_key("bucket-new"), "unmeasured bucket stays absent");
+        assert_eq!(info.usage_snapshot_converged, Some(false));
+        assert_eq!(info.buckets_count, 1);
+        assert_eq!(info.objects_total_count, 7, "measured totals are preserved");
+
+        // Full coverage leaves the snapshot untouched.
+        let mut info = measured("bucket-a");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(
+            &mut info,
+            ["bucket-a".to_string(), ".rustfs.sys".to_string()],
+        );
+        assert_eq!(info.usage_snapshot_converged, None, "a covering snapshot is not downgraded");
+        assert_eq!(info.buckets_count, 1);
+
+        // A bucket deleted since the scan must not linger in the response.
+        let mut info = measured("bucket-gone");
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-live".to_string()]);
+        assert_eq!(info, DataUsageInfo::default(), "nothing measured is still in the namespace");
+
+        // Structurally incomplete snapshots carry no usable information.
+        let mut info = measured("bucket-a");
+        info.usage_snapshot_complete = false;
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, ["bucket-a".to_string()]);
+        assert_eq!(info, DataUsageInfo::default());
+
+        // An empty namespace with an empty snapshot stays a confirmed zero.
+        let mut info = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH),
+            usage_snapshot_complete: true,
+            buckets_count: 0,
+            ..Default::default()
+        };
+        DefaultAdminUsecase::narrow_data_usage_snapshot_to_measured_buckets(&mut info, [".rustfs.sys".to_string()]);
+        assert_eq!(info.usage_snapshot_converged, None);
+        assert_eq!(info.buckets_count, 0);
+    }
 
     #[tokio::test]
     async fn execute_query_storage_info_returns_internal_error_when_store_uninitialized() {
@@ -508,123 +796,41 @@ mod tests {
         let _ = readiness.iam_ready;
     }
 
-    #[test]
-    fn storage_ready_from_runtime_state_returns_false_when_all_disks_faulty() {
-        let info = StorageInfo {
-            backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![1],
-                drives_per_set: vec![1],
-                ..Default::default()
-            },
-            disks: vec![Disk {
-                pool_index: 0,
-                set_index: 0,
-                state: "offline".to_string(),
-                runtime_state: Some("offline".to_string()),
-                ..Default::default()
-            }],
-        };
+    #[tokio::test]
+    async fn execute_collect_cluster_read_only_snapshot_returns_none_without_context() {
+        let usecase = DefaultAdminUsecase::without_context();
 
-        assert!(!DefaultAdminUsecase::storage_ready_from_runtime_state(&info));
+        let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
+
+        assert!(snapshot.is_none());
     }
 
     #[test]
-    fn storage_ready_from_runtime_state_returns_true_when_set_meets_write_quorum() {
-        let info = StorageInfo {
-            backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![1],
-                drives_per_set: vec![1],
-                ..Default::default()
-            },
-            disks: vec![Disk {
-                pool_index: 0,
-                set_index: 0,
-                state: "ok".to_string(),
-                runtime_state: Some("online".to_string()),
-                ..Default::default()
-            }],
-        };
+    fn admin_usecase_exposes_stable_discovery_routes() {
+        let usecase = DefaultAdminUsecase::without_context();
 
-        assert!(DefaultAdminUsecase::storage_ready_from_runtime_state(&info));
+        assert_eq!(usecase.cluster_snapshot_route(), "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(usecase.runtime_capabilities_route(), "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(usecase.extensions_catalog_route(), "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]
-    fn storage_ready_from_runtime_state_deduplicates_duplicate_disk_rows() {
-        let duplicate_disk = Disk {
-            endpoint: "127.0.0.1:9000".to_string(),
-            drive_path: "/data0".to_string(),
-            pool_index: 0,
-            set_index: 0,
-            disk_index: 0,
-            state: "ok".to_string(),
-            runtime_state: Some("online".to_string()),
-            ..Default::default()
-        };
-        let info = StorageInfo {
-            backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![2],
-                drives_per_set: vec![4],
-                ..Default::default()
-            },
-            disks: vec![duplicate_disk.clone(), duplicate_disk],
-        };
-
-        assert!(
-            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
-            "duplicate rows must not satisfy write quorum"
-        );
+    fn admin_query_pool_status_by_id_rejects_non_numeric_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("pool-a", 4), None);
     }
 
     #[test]
-    fn disk_online_for_readiness_requires_runtime_and_state_both_acceptable() {
-        let disk = Disk {
-            state: "disk io error".to_string(),
-            runtime_state: Some("online".to_string()),
-            ..Default::default()
-        };
-        assert!(!DefaultAdminUsecase::disk_is_online_for_readiness(&disk));
+    fn admin_query_pool_status_by_id_rejects_out_of_range_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("4", 4), None);
     }
 
     #[test]
-    fn storage_ready_from_runtime_state_requires_all_sets_meet_quorum() {
-        let info = StorageInfo {
-            backend: rustfs_madmin::BackendInfo {
-                standard_sc_data: vec![1],
-                drives_per_set: vec![2],
-                ..Default::default()
-            },
-            disks: vec![
-                Disk {
-                    endpoint: "127.0.0.1:9000".to_string(),
-                    drive_path: "/set0d0".to_string(),
-                    pool_index: 0,
-                    set_index: 0,
-                    disk_index: 0,
-                    state: "ok".to_string(),
-                    runtime_state: Some("online".to_string()),
-                    ..Default::default()
-                },
-                Disk {
-                    endpoint: "127.0.0.1:9000".to_string(),
-                    drive_path: "/set1d0".to_string(),
-                    pool_index: 0,
-                    set_index: 1,
-                    disk_index: 0,
-                    state: "offline".to_string(),
-                    runtime_state: Some("offline".to_string()),
-                    ..Default::default()
-                },
-            ],
-        };
-
-        assert!(
-            !DefaultAdminUsecase::storage_ready_from_runtime_state(&info),
-            "if any set fails write quorum, readiness must be false"
-        );
+    fn admin_query_pool_status_by_id_accepts_valid_index() {
+        assert_eq!(DefaultAdminUsecase::parse_pool_idx_by_id("0", 4), Some(0));
     }
 
     #[test]
-    fn admin_pool_list_item_maps_capacity_and_active_status() {
+    fn admin_pool_list_item_maps_capacity_without_decommission_state_as_active() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let pool = PoolStatus {
             id: 2,
@@ -637,7 +843,7 @@ mod tests {
             }),
         };
 
-        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool, (RebalStatus::None, false));
 
         assert_eq!(item.id, 2);
         assert_eq!(item.total_size, 1_000);
@@ -645,16 +851,44 @@ mod tests {
         assert_eq!(item.used_size, 750);
         assert!((item.used - 0.75).abs() < f64::EPSILON);
         assert_eq!(item.status, "active");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "none");
+        assert!(item.decommission.is_none());
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_inconsistent_decommission_progress_as_unknown() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 2,
+                cmd_line: "http://node{1...4}/disk{1...4}".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    total_size: 1_000,
+                    current_size: 250,
+                    items_decommissioned: 1,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        assert_eq!(item.status, "decommissioning");
+        assert_eq!(item.decommission_status, "unknown");
+        assert!(item.decommission.is_some());
     }
 
     #[test]
     fn admin_pool_list_item_serializes_admin_api_fields() {
-        let item = DefaultAdminUsecase::pool_list_item_from_status(PoolStatus {
-            id: 1,
-            cmd_line: "pool-1".to_string(),
-            last_update: OffsetDateTime::UNIX_EPOCH,
-            decommission: None,
-        });
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            },
+            (RebalStatus::Completed, false),
+        );
 
         let value = serde_json::to_value(item).unwrap();
 
@@ -669,6 +903,8 @@ mod tests {
                 "usedSize": 0,
                 "used": 0.0,
                 "status": "active",
+                "decommissionStatus": "none",
+                "rebalanceStatus": "completed",
                 "decommissionInfo": null
             })
         );
@@ -687,7 +923,7 @@ mod tests {
             }),
         };
 
-        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool, (RebalStatus::None, false));
 
         assert_eq!(item.total_size, 100);
         assert_eq!(item.current_size, 150);
@@ -709,30 +945,251 @@ mod tests {
             }),
         };
 
-        let item = DefaultAdminUsecase::pool_list_item_from_status(pool);
+        let item = DefaultAdminUsecase::pool_list_item_from_status(pool, (RebalStatus::Started, false));
 
-        assert_eq!(item.status, "running");
+        assert_eq!(item.status, "decommissioning");
+        assert_eq!(item.decommission_status, "running");
+        assert_eq!(item.rebalance_status, "started");
+    }
+
+    #[test]
+    fn admin_pool_list_item_keeps_decommission_state_ahead_of_rebalance_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::Started, false),
+        );
+
+        assert_eq!(item.status, "blocked");
+        assert_eq!(item.decommission_status, "failed");
+        assert_eq!(item.rebalance_status, "started");
+    }
+
+    #[test]
+    fn admin_pool_list_item_exposes_queued_decommission_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 3,
+                cmd_line: "pool-3".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    queued: true,
+                    queued_buckets: vec!["bucket-a".to_string(), ".rustfs.sys/config".to_string()],
+                    decommissioned_buckets: vec!["bucket-done".to_string()],
+                    bucket: "bucket-a".to_string(),
+                    prefix: "prefix/".to_string(),
+                    object: "object.txt".to_string(),
+                    stage: "migrate_object".to_string(),
+                    items_decommissioned: 7,
+                    items_decommission_failed: 1,
+                    bytes_done: 1024,
+                    bytes_failed: 64,
+                    unresolved_entries: vec![DecommissionUnresolvedEntry {
+                        bucket: "bucket-a".to_string(),
+                        object: "prefix/unresolved.txt".to_string(),
+                        pool_index: 3,
+                        set_index: 1,
+                        source_generation: OffsetDateTime::UNIX_EPOCH,
+                        candidate_count: 2,
+                        disk_error_count: 1,
+                        observed_at: OffsetDateTime::UNIX_EPOCH,
+                        reason: "metadata_resolution_failed".to_string(),
+                    }],
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
+        assert_eq!(item.status, "decommissioning");
+        assert_eq!(item.decommission_status, "queued");
+        let value = serde_json::to_value(item).expect("admin pool status should serialize");
+        assert_eq!(value["decommissionInfo"]["queued"], true);
+        assert_eq!(
+            value["decommissionInfo"]["queuedBuckets"],
+            serde_json::json!(["bucket-a", ".rustfs.sys/config"])
+        );
+        assert_eq!(value["decommissionInfo"]["decommissionedBuckets"], serde_json::json!(["bucket-done"]));
+        assert_eq!(value["decommissionInfo"]["bucket"], "bucket-a");
+        assert_eq!(value["decommissionInfo"]["prefix"], "prefix/");
+        assert_eq!(value["decommissionInfo"]["object"], "object.txt");
+        assert_eq!(value["decommissionInfo"]["stage"], "migrate_object");
+        assert_eq!(value["decommissionInfo"]["objectsDecommissioned"], 7);
+        assert_eq!(value["decommissionInfo"]["objectsDecommissionedFailed"], 1);
+        assert_eq!(value["decommissionInfo"]["bytesDecommissioned"], 1024);
+        assert_eq!(value["decommissionInfo"]["bytesDecommissionedFailed"], 64);
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["bucket"], "bucket-a");
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["object"], "prefix/unresolved.txt");
+        assert_eq!(
+            value["decommissionInfo"]["unresolvedEntries"][0]["sourceGeneration"],
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(value["decommissionInfo"]["unresolvedEntries"][0]["reason"], "metadata_resolution_failed");
+        assert_eq!(value["decommissionInfo"]["waitingReason"], "queued");
     }
 
     #[test]
     fn admin_pool_list_item_maps_terminal_decommission_statuses() {
-        let complete = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+        let complete = DefaultAdminUsecase::pool_decommission_status(Some(&PoolDecommissionInfo {
             complete: true,
             ..Default::default()
         }));
-        let failed = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+        let failed = DefaultAdminUsecase::pool_decommission_status(Some(&PoolDecommissionInfo {
             failed: true,
             ..Default::default()
         }));
-        let canceled = DefaultAdminUsecase::pool_list_status(Some(&PoolDecommissionInfo {
+        let canceled = DefaultAdminUsecase::pool_decommission_status(Some(&PoolDecommissionInfo {
             canceled: true,
             ..Default::default()
         }));
-        let idle = DefaultAdminUsecase::pool_list_status(None);
+        let queued = DefaultAdminUsecase::pool_decommission_status(Some(&PoolDecommissionInfo {
+            queued: true,
+            ..Default::default()
+        }));
+        let idle = DefaultAdminUsecase::pool_decommission_status(None);
 
         assert_eq!(complete, "complete");
         assert_eq!(failed, "failed");
         assert_eq!(canceled, "canceled");
-        assert_eq!(idle, "active");
+        assert_eq!(queued, "queued");
+        assert_eq!(idle, "none");
+    }
+
+    #[test]
+    fn admin_pool_list_item_keeps_rebalance_failure_separate_from_pool_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            },
+            (RebalStatus::Failed, false),
+        );
+
+        assert_eq!(item.status, "active");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "failed");
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_started_rebalance_to_pool_rebalancing() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            },
+            (RebalStatus::Started, false),
+        );
+
+        assert_eq!(item.status, "rebalancing");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "started");
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_stopping_rebalance_status() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            },
+            (RebalStatus::Started, true),
+        );
+
+        assert_eq!(item.status, "rebalancing");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "stopping");
+    }
+
+    #[test]
+    fn admin_pool_lifecycle_state_distinguishes_decommission_terminal_states() {
+        let complete = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let failed = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let canceled = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let rebalancing = DefaultAdminUsecase::pool_lifecycle_state(None, DefaultAdminUsecase::REBALANCE_STATUS_STARTED);
+
+        assert_eq!(complete, "decommissioned");
+        assert_eq!(failed, "blocked");
+        assert_eq!(canceled, "blocked");
+        assert_eq!(rebalancing, "rebalancing");
+    }
+
+    #[test]
+    fn admin_decommission_status_serializes_task_status_and_pool_status() {
+        let item = DefaultAdminUsecase::decommission_pool_status_from_status(
+            PoolStatus {
+                id: 3,
+                cmd_line: "pool-3".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::Started, false),
+        );
+
+        let value = serde_json::to_value(item).expect("decommission status should serialize");
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "id": 3,
+                "cmdline": "pool-3",
+                "status": "failed",
+                "poolStatus": "blocked",
+                "decommissionInfo": {
+                    "startTime": null,
+                    "startSize": 0,
+                    "totalSize": 0,
+                    "currentSize": 0,
+                    "complete": false,
+                    "failed": true,
+                    "canceled": false,
+                    "queued": false,
+                    "queuedBuckets": [],
+                    "decommissionedBuckets": [],
+                    "bucket": "",
+                    "prefix": "",
+                    "object": "",
+                    "stage": "",
+                    "objectsDecommissioned": 0,
+                    "objectsDecommissionedFailed": 0,
+                    "bytesDecommissioned": 0,
+                    "bytesDecommissionedFailed": 0,
+                    "waitingReason": null
+                }
+            })
+        );
     }
 }

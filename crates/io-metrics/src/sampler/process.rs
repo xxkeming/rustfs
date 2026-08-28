@@ -15,21 +15,43 @@
 use std::sync::{Mutex, OnceLock};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessStatus, ProcessesToUpdate, System};
 
-static PROCESS_SYSTEM: OnceLock<Mutex<System>> = OnceLock::new();
+static PROCESS_SAMPLER: OnceLock<Mutex<ProcessSampler>> = OnceLock::new();
 
 #[inline]
 fn current_pid() -> Pid {
     Pid::from_u32(std::process::id())
 }
 
-#[inline]
-fn process_system() -> &'static Mutex<System> {
-    PROCESS_SYSTEM.get_or_init(|| {
+#[derive(Debug)]
+pub struct ProcessSampler {
+    pid: Pid,
+    sys: System,
+}
+
+impl Default for ProcessSampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ProcessSampler {
+    #[inline]
+    pub fn new() -> Self {
         let pid = current_pid();
-        let mut system = System::new();
-        system.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
-        Mutex::new(system)
-    })
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+        Self { pid, sys }
+    }
+
+    #[inline]
+    pub fn snapshot_resource_and_system(&mut self) -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
+        snapshot_process_resource_and_system_with(self)
+    }
+}
+
+#[inline]
+fn process_sampler() -> &'static Mutex<ProcessSampler> {
+    PROCESS_SAMPLER.get_or_init(|| Mutex::new(ProcessSampler::new()))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -99,13 +121,21 @@ pub fn snapshot_process_system() -> ProcessSystemSnapshot {
 /// Collect both resource and system snapshots in one sysinfo refresh.
 #[inline]
 pub fn snapshot_process_resource_and_system() -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
+    let mut sampler = process_sampler().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    snapshot_process_resource_and_system_with(&mut sampler)
+}
+
+#[inline]
+pub fn snapshot_process_resource_and_system_with(
+    sampler: &mut ProcessSampler,
+) -> (ProcessResourceSnapshot, ProcessSystemSnapshot) {
     let platform_stats = crate::snapshot_process_platform_stats();
     let lock_snapshot = crate::snapshot_process_lock_counts();
-    let pid = current_pid();
-    let mut sys = process_system().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::everything());
+    sampler
+        .sys
+        .refresh_processes_specifics(ProcessesToUpdate::Some(&[sampler.pid]), true, ProcessRefreshKind::everything());
 
-    if let Some(process) = sys.process(pid) {
+    if let Some(process) = sampler.sys.process(sampler.pid) {
         let disk_usage = process.disk_usage();
         let status = ProcessStatusSnapshot::from(process.status());
         let uptime_seconds = process.run_time();
@@ -158,9 +188,40 @@ mod tests {
     }
 
     #[test]
-    fn process_snapshots_are_collectable() {
-        let _ = snapshot_process_resource();
-        let _ = snapshot_process_system();
-        let _ = snapshot_process_resource_and_system();
+    fn combined_snapshot_agrees_with_the_individual_ones_on_per_process_facts() {
+        // Previously three discarded calls that asserted nothing. The values that
+        // move (cpu, memory) cannot be compared across calls, but the facts that
+        // identify the process must not differ by which entry point produced them
+        // (rustfs/backlog#1836).
+        let system = snapshot_process_system();
+        let (_, combined_system) = snapshot_process_resource_and_system();
+
+        assert_eq!(
+            system.start_time_seconds, combined_system.start_time_seconds,
+            "both entry points describe this process, so its start time cannot differ"
+        );
+        assert_eq!(
+            system.file_descriptor_limit_total, combined_system.file_descriptor_limit_total,
+            "the descriptor limit is a property of the process, not of the call"
+        );
+        assert_eq!(
+            system.status_value, combined_system.status_value,
+            "the status enum and its numeric projection must stay in step"
+        );
+        assert_eq!(combined_system.status_value, combined_system.status as i64);
+    }
+
+    #[test]
+    fn independent_samplers_observe_the_same_process() {
+        let mut sampler_a = ProcessSampler::new();
+        let mut sampler_b = ProcessSampler::new();
+
+        let (_, system_a) = snapshot_process_resource_and_system_with(&mut sampler_a);
+        let (_, system_b) = snapshot_process_resource_and_system_with(&mut sampler_b);
+
+        // Two samplers hold separate sysinfo state; they must still agree on the
+        // process they are both looking at rather than each inventing a value.
+        assert_eq!(system_a.start_time_seconds, system_b.start_time_seconds);
+        assert_eq!(system_a.file_descriptor_limit_total, system_b.file_descriptor_limit_total);
     }
 }

@@ -117,6 +117,9 @@ pub struct MasterKeyInfo {
     pub rotated_at: Option<Zoned>,
     /// Key creator/owner
     pub created_by: Option<String>,
+    /// Scheduled deletion deadline while the key is pending deletion
+    #[serde(default)]
+    pub deletion_date: Option<Zoned>,
 }
 
 impl MasterKeyInfo {
@@ -142,6 +145,7 @@ impl MasterKeyInfo {
             created_at: Zoned::now(),
             rotated_at: None,
             created_by,
+            deletion_date: None,
         }
     }
 
@@ -173,6 +177,7 @@ impl MasterKeyInfo {
             created_at: Zoned::now(),
             rotated_at: None,
             created_by,
+            deletion_date: None,
         }
     }
 }
@@ -197,6 +202,29 @@ pub enum KeyStatus {
     PendingDeletion,
     /// Key has been deleted
     Deleted,
+}
+
+/// Why a key carries the rotation-readiness verdict it does.
+///
+/// Reported alongside [`KeyInfo::rotation_due`] so an operator can tell an
+/// overdue key from one the server cannot judge at all; new variants may be
+/// added, so consumers must treat an unknown value as "no verdict".
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RotationDueReason {
+    /// The key was last rotated longer ago than the configured maximum age.
+    Age,
+    /// The key has never been rotated and has existed longer than the
+    /// configured maximum age.
+    NeverRotated,
+    /// The key has wrapped more data keys than the configured maximum.
+    ///
+    /// Counted per key-material version, so a rotation restarts the budget.
+    /// The count is an over-estimate by construction (see the backend's
+    /// reservation accounting), so this verdict errs toward rotating early.
+    Wraps,
+    /// The backend cannot rotate keys at all, so no age makes one due.
+    Unsupported,
 }
 
 /// Information about a key
@@ -224,6 +252,27 @@ pub struct KeyInfo {
     pub rotated_at: Option<Zoned>,
     /// Key creator
     pub created_by: Option<String>,
+    /// Whether the key has outlived the configured rotation age.
+    ///
+    /// Advisory: nothing consults it before encrypting or decrypting, and a key
+    /// reported as due keeps serving traffic unchanged. Backends leave it at
+    /// its default — the verdict is filled in by the manager, which is the only
+    /// place that knows both the configured age and whether the backend can
+    /// rotate at all.
+    #[serde(default)]
+    pub rotation_due: bool,
+    /// Why [`KeyInfo::rotation_due`] holds its value, absent when there is no
+    /// verdict to explain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_due_reason: Option<RotationDueReason>,
+    /// Wrap operations reserved against the key's current material, reported
+    /// only by backends that count wraps (the Vault KV2 backend today). An
+    /// approximate value that by design overestimates the wraps actually
+    /// performed. In-process transport for the deletion worker's aggregate
+    /// wrap gauge, deliberately kept off the serialized admin surface: per-key
+    /// exposure would need its own contract decision and snapshot pin.
+    #[serde(skip)]
+    pub wrap_budget_reserved: Option<u64>,
 }
 
 impl From<MasterKeyInfo> for KeyInfo {
@@ -240,6 +289,9 @@ impl From<MasterKeyInfo> for KeyInfo {
             created_at: master_key.created_at,
             rotated_at: master_key.rotated_at,
             created_by: master_key.created_by,
+            rotation_due: false,
+            rotation_due_reason: None,
+            wrap_budget_reserved: None,
         }
     }
 }
@@ -443,6 +495,18 @@ pub struct ListKeysResponse {
     pub next_marker: Option<String>,
     /// Whether there are more keys available
     pub truncated: bool,
+    /// Identifiers that are present in the key store but that this build could
+    /// not describe, in listing order.
+    ///
+    /// A key whose record cannot be interpreted must not simply be missing from
+    /// `keys`: an inventory that silently omits it reads as "you do not have
+    /// this key", and the deletion sweep's census would be taken over a key set
+    /// it never fully saw. Reporting the identifier separately keeps the page
+    /// honest while still letting the caller page past the damage. Errors that
+    /// say nothing about a specific key — timeouts, 5xx, auth failures — still
+    /// fail the whole listing rather than landing here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unreadable_key_ids: Vec<String>,
 }
 
 /// Operation context for auditing and access control
@@ -477,6 +541,20 @@ impl OperationContext {
             user_agent: None,
             additional_context: HashMap::new(),
         }
+    }
+
+    /// Principal recorded for work the server starts on its own behalf.
+    ///
+    /// Namespaced so it can never collide with an access key or an IAM ARN,
+    /// which keeps "no human did this" distinguishable from "we lost track of
+    /// who did this" in the audit trail.
+    pub const INTERNAL_PRINCIPAL: &'static str = "rustfs:internal";
+
+    /// Context for an operation with no authenticated caller, such as
+    /// background maintenance or a call made while serving a data-plane
+    /// request that carries its own audit entry.
+    pub fn internal() -> Self {
+        Self::new(Self::INTERNAL_PRINCIPAL.to_string())
     }
 
     /// Add additional context
@@ -617,6 +695,20 @@ pub struct EncryptionMetadata {
     pub original_size: u64,
     /// Encrypted data key
     pub encrypted_data_key: Vec<u8>,
+    /// The exact AAD bytes this object was sealed under.
+    ///
+    /// The AAD is the serialized encryption context, and the serialization is
+    /// what must be reproduced byte-for-byte — not the map. Objects written
+    /// before the context was canonicalized carry whichever `HashMap` order
+    /// happened to be in effect when they were sealed, and
+    /// `x-rustfs-encryption-context` preserves that exact byte sequence. It is
+    /// therefore recoverable, but only while it is never round-tripped through
+    /// a `HashMap` and re-serialized.
+    ///
+    /// `None` means "derive it from `encryption_context`", which is correct
+    /// only when no stored serialization exists to defer to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_aad: Option<Vec<u8>>,
 }
 
 /// Health status information
@@ -874,15 +966,37 @@ impl std::str::FromStr for EncryptionAlgorithm {
     }
 }
 
+/// Shortest pending-deletion waiting window a caller may ask for, in days.
+///
+/// The window is enforced once, in [`crate::manager::KmsManager::delete_key`];
+/// backends keep the same bound as a defensive check for direct callers.
+pub const MIN_PENDING_DELETION_WINDOW_DAYS: u32 = 7;
+
+/// Longest pending-deletion waiting window a caller may ask for, in days.
+pub const MAX_PENDING_DELETION_WINDOW_DAYS: u32 = 30;
+
+/// Waiting window applied when a delete request does not name one.
+pub const DEFAULT_PENDING_DELETION_WINDOW_DAYS: u32 = MAX_PENDING_DELETION_WINDOW_DAYS;
+
 /// Request to delete a key
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DeleteKeyRequest {
     /// Key ID to delete
     pub key_id: String,
-    /// Number of days to wait before deletion (7-30 days, optional)
+    /// Number of days to wait before deletion (7-30 days, optional, defaults to 30)
     pub pending_window_in_days: Option<u32>,
-    /// Force immediate deletion (for development/testing only)
+    /// Destroy the key material right away instead of scheduling it.
+    ///
+    /// Refused unless the server enables `allow_immediate_deletion`; see
+    /// [`crate::manager::KmsManager::delete_key`] for the gate.
     pub force_immediate: Option<bool>,
+    /// Key id echoed back by the caller to confirm an immediate deletion.
+    ///
+    /// Must equal `key_id` exactly whenever `force_immediate` is set. Optional
+    /// with a serde default because this type is part of the admin API
+    /// contract: clients that never ask for immediate deletion are unaffected.
+    #[serde(default)]
+    pub confirm_key_id: Option<String>,
 }
 
 /// Response from delete key operation
@@ -917,4 +1031,81 @@ impl Drop for DataKeyInfo {
     fn drop(&mut self) {
         self.clear_plaintext();
     }
+}
+
+/// Request to rewrap an existing data key envelope under the current version of
+/// the master key that already wraps it.
+///
+/// Rewrap changes only the wrapping. The data key inside is never replaced, so
+/// object ciphertext, IV derivation and ETags are untouched — which is what
+/// makes it possible to retire an old master key version without rewriting a
+/// single object body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewrapDataKeyRequest {
+    /// The existing wrapped data key, exactly as it was persisted
+    pub ciphertext: Vec<u8>,
+    /// Encryption context the envelope was created with; the backend rejects
+    /// the request when the envelope's own context is not reproduced here, so a
+    /// caller cannot rewrap an envelope it could not have decrypted
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Request to report where an existing data key envelope sits relative to its
+/// master key's current version.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeDataKeyWrappingRequest {
+    /// The existing wrapped data key, exactly as it was persisted
+    pub ciphertext: Vec<u8>,
+    /// Encryption context the envelope was created with, checked exactly as
+    /// [`RewrapDataKeyRequest`] checks it
+    pub encryption_context: HashMap<String, String>,
+}
+
+/// Where an existing wrapped data key sits relative to its master key's current
+/// version.
+///
+/// This is the only supported way to ask that question. The answer lives in a
+/// different place for every backend that rotates — a JSON field on the envelope
+/// for Vault KV2, the `vault:vN:` prefix of the ciphertext for Vault Transit,
+/// nowhere at all for backends that do not rotate — and a caller that reached
+/// into the envelope itself would be re-implementing that table, on the wrong
+/// side of the KMS boundary, once per call site.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DescribeDataKeyWrappingResponse {
+    /// Master key wrapping the data key
+    pub key_id: String,
+    /// Version that wrapped the data key, when the backend can name it
+    pub key_version: Option<u32>,
+    /// The master key's current version, when the backend can name it
+    pub current_key_version: Option<u32>,
+    /// Whether the envelope is already wrapped by the current version, which is
+    /// exactly the condition under which a rewrap would be a no-op.
+    ///
+    /// Callers must read this rather than compare the two version fields. A
+    /// backend may leave either version unset while still knowing the answer,
+    /// and the two must never disagree: this flag is what a retirement scan
+    /// counts, and a rewrap sweep that rewrote envelopes the scan already
+    /// considered done would never converge.
+    pub is_current: bool,
+}
+
+/// Result of [`RewrapDataKeyRequest`].
+///
+/// The plaintext data key is deliberately absent: rewrap exists so that the
+/// data key can be re-wrapped without the caller ever holding it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewrapDataKeyResponse {
+    /// The wrapped data key to persist in place of the request's ciphertext.
+    /// Byte-identical to the request when `rewrapped` is false.
+    pub ciphertext: Vec<u8>,
+    /// Master key that wraps the data key; unchanged by a rewrap
+    pub key_id: String,
+    /// Master key version that wrapped the input, when the backend can name it
+    pub source_key_version: Option<u32>,
+    /// Master key version that wraps `ciphertext`, when the backend can name it
+    pub destination_key_version: Option<u32>,
+    /// Whether the wrapping actually changed. False means the input was already
+    /// wrapped by the current version and callers must not persist anything —
+    /// re-running a rewrap sweep has to converge without further writes.
+    pub rewrapped: bool,
 }

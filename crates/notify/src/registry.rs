@@ -15,7 +15,7 @@
 use crate::Event;
 use crate::factory::builtin_target_plugins;
 use rustfs_config::notify::NOTIFY_ROUTE_PREFIX;
-use rustfs_ecstore::config::{Config, KVS};
+use rustfs_config::server_config::{Config, KVS};
 use rustfs_targets::{Target, TargetError, TargetPluginRegistry};
 
 /// Registry for managing target factories
@@ -36,6 +36,11 @@ impl TargetRegistry {
         plugins.register_all(builtin_target_plugins());
 
         TargetRegistry { plugins }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_plugins(plugins: TargetPluginRegistry<Event>) -> Self {
+        Self { plugins }
     }
 
     pub fn supports_target_type(&self, target_type: &str) -> bool {
@@ -66,6 +71,15 @@ impl TargetRegistry {
         config: &Config,
     ) -> Result<Vec<Box<dyn Target<Event> + Send + Sync>>, TargetError> {
         self.plugins.create_targets_from_config(config, NOTIFY_ROUTE_PREFIX).await
+    }
+
+    pub(crate) async fn create_dormant_targets_from_config(
+        &self,
+        config: &Config,
+    ) -> Result<(Vec<Box<dyn Target<Event> + Send + Sync>>, Vec<String>), TargetError> {
+        self.plugins
+            .create_dormant_targets_from_config(config, NOTIFY_ROUTE_PREFIX)
+            .await
     }
 }
 

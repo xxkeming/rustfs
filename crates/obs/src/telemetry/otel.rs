@@ -39,10 +39,10 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::build_env_filter;
-use crate::telemetry::guard::OtelGuard;
-use crate::telemetry::local::spawn_cleanup_task;
-use crate::telemetry::recorder::Recorder;
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
+use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
+use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
+use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
 use crate::telemetry::resource::build_resource;
 use crate::telemetry::rolling::{RollingAppender, Rotation};
 // Import helper functions from local.rs (sibling module)
@@ -54,26 +54,54 @@ use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
 use rustfs_config::observability::{DEFAULT_OBS_LOG_MATCH_MODE, DEFAULT_OBS_LOG_MAX_SINGLE_FILE_SIZE_BYTES};
 use rustfs_config::{
-    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
+    APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOGS_EXPORT_ENABLED,
     DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, METER_INTERVAL, SAMPLE_RATIO,
 };
 use std::collections::HashMap;
 use std::{fs, io::IsTerminal, time::Duration};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
-use tracing_subscriber::{
-    Layer,
-    fmt::{format::FmtSpan, time::LocalTime},
-    layer::SubscriberExt,
-    util::SubscriberInitExt,
-};
+use tracing_subscriber::{fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+
+const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_request_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds_with_path",
+    "rustfs_io_get_object_stage_duration_seconds",
+    "rustfs_io_get_object_stage_duration_seconds_by_size",
+];
+
+const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+const REDACTED_PROFILING_ENDPOINT: &str = "[redacted]";
+
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+fn log_profiler_failure(result: &'static str, error_kind: &'static str) {
+    warn!(
+        backend = "pyroscope",
+        endpoint = REDACTED_PROFILING_ENDPOINT,
+        result,
+        error_kind,
+        "Profiling export agent initialization failed"
+    );
+}
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -107,65 +135,28 @@ pub(super) fn init_observability_http(
     // service identity and deployment metadata.
     let res = build_resource(config);
     let service_name = config.service_name.as_deref().unwrap_or(APP_NAME).to_owned();
-    let use_stdout = config.use_stdout.unwrap_or(!is_production);
+    let use_stdout = resolve_otlp_use_stdout(config.use_stdout, is_production);
     let sample_ratio = config.sample_ratio.unwrap_or(SAMPLE_RATIO);
     let sampler = build_tracer_sampler(sample_ratio);
 
     // ── Endpoint resolution ───────────────────────────────────────────────────
     // Each signal may have a dedicated endpoint; if absent, fall back to the
     // root endpoint with the standard OTLP path suffix appended.
-    let root_ep = config.endpoint.clone();
+    let root_ep = normalize_otlp_root_endpoint(&config.endpoint);
 
-    let trace_ep: String = config
-        .trace_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/traces")
-            } else {
-                String::new()
-            }
-        });
-
-    let metric_ep: String = config
-        .metric_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/metrics")
-            } else {
-                String::new()
-            }
-        });
+    let trace_ep = resolve_signal_endpoint(config.trace_endpoint.as_deref(), root_ep, "/v1/traces");
+    let metric_ep = resolve_signal_endpoint(config.metric_endpoint.as_deref(), root_ep, "/v1/metrics");
 
     // If `log_endpoint` is not explicitly set, fall back to `root_ep/v1/logs`
     // only when a root endpoint exists. An empty result intentionally triggers
     // the file-logging path below instead of silently disabling application logs.
-    let log_ep: String = config
-        .log_endpoint
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            if !root_ep.is_empty() {
-                format!("{root_ep}/v1/logs")
-            } else {
-                String::new()
-            }
-        });
+    let log_ep = resolve_signal_endpoint(config.log_endpoint.as_deref(), root_ep, "/v1/logs");
 
     // ── Tracer provider (HTTP) ────────────────────────────────────────────────
     let tracer_provider = build_tracer_provider(&trace_ep, config, res.clone(), sampler, use_stdout)?;
 
     // ── Meter provider (HTTP) ─────────────────────────────────────────────────
     let meter_provider = build_meter_provider(&metric_ep, config, res.clone(), &service_name, use_stdout)?;
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let profiling_agent = init_profiler(config);
 
     // ── Logger Logic ──────────────────────────────────────────────────────────
     // Logging is the only signal that may intentionally route to either OTLP
@@ -184,12 +175,10 @@ pub(super) fn init_observability_http(
         // Init OTLP logger logic.
         // We initialize the OTLP collector and honor the configured stdout setting
         // (e.g. via RUSTFS_OBS_USE_STDOUT / config.use_stdout) when building the provider.
-        logger_provider = build_logger_provider(&log_ep, config, res, false)?;
+        logger_provider = build_logger_provider(&log_ep, config, res, use_stdout)?;
 
         // Build bridge to capture `tracing` events.
-        otel_bridge = logger_provider
-            .as_ref()
-            .map(|p| OpenTelemetryTracingBridge::new(p).with_filter(build_env_filter(logger_level, None)));
+        otel_bridge = logger_provider.as_ref().map(OpenTelemetryTracingBridge::new);
 
         // No separate formatting layer is added here; when OTLP logging is
         // active, the OpenTelemetry bridge is the authoritative sink for
@@ -207,7 +196,7 @@ pub(super) fn init_observability_http(
         let file_logging_result = (|| -> Result<_, TelemetryError> {
             fs::create_dir_all(log_directory).map_err(|e| TelemetryError::Io(e.to_string()))?;
 
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            #[cfg(unix)]
             crate::telemetry::local::ensure_dir_permissions(log_directory)?;
 
             let rotation_str = config
@@ -229,22 +218,10 @@ pub(super) fn init_observability_http(
 
             let file_appender =
                 RollingAppender::new(log_directory, log_filename.to_string(), rotation, max_single_file_size, match_mode)?;
+            crate::telemetry::local::validate_stdout_sink(&file_appender)?;
 
             let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-            let file_layer = tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(false)
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(non_blocking)
-                .json()
-                .with_current_span(true)
-                .with_span_list(true)
-                .with_span_events(span_events.clone())
-                .with_filter(build_env_filter(logger_level, None));
+            let file_layer = build_json_log_layer(non_blocking, false, span_events.clone());
             let cleanup_handle = spawn_cleanup_task(config, log_directory, log_filename, keep_files);
             Ok((file_layer, guard, cleanup_handle, rotation_str))
         })();
@@ -256,8 +233,19 @@ pub(super) fn init_observability_http(
                 cleanup_handle = Some(new_cleanup_handle);
 
                 info!(
-                    "Init file logging at '{}', rotation: {}, keep {} files",
-                    log_directory, rotation_str, keep_files
+                    backend = "local",
+                    sink = "file",
+                    output_format = "json",
+                    log_directory,
+                    rotation = %rotation_str,
+                    keep_files,
+                    stdout_mirror_enabled = crate::telemetry::local::resolve_file_stdout_mirror(
+                        config.log_stdout_enabled,
+                        is_production,
+                    ),
+                    logger_level,
+                    is_production,
+                    "Initialized local logging fallback for observability"
                 );
             }
             Err(error) if crate::telemetry::local::should_fallback_to_stdout(&error) => {
@@ -276,46 +264,45 @@ pub(super) fn init_observability_http(
 
     // Optional stdout mirror (matching init_file_logging_internal logic)
     // This is separate from OTLP stdout logic. If file logging is enabled, we honor its stdout rules.
-    if force_stdout_logging || config.log_stdout_enabled.unwrap_or(DEFAULT_OBS_LOG_STDOUT_ENABLED) || !is_production {
+    if force_stdout_logging || crate::telemetry::local::resolve_file_stdout_mirror(config.log_stdout_enabled, is_production) {
         let (stdout_nb, stdout_g) = tracing_appender::non_blocking(std::io::stdout());
         stdout_guard = Some(stdout_g);
-        stdout_layer_opt = Some(
-            tracing_subscriber::fmt::layer()
-                .with_timer(LocalTime::rfc_3339())
-                .with_target(true)
-                .with_ansi(std::io::stdout().is_terminal())
-                .with_thread_names(true)
-                .with_thread_ids(true)
-                .with_file(true)
-                .with_line_number(true)
-                .with_writer(stdout_nb)
-                .with_span_events(span_events)
-                .with_filter(build_env_filter(logger_level, None)),
-        );
+        stdout_layer_opt = Some(build_json_log_layer(stdout_nb, std::io::stdout().is_terminal(), span_events));
     }
+    let local_file_fallback_enabled = file_layer_opt.is_some();
+    let stdout_mirror_enabled = stdout_guard.is_some();
     let filter = build_env_filter(logger_level, None);
     tracing_subscriber::registry()
         .with(filter)
+        .with(pyroscope_log_filter())
         .with(ErrorLayer::default())
-        .with(file_layer_opt) // File
-        .with(stdout_layer_opt) // Stdout (only if file logging enabled it)
+        .with(file_layer_opt)
+        .with(stdout_layer_opt)
         .with(tracer_layer)
         .with(otel_bridge)
         .with(metrics_layer)
-        .init();
+        .try_init()
+        .map_err(|err| TelemetryError::SubscriberInit(err.to_string()))?;
 
     counter!("rustfs_start_total").increment(1);
     info!(
-        "Init observability (HTTP): trace='{}', metric='{}', log='{}'",
-        trace_ep, metric_ep, log_ep
+        backend = "otlp_http",
+        trace_endpoint = %trace_ep,
+        metric_endpoint = %metric_ep,
+        log_endpoint = %log_ep,
+        local_file_fallback_enabled,
+        stdout_mirror_enabled,
+        output_format = "json",
+        logger_level,
+        is_production,
+        "Initialized observability"
     );
 
     Ok(OtelGuard {
         tracer_provider,
         meter_provider,
         logger_provider,
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
-        profiling_agent,
+        profiling_agent: None,
         tracing_guard,
         stdout_guard,
         cleanup_handle,
@@ -386,10 +373,31 @@ fn build_tracer_provider(
 /// disappear due to configuration mistakes.
 fn build_tracer_sampler(sample_ratio: f64) -> Sampler {
     if sample_ratio.is_finite() && (0.0..=1.0).contains(&sample_ratio) {
-        Sampler::TraceIdRatioBased(sample_ratio)
+        Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(sample_ratio)))
     } else {
-        Sampler::AlwaysOn
+        Sampler::ParentBased(Box::new(Sampler::AlwaysOn))
     }
+}
+
+fn resolve_otlp_use_stdout(config_use_stdout: Option<bool>, is_production: bool) -> bool {
+    config_use_stdout.unwrap_or(!is_production)
+}
+
+fn normalize_otlp_root_endpoint(root_ep: &str) -> &str {
+    root_ep.trim_end_matches('/')
+}
+
+fn resolve_signal_endpoint(signal_endpoint: Option<&str>, root_ep: &str, suffix: &str) -> String {
+    signal_endpoint
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            if root_ep.is_empty() {
+                String::new()
+            } else {
+                format!("{root_ep}{suffix}")
+            }
+        })
 }
 
 /// Build an optional [`SdkMeterProvider`] for the given metrics endpoint.
@@ -425,15 +433,18 @@ fn build_meter_provider(
         .build()
         .map_err(|e| TelemetryError::BuildMetricExporter(e.to_string()))?;
 
-    let meter_interval = config.meter_interval.unwrap_or(METER_INTERVAL);
+    let meter_interval = resolve_meter_interval(config);
 
     let (provider, recorder) = Recorder::builder(service_name.to_string())
         .with_meter_provider(|b: opentelemetry_sdk::metrics::MeterProviderBuilder| {
-            let b = b.with_resource(res).with_reader(
-                PeriodicReader::builder(exporter)
-                    .with_interval(Duration::from_secs(meter_interval))
-                    .build(),
-            );
+            let b = b
+                .with_resource(res)
+                .with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(Duration::from_secs(meter_interval))
+                        .build(),
+                )
+                .with_view(get_object_duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -443,9 +454,27 @@ fn build_meter_provider(
         .build();
 
     global::set_meter_provider(provider.clone());
-    metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
+    install_process_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
     set_observability_metric_enabled(true);
     Ok(Some(provider))
+}
+
+fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    if !is_get_object_duration_histogram_metric(instrument.name()) {
+        return None;
+    }
+
+    Stream::builder()
+        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+            boundaries: GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+            record_min_max: true,
+        })
+        .build()
+        .ok()
+}
+
+fn is_get_object_duration_histogram_metric(name: &str) -> bool {
+    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -491,8 +520,11 @@ fn build_logger_provider(
 /// Returns `None` when profiling export is disabled, when no usable
 /// profiling endpoint is configured, or when building or starting the agent
 /// fails.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>> {
+#[cfg(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+))]
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
     use pyroscope::backend::{BackendConfig, PprofConfig, pprof_backend};
     use pyroscope::pyroscope::PyroscopeAgentBuilder;
     use rustfs_config::VERSION;
@@ -504,8 +536,22 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
         return None;
     }
 
-    let endpoint = config.profiling_endpoint.as_ref()?.as_str();
-    if endpoint.is_empty() {
+    let Some(endpoint) = config
+        .profiling_endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|endpoint| !endpoint.is_empty())
+    else {
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_endpoint_missing",
+            "Profiling export is enabled but no profiling endpoint was configured"
+        );
+        return None;
+    };
+
+    if url::Url::parse(endpoint).is_err() {
+        log_profiler_failure("profiling_endpoint_invalid", "invalid_endpoint");
         return None;
     }
 
@@ -515,18 +561,43 @@ fn init_profiler(config: &OtelConfig) -> Option<pyroscope::PyroscopeAgent<pyrosc
     let version = config.service_version.as_deref().unwrap_or(VERSION);
     let sample_rate = 100; // 100 Hz
 
-    let agent = PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
-        .tags(vec![("version", version)]) // TODO: add git commit tag
+    let agent = match PyroscopeAgentBuilder::new(endpoint, service_name, sample_rate, "pyroscope-rs", "1.0.1", backend)
+        .tags(vec![("version", version), ("profile_type", "cpu")])
         .build()
-        .ok()?;
+    {
+        Ok(agent) => agent,
+        Err(_) => {
+            log_profiler_failure("profiling_agent_build_failed", "build");
+            return None;
+        }
+    };
 
     match agent.start() {
         Ok(agent) => Some(agent),
-        Err(err) => {
-            eprintln!("Pyroscope agent start error: {err:?}");
+        Err(_) => {
+            log_profiler_failure("profiling_agent_start_failed", "start");
             None
         }
     }
+}
+
+#[cfg(not(all(
+    feature = "pyroscope",
+    any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+)))]
+pub(super) fn init_profiler(config: &OtelConfig) -> Option<ProfilingAgent> {
+    if config
+        .profiling_export_enabled
+        .unwrap_or(rustfs_config::DEFAULT_OBS_PROFILING_EXPORT_ENABLED)
+    {
+        warn!(
+            backend = "pyroscope",
+            result = "profiling_feature_not_compiled",
+            required_feature = "pyroscope",
+            "Profiling export is enabled but this binary was built without Pyroscope support"
+        );
+    }
+    None
 }
 
 /// Create a stdout periodic metrics reader for the given interval.
@@ -537,6 +608,22 @@ fn create_periodic_reader(interval: u64) -> PeriodicReader<opentelemetry_stdout:
     PeriodicReader::builder(opentelemetry_stdout::MetricExporter::default())
         .with_interval(Duration::from_secs(interval))
         .build()
+}
+
+fn resolve_meter_interval(config: &OtelConfig) -> u64 {
+    match config.meter_interval {
+        Some(0) => {
+            warn!(
+                result = "invalid_meter_interval",
+                configured_seconds = 0_u64,
+                fallback_seconds = METER_INTERVAL,
+                "Metrics export interval is invalid; using default interval"
+            );
+            METER_INTERVAL
+        }
+        Some(interval) => interval,
+        None => METER_INTERVAL,
+    }
 }
 
 fn resolve_signal_headers(common_headers: Option<&str>, signal_headers: Option<&str>) -> HashMap<String, String> {
@@ -575,28 +662,66 @@ fn resolve_signal_timeout(common_timeout_millis: Option<u64>, signal_timeout_mil
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::io::{self, Write};
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
+
+    const LOG_TRACER_CHILD_ENV: &str = "RUSTFS_OBS_LOG_TRACER_CHILD";
+
+    #[derive(Clone)]
+    struct TestWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for TestWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().expect("lock test log buffer").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TestWriter {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     #[test]
     /// Valid ratios should produce trace-id-ratio sampling.
     fn test_build_tracer_sampler_uses_trace_ratio_for_valid_values() {
         let sampler = build_tracer_sampler(0.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(1.0);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
 
         let sampler = build_tracer_sampler(0.5);
-        assert!(format!("{sampler:?}").contains("TraceIdRatioBased"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("TraceIdRatioBased"));
     }
 
     #[test]
     /// Invalid ratios should degrade to the safest non-dropping sampler.
     fn test_build_tracer_sampler_rejects_invalid_ratio_with_always_on() {
         let sampler = build_tracer_sampler(-0.1);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
 
         let sampler = build_tracer_sampler(1.2);
-        assert!(format!("{sampler:?}").contains("AlwaysOn"));
+        let rendered = format!("{sampler:?}");
+        assert!(rendered.contains("ParentBased"));
+        assert!(rendered.contains("AlwaysOn"));
     }
 
     #[test]
@@ -627,5 +752,161 @@ mod tests {
         assert_eq!(resolve_signal_timeout(None, None), None);
         assert_eq!(resolve_signal_timeout(Some(0), None), None);
         assert_eq!(resolve_signal_timeout(None, Some(0)), None);
+    }
+
+    #[test]
+    fn test_normalize_otlp_root_endpoint_trims_trailing_slashes() {
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318/"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318///"), "http://collector:4318");
+        assert_eq!(normalize_otlp_root_endpoint("http://collector:4318"), "http://collector:4318");
+    }
+
+    #[test]
+    fn test_resolve_signal_endpoint_avoids_double_slashes() {
+        assert_eq!(
+            resolve_signal_endpoint(None, normalize_otlp_root_endpoint("http://collector:4318/"), "/v1/traces"),
+            "http://collector:4318/v1/traces"
+        );
+        assert_eq!(
+            resolve_signal_endpoint(Some("http://custom:4318/v1/custom"), "http://collector:4318", "/v1/traces"),
+            "http://custom:4318/v1/custom"
+        );
+        assert_eq!(resolve_signal_endpoint(None, "", "/v1/traces"), "");
+    }
+
+    #[test]
+    fn test_resolve_otlp_use_stdout_honors_config_or_environment_default() {
+        assert!(resolve_otlp_use_stdout(Some(true), true));
+        assert!(!resolve_otlp_use_stdout(Some(false), false));
+        assert!(resolve_otlp_use_stdout(None, false));
+        assert!(!resolve_otlp_use_stdout(None, true));
+    }
+
+    #[test]
+    fn test_resolve_meter_interval_rejects_zero() {
+        let config = OtelConfig {
+            meter_interval: Some(0),
+            ..OtelConfig::default()
+        };
+
+        assert_eq!(resolve_meter_interval(&config), METER_INTERVAL);
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_metric_match_is_scoped() {
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_buckets_are_sorted() {
+        assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
+    }
+
+    #[cfg(all(
+        feature = "pyroscope",
+        any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
+    ))]
+    #[test]
+    fn test_init_profiler_invalid_endpoint_redacts_sensitive_components() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5:invalid/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(writer)
+            .finish();
+
+        let config = OtelConfig {
+            profiling_export_enabled: Some(true),
+            profiling_endpoint: Some(endpoint.to_string()),
+            ..OtelConfig::default()
+        };
+
+        tracing::subscriber::with_default(subscriber, || assert!(init_profiler(&config).is_none()));
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.contains(REDACTED_PROFILING_ENDPOINT));
+        assert!(rendered.contains("error_kind=\"invalid_endpoint\""));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "profiling log leaked {leaked}: {rendered}");
+        }
+    }
+
+    #[test]
+    fn test_pyroscope_upload_failure_targets_stay_filtered_when_env_filter_enables_them() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = TestWriter(Arc::clone(&buffer));
+        let env_filter = tracing_subscriber::EnvFilter::new("pyroscope=trace")
+            .add_directive("trace".parse().expect("parse trace filter directive"))
+            .add_directive("Pyroscope::Session=trace".parse().expect("parse Pyroscope filter directive"));
+        let subscriber = tracing_subscriber::registry()
+            .with(env_filter)
+            .with(pyroscope_log_filter())
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_writer(writer),
+            );
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            tracing::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+        });
+
+        let rendered = String::from_utf8(buffer.lock().expect("lock test log buffer").clone()).expect("decode test log");
+        assert!(rendered.is_empty(), "filtered Pyroscope upload failure reached a log sink: {rendered}");
+    }
+
+    #[test]
+    fn test_pyroscope_log_facade_upload_failure_is_filtered() {
+        let endpoint = "https://profile-user:profile-token@10.24.0.5/private/profiles?access_token=query-secret";
+        if env::var_os(LOG_TRACER_CHILD_ENV).is_some() {
+            tracing_subscriber::registry()
+                .with(build_env_filter("info", None))
+                .with(pyroscope_log_filter())
+                .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
+                .try_init()
+                .expect("install isolated LogTracer subscriber");
+            log::error!(target: "pyroscope::session", "SessionManager - Failed to send session: {endpoint}");
+            log::error!(target: "Pyroscope::Session", "SessionManager - Failed to send session: {endpoint}");
+            return;
+        }
+
+        let output = Command::new(env::current_exe().expect("resolve test executable"))
+            .args([
+                "--exact",
+                "telemetry::otel::tests::test_pyroscope_log_facade_upload_failure_is_filtered",
+                "--nocapture",
+            ])
+            .env(LOG_TRACER_CHILD_ENV, "1")
+            .env("RUST_LOG", "trace,pyroscope=trace,Pyroscope::Session=trace")
+            .output()
+            .expect("run isolated LogTracer test process");
+        assert!(output.status.success(), "isolated LogTracer test failed: {output:?}");
+
+        let rendered = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        for leaked in [
+            "profile-user",
+            "profile-token",
+            "10.24.0.5",
+            "private/profiles",
+            "query-secret",
+        ] {
+            assert!(!rendered.contains(leaked), "LogTracer path leaked {leaked}: {rendered}");
+        }
     }
 }

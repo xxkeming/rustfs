@@ -22,12 +22,10 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use serial_test::serial;
     use tracing::info;
 
     /// Verify Content-Encoding header roundtrips through PUT, GET, and HEAD operations
     #[tokio::test]
-    #[serial]
     async fn test_content_encoding_roundtrip() {
         init_logging();
         info!("Starting Content-Encoding roundtrip test");
@@ -80,13 +78,31 @@ mod tests {
         assert_eq!(head_resp.content_encoding(), Some("zstd"), "HEAD should return Content-Encoding: zstd");
         assert_eq!(head_resp.content_type(), Some("text/plain"), "HEAD should return correct Content-Type");
 
+        client
+            .delete_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .expect("DELETE object failed");
+        client
+            .delete_bucket()
+            .bucket(bucket)
+            .send()
+            .await
+            .expect("DELETE bucket failed");
+        client
+            .list_buckets()
+            .send()
+            .await
+            .expect("RustFS must remain available after deleting a bucket");
+
         env.stop_server();
     }
 
     /// Issue #1857: Content-Encoding "aws-chunked" is used by SigV4 streaming clients and must
     /// not be stored or returned. Upload with aws-chunked and verify GET/HEAD do not return it.
     #[tokio::test]
-    #[serial]
     async fn test_content_encoding_aws_chunked_not_returned_issue_1857() {
         init_logging();
         info!("Issue #1857: aws-chunked must not be persisted or returned");
@@ -142,7 +158,6 @@ mod tests {
     /// Issue #2475 / Route A: when aws-chunked is combined with an effective object encoding,
     /// only the effective encoding should roundtrip through GET/HEAD.
     #[tokio::test]
-    #[serial]
     async fn test_content_encoding_aws_chunked_with_effective_encoding_roundtrip() {
         init_logging();
         info!("aws-chunked,gzip should persist only gzip");

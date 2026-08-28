@@ -75,8 +75,32 @@ impl BucketVersioningSys {
             return Ok(VersioningConfiguration::default());
         }
 
+        // Read lock is sufficient — get_versioning_config() handles its own
+        // internal locking via metadata_map RwLock. The previous write lock
+        // serialized all concurrent GET requests on this global lock.
         let bucket_meta_sys_lock = get_bucket_metadata_sys()?;
-        let bucket_meta_sys = bucket_meta_sys_lock.write().await;
+        let bucket_meta_sys = bucket_meta_sys_lock.read().await;
+
+        let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
+
+        Ok(cfg)
+    }
+
+    /// Instance-scoped variant of [`Self::get`] (backlog#1052): resolves the
+    /// caller's own instance context so a second in-process store never
+    /// answers with the first instance's versioning state; falls back to the
+    /// ambient system when the instance cell is not initialized.
+    #[allow(
+        dead_code,
+        reason = "instance-scoped seam (backlog#1052) with no caller in this port (backlog#1823)"
+    )]
+    pub(crate) async fn get_in(ctx: &crate::runtime::instance::InstanceContext, bucket: &str) -> Result<VersioningConfiguration> {
+        if bucket == RUSTFS_META_BUCKET || bucket.starts_with(RUSTFS_META_BUCKET) {
+            return Ok(VersioningConfiguration::default());
+        }
+
+        let bucket_meta_sys_lock = crate::bucket::metadata_sys::bucket_metadata_sys_of(ctx)?;
+        let bucket_meta_sys = bucket_meta_sys_lock.read().await;
 
         let (cfg, _) = bucket_meta_sys.get_versioning_config(bucket).await?;
 

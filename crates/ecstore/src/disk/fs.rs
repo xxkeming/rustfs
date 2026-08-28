@@ -13,9 +13,11 @@
 // limitations under the License.
 
 use std::{
+    collections::HashMap,
     fs::Metadata,
-    path::Path,
-    sync::{Arc, OnceLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::{
     fs::{self, File},
@@ -150,44 +152,51 @@ pub fn access_std(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub async fn lstat(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    fs::metadata(path).await
+    fs::symlink_metadata(path).await
 }
 
 pub fn lstat_std(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    std::fs::metadata(path)
+    std::fs::symlink_metadata(path)
 }
 
 pub async fn make_dir_all(path: impl AsRef<Path>) -> io::Result<()> {
     fs::create_dir_all(path.as_ref()).await
 }
 
+fn is_dir_error(e: &io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EISDIR)
+        || e.kind() == io::ErrorKind::IsADirectory
+        // macOS: remove_file on a directory returns EPERM
+        || (cfg!(target_os = "macos") && e.raw_os_error() == Some(libc::EPERM))
+}
+
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn remove(path: impl AsRef<Path>) -> io::Result<()> {
-    let meta = fs::metadata(path.as_ref()).await?;
-    if meta.is_dir() {
-        fs::remove_dir(path.as_ref()).await
-    } else {
-        fs::remove_file(path.as_ref()).await
+    // Try remove_file first; fall back to remove_dir if it's a directory
+    match fs::remove_file(path.as_ref()).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_dir_error(&e) => fs::remove_dir(path.as_ref()).await,
+        Err(e) => Err(e),
     }
 }
 
+#[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
 pub async fn remove_all(path: impl AsRef<Path>) -> io::Result<()> {
-    let meta = fs::metadata(path.as_ref()).await?;
-    if meta.is_dir() {
-        fs::remove_dir_all(path.as_ref()).await
-    } else {
-        fs::remove_file(path.as_ref()).await
+    // Try remove_file first; fall back to remove_dir_all if it's a directory
+    match fs::remove_file(path.as_ref()).await {
+        Ok(()) => Ok(()),
+        Err(e) if is_dir_error(&e) => fs::remove_dir_all(path.as_ref()).await,
+        Err(e) => Err(e),
     }
 }
 
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn remove_std(path: impl AsRef<Path>) -> io::Result<()> {
-    let path = path.as_ref();
-    let meta = std::fs::metadata(path)?;
-    if meta.is_dir() {
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
+    // Try remove_file first; fall back to remove_dir if it's a directory
+    match std::fs::remove_file(path.as_ref()) {
+        Ok(()) => Ok(()),
+        Err(e) if is_dir_error(&e) => std::fs::remove_dir(path.as_ref()),
+        Err(e) => Err(e),
     }
 }
 
@@ -216,6 +225,78 @@ pub fn rename_std(from: impl AsRef<Path>, to: impl AsRef<Path>) -> io::Result<()
 #[tracing::instrument(level = "debug", skip_all)]
 pub async fn read_file(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
     fs::read(path.as_ref()).await
+}
+
+// Bucket existence cache - reduces statx syscalls for repeated bucket checks
+
+/// Cache for bucket directory existence checks.
+struct BucketExistenceCache {
+    cache: Mutex<HashMap<PathBuf, (Instant, bool)>>,
+    ttl: Duration,
+}
+
+impl BucketExistenceCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            cache: Mutex::new(HashMap::new()),
+            ttl,
+        }
+    }
+
+    fn check_exists(&self, path: &PathBuf) -> Option<bool> {
+        let mut cache = self.cache.lock().ok()?;
+        if let Some((timestamp, exists)) = cache.get(path) {
+            if timestamp.elapsed() < self.ttl {
+                return Some(*exists);
+            }
+            cache.remove(path);
+        }
+        None
+    }
+
+    fn record(&self, path: PathBuf, exists: bool) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(path, (Instant::now(), exists));
+        }
+    }
+
+    fn invalidate(&self, path: &PathBuf) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.remove(path);
+        }
+    }
+}
+
+static BUCKET_EXISTENCE_CACHE: std::sync::LazyLock<BucketExistenceCache> =
+    std::sync::LazyLock::new(|| BucketExistenceCache::new(Duration::from_secs(60)));
+
+/// Cached access check - reduces statx syscalls
+pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
+    let path_buf = path.as_ref().to_path_buf();
+
+    if let Some(exists) = BUCKET_EXISTENCE_CACHE.check_exists(&path_buf) {
+        if exists {
+            return Ok(());
+        }
+        return Err(io::Error::new(io::ErrorKind::NotFound, "bucket not found (cached)"));
+    }
+
+    let result = fs::metadata(&path_buf).await;
+
+    match &result {
+        Ok(_) => BUCKET_EXISTENCE_CACHE.record(path_buf, true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            BUCKET_EXISTENCE_CACHE.record(path_buf, false);
+        }
+        _ => {}
+    }
+
+    result?;
+    Ok(())
+}
+
+pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
+    BUCKET_EXISTENCE_CACHE.invalidate(&path.as_ref().to_path_buf());
 }
 
 #[cfg(test)]
@@ -349,6 +430,22 @@ mod tests {
         assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_lstat_preserves_symlink_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target.txt");
+        let link_path = temp_dir.path().join("link.txt");
+
+        tokio::fs::write(&target_path, b"test content").await.unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let metadata = lstat(&link_path).await.unwrap();
+        assert!(metadata.file_type().is_symlink());
+    }
+
     #[test]
     fn test_lstat_std() {
         let temp_dir = TempDir::new().unwrap();
@@ -361,6 +458,22 @@ mod tests {
         let metadata = lstat_std(&file_path).unwrap();
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), 12); // "test content" is 12 bytes
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_lstat_std_preserves_symlink_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let target_path = temp_dir.path().join("target-std.txt");
+        let link_path = temp_dir.path().join("link-std.txt");
+
+        std::fs::write(&target_path, b"test content").unwrap();
+        symlink(&target_path, &link_path).unwrap();
+
+        let metadata = lstat_std(&link_path).unwrap();
+        assert!(metadata.file_type().is_symlink());
     }
 
     #[tokio::test]
@@ -545,7 +658,7 @@ mod tests {
 
         // Create two different files
         tokio::fs::write(&file1_path, b"content1").await.unwrap();
-        tokio::fs::write(&file2_path, b"content2").await.unwrap();
+        tokio::fs::write(&file2_path, b"different content").await.unwrap();
 
         // Get metadata
         let metadata1 = tokio::fs::metadata(&file1_path).await.unwrap();

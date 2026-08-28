@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![recursion_limit = "256"]
+
 //! RustFS — high-performance S3-compatible object storage.
 //!
 //! This library exposes the [`embedded`] module which lets you start a
@@ -50,26 +52,87 @@
 //! tests where you start one server in a background task, run all your
 //! tests, and then shut it down.
 
+/// Scope-based hotpath measurement for `#[async_trait]` methods, where
+/// `#[hotpath::measure]` would only time the boxed-future construction.
+/// The guard records wall time from this statement until the enclosing
+/// (desugared) async block completes, including early returns via `?`.
+/// With the `hotpath` feature off it expands to nothing.
+#[cfg(feature = "hotpath")]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {
+        let _hotpath_scope_guard = ::hotpath::functions::build_measurement_guard_sync($label, false);
+    };
+}
+
+#[cfg(not(feature = "hotpath"))]
+#[macro_export]
+macro_rules! hp_guard {
+    ($label:expr) => {};
+}
+
 pub mod admin;
 pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
+pub(crate) mod bitrot_selftest;
 pub mod capacity;
+pub mod cgroup_resources;
+pub mod cluster_snapshot;
 pub mod config;
+pub mod connect;
 pub mod delete_tail_activity;
+pub mod diagnose;
 pub mod embedded;
 pub mod error;
 pub mod init;
+pub mod inspect;
+pub(crate) mod kms_deletion_gate;
+pub(crate) mod kms_rekey;
 pub mod license;
 pub mod memory_observability;
+pub mod module_switches;
 pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
+pub mod runtime_capabilities;
+pub(crate) mod runtime_sources;
 pub mod server;
+pub mod shared_types;
+pub(crate) mod site_replication;
+pub(crate) mod site_replication_reconcile;
+pub(crate) mod startup_audit;
+pub(crate) mod startup_auth;
+pub(crate) mod startup_background;
+pub(crate) mod startup_bucket_metadata;
+pub(crate) mod startup_deadlock;
+pub(crate) mod startup_embedded;
+pub(crate) mod startup_embedded_optional;
+pub mod startup_entrypoint;
+pub(crate) mod startup_fs_guard;
+pub(crate) mod startup_iam;
+pub(crate) mod startup_lifecycle;
+pub(crate) mod startup_notification;
+pub(crate) mod startup_observability;
+pub(crate) mod startup_optional_runtime_sidecars;
+pub(crate) mod startup_preflight;
+pub(crate) mod startup_protocols;
+pub(crate) mod startup_runtime;
+pub(crate) mod startup_runtime_hooks;
+pub(crate) mod startup_runtime_sources;
+pub(crate) mod startup_server;
+pub(crate) mod startup_services;
+pub(crate) mod startup_shutdown;
+pub(crate) mod startup_storage;
+pub(crate) mod startup_tls_material;
 pub mod storage;
+pub(crate) mod storage_api;
+pub(crate) mod table_catalog;
+pub mod tls;
 pub mod update;
 pub mod version;
+pub mod workload_admission;
 
 // Re-export from rustfs_utils so that config sub-modules can use
 // `crate::apply_external_env_compat` without breaking.

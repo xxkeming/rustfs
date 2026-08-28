@@ -18,46 +18,109 @@ use hyper::Uri;
 use std::collections::HashMap;
 use std::fmt::Write;
 use time::{OffsetDateTime, format_description};
+use tracing::warn;
 
-use super::utils::get_host_addr;
+use http::HeaderValue;
+
+use super::utils::{HostAddrError, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hmac_sha1};
 use s3s::Body;
 
+// NOTE: SHA-1 HMAC is used here for AWS S3 Signature V2 compatibility.
+// SHA-1 is considered weak, but it's only used for HMAC (not signature collision).
+// Migration plan (not yet implemented):
+// Phase 1: Support both SHA-1 and SHA-256 (configurable)
+// Phase 2: Deprecation warnings in response headers
+// Phase 3: Default to SHA-256, SHA-1 becomes optional
+// See https://github.com/rustfs/backlog/issues/747 for discussion.
+
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
+
+#[derive(Debug, thiserror::Error)]
+pub enum SignV2Error {
+    #[error("invalid UTF-8 header value for `{name}`")]
+    InvalidHeaderValue { name: String },
+    #[error("failed to format signing timestamp: {reason}")]
+    TimeFormat { reason: String },
+    #[error("failed to build signing timestamp: {reason}")]
+    TimeComponent { reason: String },
+    #[error("failed to encode query parameters: {reason}")]
+    QueryEncode { reason: String },
+    #[error("failed to parse uri: {reason}")]
+    InvalidUri { reason: String },
+    #[error("failed to build uri from parts: {reason}")]
+    InvalidUriParts { reason: String },
+    #[error("failed to convert canonical headers to UTF-8: {reason}")]
+    CanonicalUtf8 { reason: String },
+    #[error("failed to parse header value for `{name}`: {reason}")]
+    HeaderValueParse { name: String, reason: String },
+    #[error("failed to resolve host address: {0}")]
+    HostAddr(#[from] HostAddrError),
+}
+
+#[derive(Debug)]
+struct SignV2Failure {
+    request: request::Request<Body>,
+    error: SignV2Error,
+}
+
+type SignV2Outcome = std::result::Result<request::Request<Body>, Box<SignV2Failure>>;
+
+fn sign_v2_fail(request: request::Request<Body>, error: SignV2Error) -> SignV2Outcome {
+    Err(Box::new(SignV2Failure { request, error }))
+}
 
 fn encode_url2path(req: &request::Request<Body>, _virtual_host: bool) -> String {
     req.uri().path().to_string()
 }
 
-pub fn pre_sign_v2(
+fn pre_sign_v2_inner(
     mut req: request::Request<Body>,
     access_key_id: &str,
     secret_access_key: &str,
     expires: i64,
     virtual_host: bool,
-) -> request::Request<Body> {
+) -> SignV2Outcome {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
-        return req;
+        return Ok(req);
     }
 
     let d = OffsetDateTime::now_utc();
-    let d = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
     let epoch_expires = d.unix_timestamp() + expires;
 
     let headers = req.headers_mut();
     let expires_str = headers.get("Expires");
     if expires_str.is_none() {
-        headers.insert("Expires", format!("{epoch_expires:010}").parse().unwrap());
+        let expires_value = match format!("{epoch_expires:010}").parse::<HeaderValue>() {
+            Ok(v) => v,
+            Err(err) => {
+                return sign_v2_fail(
+                    req,
+                    SignV2Error::HeaderValueParse {
+                        name: "Expires".to_string(),
+                        reason: err.to_string(),
+                    },
+                );
+            }
+        };
+        headers.insert("Expires", expires_value);
     }
 
-    let string_to_sign = pre_string_to_sign_v2(&req, virtual_host);
-    let signature = hex(hmac_sha1(secret_access_key, string_to_sign));
+    let string_to_sign = match try_pre_string_to_sign_v2(&req, virtual_host) {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, err),
+    };
+    let signature = base64_simd::STANDARD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign));
 
     let query_source = req.uri().query().unwrap_or("");
     let result = serde_urlencoded::from_str::<HashMap<String, String>>(query_source);
     let mut query = result.unwrap_or_default();
-    if get_host_addr(&req).contains(".storage.googleapis.com") {
+    let host_addr = match try_get_host_addr(&req) {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, SignV2Error::HostAddr(err)),
+    };
+    if host_addr.contains(".storage.googleapis.com") {
         query.insert("GoogleAccessId".to_string(), access_key_id.to_string());
     } else {
         query.insert("AWSAccessKeyId".to_string(), access_key_id.to_string());
@@ -67,63 +130,151 @@ pub fn pre_sign_v2(
 
     let uri = req.uri().clone();
     let mut parts = req.uri().clone().into_parts();
-    parts.path_and_query = Some(
-        format!("{}?{}&Signature={}", uri.path(), serde_urlencoded::to_string(&query).unwrap(), signature)
-            .parse()
-            .unwrap(),
-    );
+    let query_str = match serde_urlencoded::to_string(&query) {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, SignV2Error::QueryEncode { reason: err.to_string() }),
+    };
+    parts.path_and_query = Some(match format!("{}?{}&Signature={}", uri.path(), query_str, signature).parse() {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, SignV2Error::InvalidUri { reason: err.to_string() }),
+    });
 
-    *req.uri_mut() = Uri::from_parts(parts).unwrap();
+    *req.uri_mut() = match Uri::from_parts(parts) {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, SignV2Error::InvalidUriParts { reason: err.to_string() }),
+    };
 
-    req
+    Ok(req)
+}
+
+pub fn try_pre_sign_v2(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    expires: i64,
+    virtual_host: bool,
+) -> Result<request::Request<Body>, SignV2Error> {
+    pre_sign_v2_inner(req, access_key_id, secret_access_key, expires, virtual_host).map_err(|f| f.error)
+}
+
+pub fn pre_sign_v2(
+    req: request::Request<Body>,
+    access_key_id: &str,
+    secret_access_key: &str,
+    expires: i64,
+    virtual_host: bool,
+) -> request::Request<Body> {
+    match pre_sign_v2_inner(req, access_key_id, secret_access_key, expires, virtual_host) {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to presign v2 request");
+            failure.request
+        }
+    }
 }
 
 fn _post_pre_sign_signature_v2(policy_base64: &str, secret_access_key: &str) -> String {
     hex(hmac_sha1(secret_access_key, policy_base64))
 }
 
-pub fn sign_v2(
+fn sign_v2_inner(
     mut req: request::Request<Body>,
     _content_len: i64,
     access_key_id: &str,
     secret_access_key: &str,
     virtual_host: bool,
-) -> request::Request<Body> {
+) -> SignV2Outcome {
     if access_key_id.is_empty() || secret_access_key.is_empty() {
-        return req;
+        return Ok(req);
     }
 
     let d = OffsetDateTime::now_utc();
-    let d2 = d.replace_time(time::Time::from_hms(0, 0, 0).unwrap());
 
     {
         let headers = req.headers_mut();
         let need_default_date = headers.get("Date").and_then(|v| v.to_str().ok()).is_none_or(|v| v.is_empty());
         if need_default_date {
-            headers.insert("Date", d2.format(&format_description::well_known::Rfc2822).unwrap().parse().unwrap());
+            let date_str = match d.format(&format_description::well_known::Rfc2822) {
+                Ok(v) => v,
+                Err(err) => return sign_v2_fail(req, SignV2Error::TimeFormat { reason: err.to_string() }),
+            };
+            let date_value = match date_str.parse::<HeaderValue>() {
+                Ok(v) => v,
+                Err(err) => {
+                    return sign_v2_fail(
+                        req,
+                        SignV2Error::HeaderValueParse {
+                            name: "Date".to_string(),
+                            reason: err.to_string(),
+                        },
+                    );
+                }
+            };
+            headers.insert("Date", date_value);
         }
     }
-    let string_to_sign = string_to_sign_v2(&req, virtual_host);
+    let string_to_sign = match try_string_to_sign_v2(&req, virtual_host) {
+        Ok(v) => v,
+        Err(err) => return sign_v2_fail(req, err),
+    };
     let headers = req.headers_mut();
 
     let auth_header = format!("{SIGN_V2_ALGORITHM} {access_key_id}:");
     let auth_header = format!(
         "{}{}",
         auth_header,
-        base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign))
+        base64_simd::STANDARD.encode_to_string(hmac_sha1(secret_access_key, string_to_sign))
     );
 
-    headers.insert("Authorization", auth_header.parse().unwrap());
+    let auth_value = match auth_header.parse::<HeaderValue>() {
+        Ok(v) => v,
+        Err(err) => {
+            return sign_v2_fail(
+                req,
+                SignV2Error::HeaderValueParse {
+                    name: "Authorization".to_string(),
+                    reason: err.to_string(),
+                },
+            );
+        }
+    };
+    headers.insert("Authorization", auth_value);
 
-    req
+    Ok(req)
 }
 
-fn pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> String {
+pub fn try_sign_v2(
+    req: request::Request<Body>,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    virtual_host: bool,
+) -> Result<request::Request<Body>, SignV2Error> {
+    sign_v2_inner(req, content_len, access_key_id, secret_access_key, virtual_host).map_err(|f| f.error)
+}
+
+pub fn sign_v2(
+    req: request::Request<Body>,
+    content_len: i64,
+    access_key_id: &str,
+    secret_access_key: &str,
+    virtual_host: bool,
+) -> request::Request<Body> {
+    match sign_v2_inner(req, content_len, access_key_id, secret_access_key, virtual_host) {
+        Ok(request) => request,
+        Err(failure) => {
+            warn!(error = %failure.error, "failed to sign v2 request");
+            failure.request
+        }
+    }
+}
+
+fn try_pre_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Result<String, SignV2Error> {
     let mut buf = BytesMut::new();
     write_pre_sign_v2_headers(&mut buf, req);
     write_canonicalized_headers(&mut buf, req);
     write_canonicalized_resource(&mut buf, req, virtual_host);
-    String::from_utf8(buf.to_vec()).unwrap()
+    String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
 }
 
 fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
@@ -137,12 +288,12 @@ fn write_pre_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
     let _ = buf.write_char('\n');
 }
 
-fn string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> String {
+fn try_string_to_sign_v2(req: &request::Request<Body>, virtual_host: bool) -> Result<String, SignV2Error> {
     let mut buf = BytesMut::new();
     write_sign_v2_headers(&mut buf, req);
     write_canonicalized_headers(&mut buf, req);
     write_canonicalized_resource(&mut buf, req, virtual_host);
-    String::from_utf8(buf.to_vec()).unwrap()
+    String::from_utf8(buf.to_vec()).map_err(|err| SignV2Error::CanonicalUtf8 { reason: err.to_string() })
 }
 
 fn write_sign_v2_headers(buf: &mut BytesMut, req: &request::Request<Body>) {
@@ -309,12 +460,144 @@ mod tests {
             .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
 
         let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
-        let expected_string_to_sign = string_to_sign_v2(&req, false);
-        let expected_signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
+        let expected_string_to_sign = try_string_to_sign_v2(&req, false).expect("string to sign should build");
+        let expected_signature = base64_simd::STANDARD.encode_to_string(hmac_sha1("SECRET", expected_string_to_sign));
 
         assert_eq!(
             req.headers().get("Authorization").unwrap().to_str().unwrap(),
             format!("AWS AKIAEXAMPLE:{expected_signature}")
         );
+    }
+
+    // Known-answer test: with a fixed non-midnight Date already set, the emitted
+    // Authorization signature is the STANDARD (padded) base64 of the HMAC-SHA1 over
+    // the canonical string-to-sign "GET\n\n\nFri, 24 May 2013 12:34:56 GMT\n/object".
+    #[test]
+    fn test_sign_v2_authorization_known_answer() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+        req.headers_mut()
+            .insert("Date", "Fri, 24 May 2013 12:34:56 GMT".parse().unwrap());
+
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+
+        // The fixed Date must be preserved (not overwritten with midnight).
+        assert_eq!(req.headers().get("Date").unwrap().to_str().unwrap(), "Fri, 24 May 2013 12:34:56 GMT");
+        // Reference value: standard base64 of HMAC-SHA1("SECRET", string_to_sign).
+        assert_eq!(
+            req.headers().get("Authorization").unwrap().to_str().unwrap(),
+            "AWS AKIAEXAMPLE:1SPmXVPPoRZ1v5hKvou9xXq5GfU="
+        );
+    }
+
+    // The auto-generated Date header must reflect the real signing instant, never
+    // midnight UTC.
+    #[test]
+    fn test_sign_v2_date_uses_real_time_not_midnight() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let before = OffsetDateTime::now_utc();
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+        let after = OffsetDateTime::now_utc();
+
+        let date_str = req.headers().get("Date").unwrap().to_str().unwrap();
+        let signed = OffsetDateTime::parse(date_str, &format_description::well_known::Rfc2822).expect("Date must be RFC2822");
+
+        // RFC2822 truncates to whole seconds, so allow a one-second slack on each side.
+        assert!(
+            signed.unix_timestamp() >= before.unix_timestamp() - 1 && signed.unix_timestamp() <= after.unix_timestamp() + 1,
+            "signed Date {signed} must fall within the signing window [{before}, {after}]"
+        );
+    }
+
+    // A presigned V2 URL must set Expires to (now + expires), computed from the real
+    // signing instant rather than midnight.
+    #[test]
+    fn test_pre_sign_v2_expires_is_now_plus_expires() {
+        let expires = 60i64;
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let before = OffsetDateTime::now_utc();
+        let req = pre_sign_v2(req, "AKIAEXAMPLE", "SECRET", expires, false);
+        let after = OffsetDateTime::now_utc();
+
+        let query = req.uri().query().unwrap_or_default();
+        let values = serde_urlencoded::from_str::<HashMap<String, String>>(query).unwrap();
+        let signed_expires = values.get("Expires").unwrap().parse::<i64>().unwrap();
+
+        assert!(
+            signed_expires >= before.unix_timestamp() + expires && signed_expires <= after.unix_timestamp() + expires,
+            "Expires {signed_expires} must equal now + {expires}"
+        );
+    }
+
+    // The header-auth signature must be valid STANDARD base64 (decodes to the 20-byte
+    // HMAC-SHA1 digest, padded), never URL-safe or hex.
+    #[test]
+    fn test_sign_v2_signature_is_standard_base64() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let req = sign_v2(req, 0, "AKIAEXAMPLE", "SECRET", false);
+        let auth = req.headers().get("Authorization").unwrap().to_str().unwrap();
+        let signature = auth.strip_prefix("AWS AKIAEXAMPLE:").expect("auth prefix");
+
+        // Standard base64 of a 20-byte SHA-1 digest is 28 chars with one '=' pad.
+        assert_eq!(signature.len(), 28);
+        assert!(signature.ends_with('='), "standard base64 must be padded: {signature}");
+        assert!(
+            !signature.contains('-') && !signature.contains('_'),
+            "signature must not be URL-safe base64: {signature}"
+        );
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(signature)
+            .expect("must decode as standard base64");
+        assert_eq!(decoded.len(), 20);
+    }
+
+    // The presigned Signature query value must likewise be STANDARD base64, not hex.
+    #[test]
+    fn test_pre_sign_v2_signature_is_standard_base64() {
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .unwrap();
+        req.headers_mut()
+            .insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+
+        let req = pre_sign_v2(req, "AKIAEXAMPLE", "SECRET", 60, false);
+        let query = req.uri().query().unwrap_or_default();
+        // Signature is appended last as `&Signature=<value>`, unencoded.
+        let signature = query.rsplit_once("Signature=").expect("Signature param").1;
+
+        assert_eq!(signature.len(), 28);
+        assert!(signature.ends_with('='), "standard base64 must be padded: {signature}");
+        let decoded = base64_simd::STANDARD
+            .decode_to_vec(signature)
+            .expect("must decode as standard base64");
+        assert_eq!(decoded.len(), 20);
     }
 }

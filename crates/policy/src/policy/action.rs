@@ -17,7 +17,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, Error as DeError, Visitor},
 };
-use std::{collections::HashSet, fmt, ops::Deref};
+use std::{fmt, ops::Deref};
 use strum::{EnumString, IntoStaticStr};
 
 use super::{Error as IamError, Validator, utils::wildcard};
@@ -25,7 +25,7 @@ use super::{Error as IamError, Validator, utils::wildcard};
 /// A set of policy actions that always serializes as an array of strings,
 /// conforming to the S3 policy specification for consistency and compatibility.
 #[derive(Clone, Default, Debug)]
-pub struct ActionSet(pub HashSet<Action>);
+pub struct ActionSet(pub Vec<Action>);
 
 impl Serialize for ActionSet {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -51,6 +51,12 @@ impl ActionSet {
         self.0.is_empty()
     }
 
+    fn push_unique(&mut self, action: Action) {
+        if !self.0.contains(&action) {
+            self.0.push(action);
+        }
+    }
+
     pub fn is_match(&self, action: &Action) -> bool {
         for act in self.0.iter() {
             if act.is_match(action) {
@@ -69,7 +75,7 @@ impl ActionSet {
 }
 
 impl Deref for ActionSet {
-    type Target = HashSet<Action>;
+    type Target = [Action];
 
     fn deref(&self) -> &Self::Target {
         &self.0
@@ -85,7 +91,7 @@ impl Validator for ActionSet {
 
 impl PartialEq for ActionSet {
     fn eq(&self, other: &Self) -> bool {
-        self.len() == other.len() && self.0.iter().all(|x| other.0.contains(x))
+        self.0.iter().all(|x| other.0.contains(x)) && other.0.iter().all(|x| self.0.contains(x))
     }
 }
 
@@ -108,9 +114,9 @@ impl<'de> Deserialize<'de> for ActionSet {
                 E: de::Error,
             {
                 let action = Action::try_from(value).map_err(|e| E::custom(format!("invalid action: {}", e)))?;
-                let mut set = HashSet::new();
-                set.insert(action);
-                Ok(ActionSet(set))
+                let mut actions = ActionSet::default();
+                actions.push_unique(action);
+                Ok(actions)
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
@@ -118,18 +124,18 @@ impl<'de> Deserialize<'de> for ActionSet {
                 A: de::SeqAccess<'de>,
                 A::Error: DeError,
             {
-                let mut set = HashSet::with_capacity(seq.size_hint().unwrap_or(0));
+                let mut actions = ActionSet(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
                 while let Some(value) = seq.next_element::<String>()? {
                     match Action::try_from(value.as_str()) {
                         Ok(action) => {
-                            set.insert(action);
+                            actions.push_unique(action);
                         }
                         Err(e) => {
                             return Err(A::Error::custom(format!("invalid action: {}", e)));
                         }
                     }
                 }
-                Ok(ActionSet(set))
+                Ok(actions)
             }
         }
 
@@ -349,37 +355,6 @@ pub enum S3Action {
     GetBucketQuotaAction,
 }
 
-// #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, EnumString, IntoStaticStr, Debug, Copy)]
-// #[serde(try_from = "&str", into = "&str")]
-// pub enum AdminAction {
-//     #[strum(serialize = "admin:*")]
-//     AllActions,
-//     #[strum(serialize = "admin:Profiling")]
-//     ProfilingAdminAction,
-//     #[strum(serialize = "admin:ServerTrace")]
-//     TraceAdminAction,
-//     #[strum(serialize = "admin:ConsoleLog")]
-//     ConsoleLogAdminAction,
-//     #[strum(serialize = "admin:ServerInfo")]
-//     ServerInfoAdminAction,
-//     #[strum(serialize = "admin:OBDInfo")]
-//     HealthInfoAdminAction,
-//     #[strum(serialize = "admin:TopLocksInfo")]
-//     TopLocksAdminAction,
-//     #[strum(serialize = "admin:LicenseInfo")]
-//     LicenseInfoAdminAction,
-//     #[strum(serialize = "admin:BandwidthMonitor")]
-//     BandwidthMonitorAction,
-//     #[strum(serialize = "admin:InspectData")]
-//     InspectDataAction,
-//     #[strum(serialize = "admin:Prometheus")]
-//     PrometheusAdminAction,
-//     #[strum(serialize = "admin:ListServiceAccounts")]
-//     ListServiceAccountsAdminAction,
-//     #[strum(serialize = "admin:CreateServiceAccount")]
-//     CreateServiceAccountAdminAction,
-// }
-
 // AdminAction - admin policy action.
 #[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, IntoStaticStr, Debug, Copy, EnumString)]
 #[serde(try_from = "&str", into = "&str")]
@@ -406,10 +381,6 @@ pub enum AdminAction {
     TraceAdminAction,
     #[strum(serialize = "admin:ConsoleLog")]
     ConsoleLogAdminAction,
-    #[strum(serialize = "admin:KMSCreateKey")]
-    KMSCreateKeyAdminAction,
-    #[strum(serialize = "admin:KMSKeyStatus")]
-    KMSKeyStatusAdminAction,
     #[strum(serialize = "admin:ServerInfo")]
     ServerInfoAdminAction,
     #[strum(serialize = "admin:OBDInfo")]
@@ -494,6 +465,8 @@ pub enum AdminAction {
     SetBucketTargetAction,
     #[strum(serialize = "admin:GetBucketTarget")]
     GetBucketTargetAction,
+    #[strum(serialize = "admin:GetMetrics")]
+    GetMetricsAction,
     #[strum(serialize = "admin:ReplicationDiff")]
     ReplicationDiff,
     #[strum(serialize = "admin:GetReplicationMetrics")]
@@ -502,6 +475,50 @@ pub enum AdminAction {
     ImportBucketMetadataAction,
     #[strum(serialize = "admin:ExportBucketMetadata")]
     ExportBucketMetadataAction,
+    #[strum(serialize = "admin:GetTableCatalog")]
+    GetTableCatalogAction,
+    #[strum(serialize = "admin:MigrateTableCatalog")]
+    MigrateTableCatalogAction,
+    #[strum(serialize = "admin:GetTableBucket")]
+    GetTableBucketAction,
+    #[strum(serialize = "admin:SetTableBucket")]
+    SetTableBucketAction,
+    #[strum(serialize = "admin:GetTableNamespace")]
+    GetTableNamespaceAction,
+    #[strum(serialize = "admin:SetTableNamespace")]
+    SetTableNamespaceAction,
+    #[strum(serialize = "admin:UpdateTableNamespaceProperties")]
+    UpdateTableNamespacePropertiesAction,
+    #[strum(serialize = "admin:DeleteTableNamespace")]
+    DeleteTableNamespaceAction,
+    #[strum(serialize = "admin:GetTable")]
+    GetTableAction,
+    #[strum(serialize = "admin:SetTable")]
+    SetTableAction,
+    #[strum(serialize = "admin:CreateTable")]
+    CreateTableAction,
+    #[strum(serialize = "admin:RegisterTable")]
+    RegisterTableAction,
+    #[strum(serialize = "admin:CommitTable")]
+    CommitTableAction,
+    #[strum(serialize = "admin:DeleteTable")]
+    DeleteTableAction,
+    #[strum(serialize = "admin:GetTableLifecycle")]
+    GetTableLifecycleAction,
+    #[strum(serialize = "admin:SetTableLifecycle")]
+    SetTableLifecycleAction,
+    #[strum(serialize = "admin:GetTableCredentials")]
+    GetTableCredentialsAction,
+    #[strum(serialize = "admin:RunTableMaintenance")]
+    RunTableMaintenanceAction,
+    #[strum(serialize = "admin:GetTableMetadataLocation")]
+    GetTableMetadataLocationAction,
+    #[strum(serialize = "admin:SetTableMetadataLocation")]
+    SetTableMetadataLocationAction,
+    #[strum(serialize = "admin:GetTableMetadata")]
+    GetTableMetadataAction,
+    #[strum(serialize = "admin:SetTableMetadata")]
+    SetTableMetadataAction,
     #[strum(serialize = "admin:SetTier")]
     SetTierAction,
     #[strum(serialize = "admin:ListTier")]
@@ -523,6 +540,32 @@ pub enum AdminAction {
 }
 
 impl AdminAction {
+    pub(crate) fn is_table_resource_scoped(&self) -> bool {
+        matches!(
+            self,
+            AdminAction::GetTableBucketAction
+                | AdminAction::SetTableBucketAction
+                | AdminAction::GetTableNamespaceAction
+                | AdminAction::SetTableNamespaceAction
+                | AdminAction::UpdateTableNamespacePropertiesAction
+                | AdminAction::DeleteTableNamespaceAction
+                | AdminAction::GetTableAction
+                | AdminAction::SetTableAction
+                | AdminAction::CreateTableAction
+                | AdminAction::RegisterTableAction
+                | AdminAction::CommitTableAction
+                | AdminAction::DeleteTableAction
+                | AdminAction::GetTableLifecycleAction
+                | AdminAction::SetTableLifecycleAction
+                | AdminAction::GetTableCredentialsAction
+                | AdminAction::RunTableMaintenanceAction
+                | AdminAction::GetTableMetadataLocationAction
+                | AdminAction::SetTableMetadataLocationAction
+                | AdminAction::GetTableMetadataAction
+                | AdminAction::SetTableMetadataAction
+        )
+    }
+
     // IsValid - checks if action is valid or not.
     pub fn is_valid(&self) -> bool {
         matches!(
@@ -538,8 +581,6 @@ impl AdminAction {
                 | AdminAction::ProfilingAdminAction
                 | AdminAction::TraceAdminAction
                 | AdminAction::ConsoleLogAdminAction
-                | AdminAction::KMSCreateKeyAdminAction
-                | AdminAction::KMSKeyStatusAdminAction
                 | AdminAction::ServerInfoAdminAction
                 | AdminAction::HealthInfoAdminAction
                 | AdminAction::LicenseInfoAdminAction
@@ -582,10 +623,33 @@ impl AdminAction {
                 | AdminAction::SetBucketQuotaAdminAction
                 | AdminAction::SetBucketTargetAction
                 | AdminAction::GetBucketTargetAction
+                | AdminAction::GetMetricsAction
                 | AdminAction::ReplicationDiff
                 | AdminAction::GetReplicationMetricsAction
                 | AdminAction::ImportBucketMetadataAction
                 | AdminAction::ExportBucketMetadataAction
+                | AdminAction::GetTableCatalogAction
+                | AdminAction::MigrateTableCatalogAction
+                | AdminAction::GetTableBucketAction
+                | AdminAction::SetTableBucketAction
+                | AdminAction::GetTableNamespaceAction
+                | AdminAction::SetTableNamespaceAction
+                | AdminAction::UpdateTableNamespacePropertiesAction
+                | AdminAction::DeleteTableNamespaceAction
+                | AdminAction::GetTableAction
+                | AdminAction::SetTableAction
+                | AdminAction::CreateTableAction
+                | AdminAction::RegisterTableAction
+                | AdminAction::CommitTableAction
+                | AdminAction::DeleteTableAction
+                | AdminAction::GetTableLifecycleAction
+                | AdminAction::SetTableLifecycleAction
+                | AdminAction::GetTableCredentialsAction
+                | AdminAction::RunTableMaintenanceAction
+                | AdminAction::GetTableMetadataLocationAction
+                | AdminAction::SetTableMetadataLocationAction
+                | AdminAction::GetTableMetadataAction
+                | AdminAction::SetTableMetadataAction
                 | AdminAction::SetTierAction
                 | AdminAction::ListTierAction
                 | AdminAction::ExportIAMAction
@@ -613,12 +677,52 @@ pub enum StsAction {
 pub enum KmsAction {
     #[strum(serialize = "kms:*")]
     AllActions,
+    #[strum(serialize = "kms:Configure")]
+    ConfigureAction,
+    #[strum(serialize = "kms:ServiceControl")]
+    ServiceControlAction,
+    #[strum(serialize = "kms:ClearCache")]
+    ClearCacheAction,
+    #[strum(serialize = "kms:GenerateDataKey")]
+    GenerateDataKeyAction,
+    #[strum(serialize = "kms:DeleteKey")]
+    DeleteKeyAction,
+    #[strum(serialize = "kms:EnableKey")]
+    EnableKeyAction,
+    #[strum(serialize = "kms:DisableKey")]
+    DisableKeyAction,
+    #[strum(serialize = "kms:RotateKey")]
+    RotateKeyAction,
+    #[strum(serialize = "kms:UpdateKeyDescription")]
+    UpdateKeyDescriptionAction,
+    #[strum(serialize = "kms:TagResource")]
+    TagResourceAction,
+    #[strum(serialize = "kms:UntagResource")]
+    UntagResourceAction,
+    #[strum(serialize = "kms:ListKeys")]
+    ListKeysAction,
+    #[strum(serialize = "kms:DescribeKey")]
+    DescribeKeyAction,
+    #[strum(serialize = "kms:Decrypt")]
+    DecryptAction,
+    /// Export a KMS backup bundle. Separate from every key action because a
+    /// bundle carries the material of every key at once.
+    #[strum(serialize = "kms:Backup")]
+    BackupAction,
+    /// Preflight or execute a KMS restore.
+    #[strum(serialize = "kms:Restore")]
+    RestoreAction,
+    /// Run the bulk rekey sweep that rewraps stored object DEK envelopes onto
+    /// current master key versions. Cluster-scoped: it walks and rewrites
+    /// object metadata across buckets, so it is never conferred by a per-key
+    /// role template.
+    #[strum(serialize = "kms:Rekey")]
+    RekeyAction,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
 
     #[test]
     fn test_action_wildcard_parsing() {
@@ -638,11 +742,52 @@ mod tests {
     }
 
     #[test]
+    fn test_kms_action_taxonomy_parses_and_serializes() {
+        for (raw, expected) in [
+            ("kms:Configure", KmsAction::ConfigureAction),
+            ("kms:ServiceControl", KmsAction::ServiceControlAction),
+            ("kms:ClearCache", KmsAction::ClearCacheAction),
+            ("kms:GenerateDataKey", KmsAction::GenerateDataKeyAction),
+            ("kms:DeleteKey", KmsAction::DeleteKeyAction),
+            ("kms:EnableKey", KmsAction::EnableKeyAction),
+            ("kms:DisableKey", KmsAction::DisableKeyAction),
+            ("kms:RotateKey", KmsAction::RotateKeyAction),
+            ("kms:UpdateKeyDescription", KmsAction::UpdateKeyDescriptionAction),
+            ("kms:TagResource", KmsAction::TagResourceAction),
+            ("kms:UntagResource", KmsAction::UntagResourceAction),
+            ("kms:ListKeys", KmsAction::ListKeysAction),
+            ("kms:DescribeKey", KmsAction::DescribeKeyAction),
+            ("kms:Decrypt", KmsAction::DecryptAction),
+            ("kms:Backup", KmsAction::BackupAction),
+            ("kms:Restore", KmsAction::RestoreAction),
+            ("kms:Rekey", KmsAction::RekeyAction),
+        ] {
+            let action = Action::try_from(raw).expect("Should parse KMS action");
+            assert_eq!(action, Action::KmsAction(expected));
+            assert_eq!(<&str>::from(&action), raw);
+        }
+    }
+
+    #[test]
+    fn test_legacy_kms_admin_actions_are_rejected() {
+        for raw in ["admin:KMSCreateKey", "admin:KMSKeyStatus"] {
+            assert!(Action::try_from(raw).is_err(), "{raw} should not parse as a policy action");
+        }
+    }
+
+    #[test]
+    fn test_kms_wildcard_matches_dedicated_actions() {
+        let wildcard = Action::try_from("kms:*").expect("Should parse KMS wildcard action");
+        let action = Action::try_from("kms:GenerateDataKey").expect("Should parse GenerateDataKey action");
+
+        assert!(matches!(wildcard, Action::KmsAction(KmsAction::AllActions)));
+        assert!(wildcard.is_match(&action));
+    }
+
+    #[test]
     fn test_actionset_serialize_single_element() {
         // Single element should serialize as array for S3 specification compliance
-        let mut set = HashSet::new();
-        set.insert(Action::S3Action(S3Action::GetObjectAction));
-        let actionset = ActionSet(set);
+        let actionset = ActionSet(vec![Action::S3Action(S3Action::GetObjectAction)]);
 
         let json = serde_json::to_string(&actionset).expect("Should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
@@ -655,10 +800,10 @@ mod tests {
     #[test]
     fn test_actionset_serialize_multiple_elements() {
         // Multiple elements should serialize as array
-        let mut set = HashSet::new();
-        set.insert(Action::S3Action(S3Action::GetObjectAction));
-        set.insert(Action::S3Action(S3Action::PutObjectAction));
-        let actionset = ActionSet(set);
+        let actionset = ActionSet(vec![
+            Action::S3Action(S3Action::GetObjectAction),
+            Action::S3Action(S3Action::PutObjectAction),
+        ]);
 
         let json = serde_json::to_string(&actionset).expect("Should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
@@ -670,9 +815,7 @@ mod tests {
     #[test]
     fn test_actionset_wildcard_serialization() {
         // Wildcard action should serialize as array for S3 specification compliance
-        let mut set = HashSet::new();
-        set.insert(Action::try_from("*").expect("Should parse wildcard"));
-        let actionset = ActionSet(set);
+        let actionset = ActionSet(vec![Action::try_from("*").expect("Should parse wildcard")]);
 
         let json = serde_json::to_string(&actionset).expect("Should serialize");
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
@@ -685,5 +828,114 @@ mod tests {
     #[test]
     fn test_get_replication_metrics_admin_action_is_valid() {
         assert!(AdminAction::GetReplicationMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn test_get_metrics_admin_action_is_valid() {
+        assert!(AdminAction::GetMetricsAction.is_valid());
+    }
+
+    #[test]
+    fn test_table_catalog_admin_action_is_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableCatalog").expect("Should parse GetTableCatalog action");
+        let migrate_action = AdminAction::try_from("admin:MigrateTableCatalog").expect("Should parse MigrateTableCatalog action");
+
+        assert_eq!(get_action, AdminAction::GetTableCatalogAction);
+        assert_eq!(migrate_action, AdminAction::MigrateTableCatalogAction);
+        assert!(get_action.is_valid());
+        assert!(migrate_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_bucket_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableBucket").expect("Should parse GetTableBucket action");
+        let set_action = AdminAction::try_from("admin:SetTableBucket").expect("Should parse SetTableBucket action");
+
+        assert_eq!(get_action, AdminAction::GetTableBucketAction);
+        assert_eq!(set_action, AdminAction::SetTableBucketAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_namespace_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableNamespace").expect("Should parse GetTableNamespace action");
+        let set_action = AdminAction::try_from("admin:SetTableNamespace").expect("Should parse SetTableNamespace action");
+        let update_properties_action = AdminAction::try_from("admin:UpdateTableNamespaceProperties")
+            .expect("Should parse UpdateTableNamespaceProperties action");
+        let delete_action =
+            AdminAction::try_from("admin:DeleteTableNamespace").expect("Should parse DeleteTableNamespace action");
+
+        assert_eq!(get_action, AdminAction::GetTableNamespaceAction);
+        assert_eq!(set_action, AdminAction::SetTableNamespaceAction);
+        assert_eq!(update_properties_action, AdminAction::UpdateTableNamespacePropertiesAction);
+        assert_eq!(delete_action, AdminAction::DeleteTableNamespaceAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+        assert!(update_properties_action.is_valid());
+        assert!(delete_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTable").expect("Should parse GetTable action");
+        let set_action = AdminAction::try_from("admin:SetTable").expect("Should parse SetTable action");
+        let create_action = AdminAction::try_from("admin:CreateTable").expect("Should parse CreateTable action");
+        let register_action = AdminAction::try_from("admin:RegisterTable").expect("Should parse RegisterTable action");
+        let commit_action = AdminAction::try_from("admin:CommitTable").expect("Should parse CommitTable action");
+        let delete_action = AdminAction::try_from("admin:DeleteTable").expect("Should parse DeleteTable action");
+        let get_lifecycle_action =
+            AdminAction::try_from("admin:GetTableLifecycle").expect("Should parse GetTableLifecycle action");
+        let set_lifecycle_action =
+            AdminAction::try_from("admin:SetTableLifecycle").expect("Should parse SetTableLifecycle action");
+        let run_maintenance_action =
+            AdminAction::try_from("admin:RunTableMaintenance").expect("Should parse RunTableMaintenance action");
+        let get_credentials_action =
+            AdminAction::try_from("admin:GetTableCredentials").expect("Should parse GetTableCredentials action");
+
+        assert_eq!(get_action, AdminAction::GetTableAction);
+        assert_eq!(set_action, AdminAction::SetTableAction);
+        assert_eq!(create_action, AdminAction::CreateTableAction);
+        assert_eq!(register_action, AdminAction::RegisterTableAction);
+        assert_eq!(commit_action, AdminAction::CommitTableAction);
+        assert_eq!(delete_action, AdminAction::DeleteTableAction);
+        assert_eq!(get_lifecycle_action, AdminAction::GetTableLifecycleAction);
+        assert_eq!(set_lifecycle_action, AdminAction::SetTableLifecycleAction);
+        assert_eq!(run_maintenance_action, AdminAction::RunTableMaintenanceAction);
+        assert_eq!(get_credentials_action, AdminAction::GetTableCredentialsAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+        assert!(create_action.is_valid());
+        assert!(register_action.is_valid());
+        assert!(commit_action.is_valid());
+        assert!(delete_action.is_valid());
+        assert!(get_lifecycle_action.is_valid());
+        assert!(set_lifecycle_action.is_valid());
+        assert!(run_maintenance_action.is_valid());
+        assert!(get_credentials_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_metadata_location_admin_actions_are_valid() {
+        let get_action =
+            AdminAction::try_from("admin:GetTableMetadataLocation").expect("Should parse GetTableMetadataLocation action");
+        let set_action =
+            AdminAction::try_from("admin:SetTableMetadataLocation").expect("Should parse SetTableMetadataLocation action");
+
+        assert_eq!(get_action, AdminAction::GetTableMetadataLocationAction);
+        assert_eq!(set_action, AdminAction::SetTableMetadataLocationAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
+    }
+
+    #[test]
+    fn test_table_metadata_admin_actions_are_valid() {
+        let get_action = AdminAction::try_from("admin:GetTableMetadata").expect("Should parse GetTableMetadata action");
+        let set_action = AdminAction::try_from("admin:SetTableMetadata").expect("Should parse SetTableMetadata action");
+
+        assert_eq!(get_action, AdminAction::GetTableMetadataAction);
+        assert_eq!(set_action, AdminAction::SetTableMetadataAction);
+        assert!(get_action.is_valid());
+        assert!(set_action.is_valid());
     }
 }

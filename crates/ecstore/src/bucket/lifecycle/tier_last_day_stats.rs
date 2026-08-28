@@ -18,7 +18,7 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use rustfs_common::data_usage::TierStats;
+use rustfs_data_usage::TierStats;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::ops::Sub;
@@ -80,7 +80,10 @@ impl LastDayTierStats {
         }
     }
 
-    #[allow(dead_code)]
+    #[allow(
+        dead_code,
+        reason = "asserted by this file's tests; the lib target cannot see test-only consumers (backlog#1823)"
+    )]
     fn merge(&self, m: LastDayTierStats) -> LastDayTierStats {
         let mut cl = self.clone();
         let mut cm = m;

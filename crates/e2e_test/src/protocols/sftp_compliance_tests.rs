@@ -104,6 +104,11 @@
 //!   byte-exact with the production cache window.
 //! - CMPTST-33: read-cache disabled regression, 8 MiB download
 //!   byte-exact with RUSTFS_SFTP_READ_CACHE_WINDOW_BYTES=0.
+//! - CMPTST-34: OPEN with non-default FileAttributes followed by a
+//!   payload that crosses the 5 MiB multipart boundary preserves the
+//!   client-supplied mtime and permissions through the streaming
+//!   CreateMultipartUpload path. HeadObject through aws-sdk-s3
+//!   confirms the metadata reached the finalised S3 object.
 
 use crate::common::rustfs_binary_path_with_features;
 use crate::protocols::sftp_helpers::{
@@ -118,7 +123,6 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use russh::client;
 use russh_sftp::client::{Config, SftpSession};
 use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
-#[cfg(target_os = "linux")]
 use rustfs_config::ENV_SFTP_IDLE_TIMEOUT;
 use rustfs_config::{
     ENV_CONSOLE_ENABLE, ENV_RUSTFS_ADDRESS, ENV_SFTP_ADDRESS, ENV_SFTP_ENABLE, ENV_SFTP_HOST_KEY_DIR, ENV_SFTP_PART_SIZE,
@@ -129,7 +133,6 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::Arc;
-#[cfg(target_os = "linux")]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
@@ -138,7 +141,6 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWri
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::process::{Child, Command};
-#[cfg(target_os = "linux")]
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tracing::info;
@@ -190,6 +192,7 @@ pub(crate) async fn spawn_compliance_rustfs(
         .to_str()
         .ok_or_else(|| anyhow!("host key dir path is not utf-8: {}", host_key_dir.display()))?;
     let child = Command::new(&binary_path)
+        .env(ENV_CONSOLE_ENABLE, "false")
         .env(ENV_SFTP_ENABLE, "true")
         .env(ENV_SFTP_ADDRESS, sftp_address)
         .env(ENV_SFTP_HOST_KEY_DIR, host_key_dir_str)
@@ -407,13 +410,11 @@ fn capture_server_stdout(child: &mut Child) -> Arc<tokio::sync::Mutex<Vec<String
 /// lifecycle cases (CMPTST-24, CMPTST-25, CMPTST-26) read both fields
 /// to assert the watchdog killed silent sessions on the expected path.
 #[derive(Default)]
-#[cfg(target_os = "linux")]
 struct SessionCounters {
     entered: AtomicUsize,
     finished: AtomicUsize,
 }
 
-#[cfg(target_os = "linux")]
 impl SessionCounters {
     fn new() -> Arc<Self> {
         Arc::new(Self {
@@ -427,7 +428,6 @@ impl SessionCounters {
 /// increments the matching counter for every server-side session
 /// lifecycle event. The task ends when stdout closes (i.e. when the
 /// child is killed at teardown).
-#[cfg(target_os = "linux")]
 fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounters>) {
     let Some(stdout) = child.stdout.take() else {
         return;
@@ -453,27 +453,28 @@ fn watch_session_lifecycle_events(child: &mut Child, counters: Arc<SessionCounte
 }
 
 /// Count TCP connections in CLOSE_WAIT against the given local port
-/// by shelling out to ss -tn state CLOSE-WAIT. The check is
-/// best-effort: if ss is missing on the host the function returns
-/// Ok(None) and the caller skips the assertion. The contract is zero
+/// by shelling out to ss -tn state CLOSE-WAIT. The oracle fails closed
+/// if ss is missing or cannot inspect socket state. The contract is zero
 /// CLOSE_WAIT entries attributable to the test.
 #[cfg(target_os = "linux")]
-async fn count_close_wait_on_port(port: u16) -> Result<Option<usize>> {
-    let output = match Command::new("ss").args(["-tn", "state", "CLOSE-WAIT"]).output().await {
-        Ok(o) => o,
-        Err(_) => return Ok(None),
-    };
+async fn count_close_wait_on_port(port: u16, test_id: &str) -> Result<usize> {
+    let port_filter = format!("sport = :{port}");
+    let output = Command::new("ss")
+        .args(["-H", "-t", "-n", "state", "close-wait"])
+        .arg(&port_filter)
+        .output()
+        .await
+        .map_err(|error| anyhow!("{test_id} failed to run ss CLOSE_WAIT oracle: {error}"))?;
     if !output.status.success() {
-        return Ok(None);
+        return Err(anyhow!(
+            "{test_id} ss CLOSE_WAIT oracle exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let needle_local = format!(":{port} ");
-    let needle_local_eol = format!(":{port}\n");
-    let count = stdout
-        .lines()
-        .filter(|l| l.contains(&needle_local) || l.contains(needle_local_eol.trim_end()))
-        .count();
-    Ok(Some(count))
+    let count = stdout.lines().filter(|line| !line.trim().is_empty()).count();
+    Ok(count)
 }
 
 // CMPTST-01: medium-binary upload then download with SHA256 compare.
@@ -1400,7 +1401,7 @@ pub(crate) mod cmptst_24 {
     //    the JoinSet flushes finished tasks before the assertion runs.
     // 5. Assert the entered/finished session counters balance and that
     //    no CLOSE_WAIT sockets remain on the bind port (Linux ss(8)
-    //    only; the assertion skips with a warn if ss is unavailable).
+    //    only; missing or failed socket inspection is an error).
     pub(crate) async fn run_concurrent_half_close_no_leak() -> Result<()> {
         let env = ProtocolTestEnvironment::new().map_err(|e| anyhow!("{}", e))?;
         let host_key_dir = PathBuf::from(&env.temp_dir).join("sftp_host_keys");
@@ -1520,15 +1521,13 @@ pub(crate) mod cmptst_24 {
                 ));
             }
 
-            match count_close_wait_on_port(HALF_CLOSE_SFTP_PORT).await? {
-                Some(0) => info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}"),
-                Some(n) => {
-                    return Err(anyhow!(
-                        "{COMPLIANCE_TEST_OUTPUT_ID} {n} CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}, expected 0"
-                    ));
-                }
-                None => info!("{COMPLIANCE_TEST_OUTPUT_ID}: ss(8) unavailable, skipping CLOSE_WAIT assertion"),
+            let close_wait = count_close_wait_on_port(HALF_CLOSE_SFTP_PORT, COMPLIANCE_TEST_OUTPUT_ID).await?;
+            if close_wait != 0 {
+                return Err(anyhow!(
+                    "{COMPLIANCE_TEST_OUTPUT_ID} {close_wait} CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}, expected 0"
+                ));
             }
+            info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {HALF_CLOSE_SFTP_PORT}");
 
             // Drop the keepalive vector now so the test process does
             // not leave the half-closed sockets dangling past the
@@ -1947,7 +1946,7 @@ pub(crate) mod cmptst_25 {
     //    plus two 15 s ticks worst-case = 60 s) to detect CLOSE_WAIT
     //    via /proc/net/tcp and cancel the parked session.
     // 5. Assert the session task counters balance and CLOSE_WAIT count
-    //    is zero (ss(8) only; skips with a warn when ss is missing).
+    //    is zero (ss(8) only; missing or failed socket inspection is an error).
     pub(crate) async fn run_wedge_kill_after_silence_in_close_wait() -> Result<()> {
         let env = ProtocolTestEnvironment::new().map_err(|e| anyhow!("{}", e))?;
         let host_key_dir = PathBuf::from(&env.temp_dir).join("sftp_host_keys");
@@ -2056,15 +2055,13 @@ pub(crate) mod cmptst_25 {
                 ));
             }
 
-            match count_close_wait_on_port(WEDGE_SFTP_PORT).await? {
-                Some(0) => info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}"),
-                Some(n) => {
-                    return Err(anyhow!(
-                        "{COMPLIANCE_TEST_OUTPUT_ID} {n} CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}, expected 0"
-                    ));
-                }
-                None => info!("{COMPLIANCE_TEST_OUTPUT_ID}: ss(8) unavailable, skipping CLOSE_WAIT assertion"),
+            let close_wait = count_close_wait_on_port(WEDGE_SFTP_PORT, COMPLIANCE_TEST_OUTPUT_ID).await?;
+            if close_wait != 0 {
+                return Err(anyhow!(
+                    "{COMPLIANCE_TEST_OUTPUT_ID} {close_wait} CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}, expected 0"
+                ));
             }
+            info!("{COMPLIANCE_TEST_OUTPUT_ID}: zero CLOSE_WAIT entries against port {WEDGE_SFTP_PORT}");
 
             drop(keepalive);
             info!("PASS {COMPLIANCE_TEST_OUTPUT_ID}: wedged sessions killed by the watchdog");
@@ -2088,7 +2085,6 @@ pub(crate) mod cmptst_25 {
 }
 
 // CMPTST-26: healthy idle session past the watchdog fast-kill threshold stays alive.
-#[cfg(target_os = "linux")]
 pub(crate) mod cmptst_26 {
     use super::*;
 
@@ -2103,20 +2099,21 @@ pub(crate) mod cmptst_26 {
     // Idle timeout for the spawned server. 300 s sits well above the
     // wait window so russh's own inactivity_timeout cannot kill during
     // the test. The contract: a healthy idle session past the
-    // watchdog's fast-kill threshold MUST stay alive because the procfs
-    // probe sees ESTABLISHED and the decision function returns
-    // Decision::Quiet.
+    // watchdog's fast-kill threshold MUST stay alive. On Linux the
+    // procfs probe sees ESTABLISHED and the decision function returns
+    // Decision::Quiet. On non-Linux targets the fallback watchdog only
+    // cancels at the far larger fallback ceiling, so the session
+    // survives the wait window.
     const IDLE_TIMEOUT_SECS: u64 = 300;
 
-    // Wait window. Must exceed
-    // WEDGE_FAST_KILL_SILENCE_SECS (30) + WEDGE_WATCHDOG_TICK_SECS (15)
-    // = 45 s of worst-case watchdog detection latency, plus a 15 s
-    // grace. Sits well below WEDGE_FALLBACK_KILL_SILENCE_SECS (1800)
-    // so the fallback path does not fire either.
-    // 90 s instead of 60 s. The case asserts the watchdog does NOT
-    // false-kill, so a longer wait strengthens the assertion: if the
-    // procfs ESTABLISHED discriminator is broken, more wait windows
-    // give it more chances to fire.
+    // Wait window. Must exceed the worst-case watchdog detection
+    // latency on Linux: WEDGE_FAST_KILL_SILENCE_SECS (30) plus one to
+    // two WEDGE_WATCHDOG_TICK_SECS ticks (15 each), so 45 to 60 s. Sits
+    // well below WEDGE_FALLBACK_KILL_SILENCE_SECS (1800) so the fallback
+    // path does not fire either. 90 s instead of 60 s: the case asserts
+    // the watchdog does NOT false-kill, so a longer wait strengthens the
+    // assertion. On Linux, if the procfs ESTABLISHED discriminator is
+    // broken, more wait windows give it more chances to fire.
     const IDLE_WAIT_SECS: u64 = 90;
 
     pub(crate) async fn run_healthy_idle_session_above_fast_threshold() -> Result<()> {
@@ -2224,7 +2221,10 @@ pub(crate) mod cmptst_26 {
         result
     }
 
-    #[cfg(target_os = "linux")]
+    // Excluded on Windows. Ambient operating-system traffic can inflate
+    // the session counter and false-positive this healthy-idle assertion.
+    // Linux and macOS run it.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn regression() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::common::init_logging();
@@ -2851,7 +2851,7 @@ pub(crate) mod cmptst_30 {
         result
     }
 
-    #[ignore]
+    #[ignore = "timing-sensitive backend-pressure latency probe; run explicitly with --ignored"]
     #[tokio::test]
     async fn regression() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         crate::common::init_logging();
@@ -3273,6 +3273,80 @@ pub(crate) mod cmptst_33 {
         run_read_cache_disabled_round_trip()
             .await
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
+    }
+}
+
+// CMPTST-34: OPEN-time client attrs preservation across the streaming
+// multipart write path. The payload crosses the 5 MiB part-size
+// boundary so the driver transitions Buffering -> Streaming and
+// finalises via CompleteMultipartUpload. The OPEN-supplied mtime and
+// permissions must reach the resulting object as x-amz-meta-mtime and
+// x-amz-meta-mode. The S3 client connects to the same rustfs process
+// the shared-server suite already drives.
+pub(crate) mod cmptst_34 {
+    use super::*;
+
+    const COMPLIANCE_TEST_OUTPUT_ID: &str = "CMPTST-34";
+    const REQUESTED_MTIME: u32 = 1_715_000_010;
+    const REQUESTED_MODE: u32 = 0o600;
+
+    pub(crate) async fn run_open_attrs_round_trip_multipart(sftp: &SftpSession, s3: &S3Client) -> Result<()> {
+        info!("{COMPLIANCE_TEST_OUTPUT_ID}: OPEN with mtime + mode, multi-part payload, streaming path");
+        let bucket = "complopenattrsmpbucket";
+        let bucket_path = format!("/{bucket}");
+        sftp.create_dir(&bucket_path).await?;
+
+        let path = format!("/{bucket}/attr-mp.bin");
+        // 6 MiB exceeds the 5 MiB part-size boundary so the streaming
+        // path runs at least one full UploadPart before the CLOSE-time
+        // CompleteMultipartUpload finalises the object.
+        let payload = vec![0xA5u8; 6 * 1024 * 1024];
+
+        let client_attrs = FileAttributes {
+            mtime: Some(REQUESTED_MTIME),
+            atime: Some(REQUESTED_MTIME),
+            permissions: Some(REQUESTED_MODE),
+            ..FileAttributes::default()
+        };
+
+        let mut writer = sftp
+            .open_with_flags_and_attributes(&path, OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE, client_attrs)
+            .await?;
+        writer.write_all(&payload).await?;
+        writer.flush().await?;
+        writer.shutdown().await?;
+
+        let head = s3
+            .head_object()
+            .bucket(bucket)
+            .key("attr-mp.bin")
+            .send()
+            .await
+            .map_err(|e| anyhow!("S3 HeadObject failed: {e:?}"))?;
+        let content_length = head.content_length().unwrap_or(0);
+        if content_length != payload.len() as i64 {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} unexpected size: got {content_length} bytes"));
+        }
+        let metadata = head
+            .metadata()
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} HeadObject returned no metadata map"))?;
+        let mtime_value = metadata
+            .get("mtime")
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mtime key missing on the object"))?;
+        if mtime_value != &REQUESTED_MTIME.to_string() {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mtime mismatch: got {mtime_value}"));
+        }
+        let mode_value = metadata
+            .get("mode")
+            .ok_or_else(|| anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mode key missing on the object"))?;
+        if mode_value != &REQUESTED_MODE.to_string() {
+            return Err(anyhow!("{COMPLIANCE_TEST_OUTPUT_ID} mode mismatch: got {mode_value}"));
+        }
+
+        sftp.remove_file(&path).await?;
+        sftp.remove_dir(&bucket_path).await?;
+        info!("PASS {COMPLIANCE_TEST_OUTPUT_ID}: multipart upload preserved mtime + mode end to end");
+        Ok(())
     }
 }
 

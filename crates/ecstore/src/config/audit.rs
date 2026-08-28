@@ -12,17 +12,19 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use crate::config::{KV, KVS};
 use rustfs_config::audit::AUDIT_REDIS_DEFAULT_CHANNEL;
+use rustfs_config::server_config::{KV, KVS};
 use rustfs_config::{
     AMQP_EXCHANGE, AMQP_MANDATORY, AMQP_PASSWORD, AMQP_PERSISTENT, AMQP_QUEUE_DIR, AMQP_QUEUE_LIMIT, AMQP_ROUTING_KEY,
     AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, AMQP_URL, AMQP_USERNAME, COMMENT_KEY, DEFAULT_LIMIT, ENABLE_KEY,
-    EVENT_DEFAULT_DIR, EnableState, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_TLS_CA,
-    KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY, KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL,
-    MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR, MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT,
-    MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY, MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST,
-    MYSQL_DSN_STRING, MYSQL_FORMAT, MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, MYSQL_TLS_CA,
-    MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_PASSWORD, NATS_QUEUE_DIR,
+    EVENT_DEFAULT_DIR, EnableState, KAFKA_ACKS, KAFKA_BROKERS, KAFKA_QUEUE_DIR, KAFKA_QUEUE_LIMIT, KAFKA_SASL_ENABLE,
+    KAFKA_SASL_MECHANISM, KAFKA_SASL_PASSWORD, KAFKA_SASL_USERNAME, KAFKA_TLS_CA, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY,
+    KAFKA_TLS_ENABLE, KAFKA_TOPIC, MQTT_BROKER, MQTT_KEEP_ALIVE_INTERVAL, MQTT_PASSWORD, MQTT_QOS, MQTT_QUEUE_DIR,
+    MQTT_QUEUE_LIMIT, MQTT_RECONNECT_INTERVAL, MQTT_TLS_CA, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MQTT_TLS_POLICY,
+    MQTT_TLS_TRUST_LEAF_AS_CA, MQTT_TOPIC, MQTT_USERNAME, MQTT_WS_PATH_ALLOWLIST, MYSQL_DSN_STRING, MYSQL_FORMAT,
+    MYSQL_MAX_OPEN_CONNECTIONS, MYSQL_QUEUE_DIR, MYSQL_QUEUE_LIMIT, MYSQL_TABLE, MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT,
+    MYSQL_TLS_CLIENT_KEY, NATS_ADDRESS, NATS_CREDENTIALS_FILE, NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS,
+    NATS_JETSTREAM_ACK_TIMEOUT_SECS, NATS_JETSTREAM_ENABLE, NATS_JETSTREAM_STREAM_NAME, NATS_PASSWORD, NATS_QUEUE_DIR,
     NATS_QUEUE_LIMIT, NATS_SUBJECT, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY, NATS_TLS_REQUIRED, NATS_TOKEN,
     NATS_USERNAME, POSTGRES_DSN_STRING, POSTGRES_FORMAT, POSTGRES_QUEUE_DIR, POSTGRES_QUEUE_LIMIT, POSTGRES_TABLE,
     POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY, POSTGRES_TLS_REQUIRED, PULSAR_AUTH_TOKEN, PULSAR_BROKER,
@@ -37,7 +39,6 @@ use rustfs_config::{
 };
 use std::sync::LazyLock;
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit webhook settings.
 pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
@@ -115,7 +116,6 @@ pub static DEFAULT_AUDIT_WEBHOOK_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 #[allow(clippy::declare_interior_mutable_const)]
 /// Default KVS for audit MQTT settings.
 pub static DEFAULT_AUDIT_MQTT_KVS: LazyLock<KVS> = LazyLock::new(|| {
@@ -351,6 +351,21 @@ pub static DEFAULT_AUDIT_NATS_KVS: LazyLock<KVS> = LazyLock::new(|| {
             hidden_if_empty: false,
         },
         KV {
+            key: NATS_JETSTREAM_ENABLE.to_owned(),
+            value: EnableState::Off.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: NATS_JETSTREAM_STREAM_NAME.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: NATS_JETSTREAM_ACK_TIMEOUT_SECS.to_owned(),
+            value: NATS_JETSTREAM_ACK_TIMEOUT_DEFAULT_SECS.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
             key: COMMENT_KEY.to_owned(),
             value: "".to_owned(),
             hidden_if_empty: false,
@@ -358,7 +373,6 @@ pub static DEFAULT_AUDIT_NATS_KVS: LazyLock<KVS> = LazyLock::new(|| {
     ])
 });
 
-#[allow(dead_code)]
 pub static DEFAULT_AUDIT_PULSAR_KVS: LazyLock<KVS> = LazyLock::new(|| {
     KVS(vec![
         KV {
@@ -633,6 +647,26 @@ pub static DEFAULT_AUDIT_KAFKA_KVS: LazyLock<KVS> = LazyLock::new(|| {
         },
         KV {
             key: KAFKA_TLS_CLIENT_KEY.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: true,
+        },
+        KV {
+            key: KAFKA_SASL_ENABLE.to_owned(),
+            value: EnableState::Off.to_string(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: KAFKA_SASL_MECHANISM.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: KAFKA_SASL_USERNAME.to_owned(),
+            value: "".to_owned(),
+            hidden_if_empty: false,
+        },
+        KV {
+            key: KAFKA_SASL_PASSWORD.to_owned(),
             value: "".to_owned(),
             hidden_if_empty: true,
         },

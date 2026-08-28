@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_credentials;
 use rustfs_policy::policy::action::S3Action as PolicyS3Action;
 use serde_json;
 use std::collections::HashMap;
@@ -274,7 +273,17 @@ pub async fn is_authorized(
     let iam_sys = match rustfs_iam::get() {
         Ok(sys) => sys,
         Err(e) => {
-            error!("IAM system unavailable: {}", e);
+            error!(
+                event = "protocol_gateway_authz_state",
+                component = "protocols",
+                subsystem = "gateway",
+                result = "iam_unavailable",
+                action = action.as_str(),
+                bucket = %bucket,
+                object = %object.unwrap_or_default(),
+                error = %e,
+                "protocol gateway authz state changed"
+            );
             return Err(AuthorizationError::IamUnavailable);
         }
     };
@@ -289,11 +298,7 @@ pub async fn is_authorized(
     let policy_action: rustfs_policy::policy::action::Action = action.clone().into();
 
     // Check if user is the owner (admin)
-    let is_owner = if let Some(global_cred) = rustfs_credentials::get_global_action_cred() {
-        session_context.principal.access_key() == global_cred.access_key
-    } else {
-        false
-    };
+    let is_owner = rustfs_iam::is_root_access_key(session_context.principal.access_key());
 
     let args = rustfs_policy::policy::Args {
         account: session_context.principal.access_key(),

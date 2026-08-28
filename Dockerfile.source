@@ -27,16 +27,18 @@
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
+ARG RUSTFS_BUILD_FEATURES=""
 
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.93-trixie AS builder
+FROM rust:1.97.1-trixie AS builder
 
 # Re-declare args after FROM
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
+ARG RUSTFS_BUILD_FEATURES
 
 # Debug: print platforms
 RUN echo "Build info -> BUILDPLATFORM=${BUILDPLATFORM}, TARGETPLATFORM=${TARGETPLATFORM}"
@@ -143,12 +145,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     case "${target_platform}" in \
     linux/amd64) \
     echo "Building for x86_64-unknown-linux-gnu"; \
+    if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
+    cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    else \
     cargo build --release --locked --target x86_64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
+    fi; \
     install -m 0755 "${CARGO_TARGET_DIR}/x86_64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     linux/arm64) \
     echo "Building for aarch64-unknown-linux-gnu"; \
+    if [ -n "${RUSTFS_BUILD_FEATURES}" ]; then \
+    cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs --features "${RUSTFS_BUILD_FEATURES}" -j "$(nproc)"; \
+    else \
     cargo build --release --locked --target aarch64-unknown-linux-gnu --bin rustfs -j "$(nproc)"; \
+    fi; \
     install -m 0755 "${CARGO_TARGET_DIR}/aarch64-unknown-linux-gnu/release/rustfs" /usr/local/bin/rustfs \
     ;; \
     *) \
@@ -198,7 +208,7 @@ CMD ["cargo", "run", "--bin", "rustfs", "--"]
 # -----------------------------
 # Runtime stage (Ubuntu minimal)
 # -----------------------------
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 ARG BUILD_DATE
 ARG VCS_REF
@@ -213,6 +223,7 @@ LABEL name="RustFS (dev-local)" \
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
     apt-get update; \
+    apt-get upgrade -y; \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \

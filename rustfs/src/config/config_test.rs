@@ -15,10 +15,11 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
-    use crate::config::{Config, Opt};
+    use crate::config::cli::{InspectCommands, default_server_opts};
+    use crate::config::{CommandResult, Config, Opt, TlsCommands};
+    use crate::storage_api::config_test::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
     use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
-    use rustfs_ecstore::disks_layout::DisksLayout;
     use serial_test::serial;
     use std::env;
 
@@ -74,6 +75,71 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_tls_inspect_subcommand_parses() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]).expect("tls inspect command should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_tls_inspect_subcommand_parses_tls_path_alias() {
+        let result =
+            Opt::parse_command(["rustfs", "tls", "inspect", "--tls-path", "/tmp/certs"]).expect("tls inspect alias should parse");
+
+        match result {
+            CommandResult::Tls(opts) => match opts.command {
+                TlsCommands::Inspect(inspect) => assert_eq!(inspect.path, "/tmp/certs"),
+            },
+            _ => panic!("expected TLS command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_inspect_subcommand_survives_legacy_preprocessing() {
+        let result = Opt::parse_command([
+            "rustfs",
+            "inspect",
+            "bucket-meta",
+            "--path",
+            "/data/drive-1",
+            "--bucket",
+            "example-bucket",
+        ])
+        .expect("inspect command should survive legacy preprocessing");
+
+        match result {
+            CommandResult::Inspect(opts) => match opts.command {
+                InspectCommands::BucketMeta(opts) => {
+                    assert_eq!(opts.paths, ["/data/drive-1"]);
+                    assert_eq!(opts.bucket, "example-bucket");
+                }
+            },
+            _ => panic!("expected inspect command result"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_from_non_server_commands_falls_back_without_panicking() {
+        let info_opt = Opt::parse_from(["rustfs", "info"]);
+        let tls_opt = Opt::parse_from(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]);
+
+        assert!(info_opt.volumes.is_empty());
+        assert!(tls_opt.volumes.is_empty());
+        assert_eq!(info_opt.address, default_server_opts().address);
+        assert_eq!(tls_opt.address, default_server_opts().address);
+    }
+
+    #[test]
+    #[serial]
     fn test_default_console_configuration() {
         // Test that default console configuration is correct
         let args = vec!["rustfs", "/test/volume"];
@@ -105,10 +171,12 @@ mod tests {
         assert!(!config.kms_enable);
         assert_eq!(config.kms_backend, "local");
         assert_eq!(config.kms_key_dir, None);
+        assert_eq!(config.kms_local_master_key, None);
         assert_eq!(config.kms_vault_address, None);
         assert_eq!(config.kms_vault_token, None);
         assert_eq!(config.kms_vault_mount_path, None);
         assert_eq!(config.kms_default_key_id, None);
+        assert!(!config.kms_allow_insecure_dev_defaults);
         assert!(!config.buffer_profile_disable);
         assert_eq!(config.buffer_profile, "GeneralPurpose");
     }
@@ -232,7 +300,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_volumes_and_disk_layout_parsing() {
-        use rustfs_ecstore::disks_layout::DisksLayout;
+        use crate::storage_api::config_test::DisksLayout;
 
         // Test case 1: Single volume path
         let args = vec!["rustfs", "/data/vol1"];

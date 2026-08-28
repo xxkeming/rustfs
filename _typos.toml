@@ -40,11 +40,17 @@ mak = "mak"
 gae = "gae"
 GAE = "GAE"
 thr = "thr"
+mis = "mis"
 # s3-tests original test names (cannot be changed)
 nonexisted = "nonexisted"
 consts = "consts"
 # Swift API - company/product names
 Hashi = "Hashi"  # HashiCorp
+# Accept alternate spelling used in parser/XML comments.
+unparseable = "unparseable"
+# Disaster-recovery objectives: recovery time and recovery point.
+RTO = "RTO"
+rto = "rto"
 
 [files]
 extend-exclude = []

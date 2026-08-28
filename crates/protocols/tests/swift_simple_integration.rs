@@ -16,24 +16,8 @@
 
 #![cfg(feature = "swift")]
 
-use rustfs_protocols::swift::{encryption, quota, ratelimit, slo, symlink, sync, tempurl, versioning};
+use rustfs_protocols::swift::{quota, slo, symlink, sync, tempurl, versioning};
 use std::collections::HashMap;
-
-/// Test that encryption metadata can coexist with user metadata
-#[test]
-fn test_encryption_with_user_metadata() {
-    let key = vec![0u8; 32];
-    let config = encryption::EncryptionConfig::new(true, "test-key".to_string(), key).unwrap();
-
-    let plaintext = b"Sensitive data";
-    let (_ciphertext, enc_metadata) = encryption::encrypt_data(plaintext, &config).unwrap();
-
-    let mut all_metadata = enc_metadata.to_headers();
-    all_metadata.insert("x-object-meta-author".to_string(), "alice".to_string());
-
-    assert_eq!(all_metadata.get("x-object-meta-crypto-enabled"), Some(&"true".to_string()));
-    assert_eq!(all_metadata.get("x-object-meta-author"), Some(&"alice".to_string()));
-}
 
 /// Test sync configuration parsing
 #[test]
@@ -106,14 +90,6 @@ fn test_symlink_detection() {
 
     // Just verify the function works - may require specific metadata format
     let _is_symlink = symlink::is_symlink(&metadata);
-}
-
-/// Test rate limit parsing
-#[test]
-fn test_rate_limit_parsing() {
-    let rl = ratelimit::RateLimit::parse("100/60").unwrap();
-    assert_eq!(rl.limit, 100);
-    assert_eq!(rl.window_seconds, 60);
 }
 
 /// Test quota structure

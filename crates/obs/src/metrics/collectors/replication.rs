@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 //! Replication metrics collector.
 //!
 //! Collects cluster-wide replication metrics including queue stats,
@@ -24,7 +22,7 @@ use crate::metrics::schema::replication::*;
 
 /// Replication statistics.
 #[derive(Debug, Clone, Default)]
-pub struct ReplicationStats {
+pub struct ReplicationMetricsSnapshot {
     /// Average number of active replication workers
     pub average_active_workers: f64,
     /// Average queued bytes since server start
@@ -49,14 +47,20 @@ pub struct ReplicationStats {
     pub max_queued_count: u64,
     /// Maximum data transfer rate seen since server start
     pub max_data_transfer_rate: f64,
-    /// Objects in replication backlog in the last 5 minutes
+    /// Objects currently in replication backlog
     pub recent_backlog_count: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ReplicationRuntimeStats {
+    pub(crate) server: String,
+    pub(crate) stats: ReplicationMetricsSnapshot,
 }
 
 /// Collects replication metrics from the given stats.
 ///
 /// Returns a vector of Prometheus metrics for replication statistics.
-pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMetric> {
+pub fn collect_replication_metrics(stats: &ReplicationMetricsSnapshot) -> Vec<PrometheusMetric> {
     vec![
         PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_ACTIVE_WORKERS_MD, stats.average_active_workers),
         PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_BYTES_MD, stats.average_queued_bytes as f64),
@@ -74,6 +78,41 @@ pub fn collect_replication_metrics(stats: &ReplicationStats) -> Vec<PrometheusMe
     ]
 }
 
+pub(crate) fn collect_replication_runtime_metrics(runtime: &ReplicationRuntimeStats) -> Vec<PrometheusMetric> {
+    let stats = &runtime.stats;
+    let mut metrics = collect_replication_metrics(stats);
+    metrics.extend([
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_ACTIVE_WORKERS_BY_SERVER_MD, stats.average_active_workers)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_BYTES_BY_SERVER_MD, stats.average_queued_bytes as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_AVERAGE_QUEUED_COUNT_BY_SERVER_MD, stats.average_queued_count as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_ACTIVE_WORKERS_BY_SERVER_MD, stats.active_workers as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_CURRENT_DATA_TRANSFER_RATE_BY_SERVER_MD, stats.current_data_transfer_rate)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(
+            &REPLICATION_LAST_MINUTE_QUEUED_BYTES_BY_SERVER_MD,
+            stats.last_minute_queued_bytes as f64,
+        )
+        .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(
+            &REPLICATION_LAST_MINUTE_QUEUED_COUNT_BY_SERVER_MD,
+            stats.last_minute_queued_count as f64,
+        )
+        .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_MAX_ACTIVE_WORKERS_BY_SERVER_MD, stats.max_active_workers as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_MAX_QUEUED_BYTES_BY_SERVER_MD, stats.max_queued_bytes as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+        PrometheusMetric::from_descriptor(&REPLICATION_MAX_QUEUED_COUNT_BY_SERVER_MD, stats.max_queued_count as f64)
+            .with_label_owned(SERVER_LABEL, runtime.server.clone()),
+    ]);
+
+    metrics
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,7 +120,7 @@ mod tests {
 
     #[test]
     fn test_collect_replication_metrics() {
-        let stats = ReplicationStats {
+        let stats = ReplicationMetricsSnapshot {
             average_active_workers: 8.5,
             average_queued_bytes: 1024 * 1024 * 40,
             average_queued_count: 240,
@@ -97,10 +136,13 @@ mod tests {
             recent_backlog_count: 1500,
         };
 
-        let metrics = collect_replication_metrics(&stats);
+        let metrics = collect_replication_runtime_metrics(&ReplicationRuntimeStats {
+            server: "node-a:9000".to_string(),
+            stats,
+        });
         report_metrics(&metrics);
 
-        assert_eq!(metrics.len(), 13);
+        assert_eq!(metrics.len(), 23);
 
         // Verify active workers
         let active_name = REPLICATION_CURRENT_ACTIVE_WORKERS_MD.get_full_metric_name();
@@ -111,11 +153,36 @@ mod tests {
         let avg_active_name = REPLICATION_AVERAGE_ACTIVE_WORKERS_MD.get_full_metric_name();
         let avg_active = metrics.iter().find(|m| m.name == avg_active_name);
         assert_eq!(avg_active.map(|m| m.value), Some(8.5));
+
+        let active_by_server_name = REPLICATION_CURRENT_ACTIVE_WORKERS_BY_SERVER_MD.get_full_metric_name();
+        let active_by_server = metrics.iter().find(|m| m.name == active_by_server_name);
+        assert_eq!(active_by_server.map(|m| m.value), Some(10.0));
+        assert_eq!(
+            active_by_server
+                .and_then(|m| m.labels.iter().find(|(name, _)| *name == SERVER_LABEL))
+                .map(|(_, value)| value.as_ref()),
+            Some("node-a:9000")
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.name != REPLICATION_AVERAGE_DATA_TRANSFER_RATE_BY_SERVER_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.name != REPLICATION_MAX_DATA_TRANSFER_RATE_BY_SERVER_MD.get_full_metric_name())
+        );
+        assert!(
+            metrics
+                .iter()
+                .all(|m| m.name != REPLICATION_RECENT_BACKLOG_COUNT_BY_SERVER_MD.get_full_metric_name())
+        );
     }
 
     #[test]
     fn test_collect_replication_metrics_default() {
-        let stats = ReplicationStats::default();
+        let stats = ReplicationMetricsSnapshot::default();
         let metrics = collect_replication_metrics(&stats);
 
         assert_eq!(metrics.len(), 13);
@@ -123,5 +190,26 @@ mod tests {
             assert_eq!(metric.value, 0.0);
             assert!(metric.labels.is_empty());
         }
+    }
+
+    #[test]
+    fn replication_stats_struct_literal_keeps_legacy_fields() {
+        let stats = ReplicationMetricsSnapshot {
+            average_active_workers: 1.0,
+            average_queued_bytes: 2,
+            average_queued_count: 3,
+            average_data_transfer_rate: 4.0,
+            active_workers: 5,
+            current_data_transfer_rate: 6.0,
+            last_minute_queued_bytes: 7,
+            last_minute_queued_count: 8,
+            max_active_workers: 9,
+            max_queued_bytes: 10,
+            max_queued_count: 11,
+            max_data_transfer_rate: 12.0,
+            recent_backlog_count: 13,
+        };
+
+        assert_eq!(collect_replication_metrics(&stats).len(), 13);
     }
 }

@@ -12,20 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{RustFSBufferConfig, WorkloadProfile, get_global_buffer_config, is_buffer_profile_enabled};
+use super::{StorageError, add_object_lock_years, get_bucket_cors_config};
+use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
 use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::bucket::{BucketOperations, BucketOptions};
+use crate::storage::storage_api::ecfs_extend_consumer::contract::multipart::MAX_MULTIPART_PART_NUMBER;
+use crate::storage::storage_api::ecstore_bucket::metadata_sys::{self, ObjectLockConfigState};
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_ecstore::bucket::metadata_sys;
-use rustfs_ecstore::bucket::metadata_sys::get_replication_config;
-use rustfs_ecstore::bucket::object_lock::objectlock_sys;
-use rustfs_ecstore::bucket::replication::ReplicationConfigurationExt;
-use rustfs_ecstore::error::StorageError;
-use rustfs_ecstore::new_object_layer_fn;
-use rustfs_ecstore::store_api::{BucketOperations, BucketOptions, ObjectInfo, ObjectToDelete};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
@@ -41,11 +38,19 @@ use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
+
+use crate::storage::storage_api::ecfs_extend_consumer::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+
+const LOG_COMPONENT_STORAGE: &str = "storage";
+const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
+const LOG_SUBSYSTEM_OBJECT_KEY: &str = "object_key";
 
 pub const RFC1123: &[FormatItem<'_>] =
     format_description!("[weekday repr:short], [day] [month repr:short] [year] [hour]:[minute]:[second] GMT");
@@ -83,7 +88,7 @@ pub(crate) fn remove_object_lock_metadata_for_copy(metadata: &mut HashMap<String
 }
 
 /// Apply bucket default Object Lock retention to object metadata if no explicit retention is set.
-pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
+pub(crate) fn apply_lock_retention(object_lock_config: Option<&ObjectLockConfiguration>, metadata: &mut HashMap<String, String>) {
     if has_object_lock_retention_metadata(metadata) {
         return;
     }
@@ -94,13 +99,15 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
         return;
     }
 
-    let Some(default_retention) = config.rule.and_then(|r| r.default_retention) else { return };
-    let Some(mode) = default_retention.mode else { return };
+    let Some(default_retention) = config.rule.as_ref().and_then(|r| r.default_retention.as_ref()) else {
+        return;
+    };
+    let Some(mode) = default_retention.mode.as_ref() else { return };
 
     let now = OffsetDateTime::now_utc();
     let retain_until = match (default_retention.days, default_retention.years) {
         (Some(days), _) => now.saturating_add(time::Duration::days(days as i64)),
-        (None, Some(years)) => objectlock_sys::add_years(now, years),
+        (None, Some(years)) => add_object_lock_years(now, years),
         _ => return,
     };
 
@@ -112,7 +119,7 @@ pub(crate) fn apply_lock_retention(object_lock_config: Option<ObjectLockConfigur
 }
 
 pub(crate) fn apply_default_lock_retention_metadata(
-    object_lock_configuration: Option<ObjectLockConfiguration>,
+    object_lock_configuration: Option<&ObjectLockConfiguration>,
     metadata: &mut HashMap<String, String>,
 ) -> bool {
     if has_object_lock_retention_metadata(metadata) {
@@ -129,33 +136,73 @@ pub(crate) fn apply_default_lock_retention_metadata(
     true
 }
 
-pub(crate) async fn apply_bucket_default_lock_retention(
+pub(crate) async fn load_bucket_object_lock_config_state(bucket: &str) -> S3Result<ObjectLockConfigState> {
+    map_bucket_object_lock_config_state(bucket, metadata_sys::get_object_lock_config_state(bucket).await)
+}
+
+pub(crate) fn map_bucket_object_lock_config_state(
     bucket: &str,
+    result: Result<ObjectLockConfigState, StorageError>,
+) -> S3Result<ObjectLockConfigState> {
+    match result {
+        Ok(ObjectLockConfigState::Fabricated) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+        Ok(state) => Ok(state),
+        Err(err) => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_load_failed",
+                bucket = %bucket,
+                error = ?err,
+                "Failed to load bucket object lock configuration"
+            );
+            Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ))
+        }
+    }
+}
+
+pub(crate) fn apply_bucket_default_lock_retention(
+    bucket: &str,
+    state: &ObjectLockConfigState,
     metadata: &mut HashMap<String, String>,
     has_explicit_retention: bool,
 ) -> S3Result<()> {
-    if has_explicit_retention {
-        return Ok(());
-    }
-
-    if has_object_lock_retention_metadata(metadata) {
-        return Ok(());
-    }
-
-    let object_lock_configuration = match metadata_sys::get_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => Some(cfg),
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                None
-            } else {
-                warn!("get_object_lock_config err {:?}", err);
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InternalError,
-                    "Failed to load Object Lock configuration".to_string(),
-                ));
-            }
+    let object_lock_configuration = match state {
+        ObjectLockConfigState::Configured { config, .. } => Some(config),
+        ObjectLockConfigState::ConfirmedAbsent => None,
+        ObjectLockConfigState::Fabricated => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            return Err(S3Error::with_message(
+                S3ErrorCode::InternalError,
+                "Failed to load Object Lock configuration".to_string(),
+            ));
         }
     };
+
+    if has_explicit_retention || has_object_lock_retention_metadata(metadata) {
+        return Ok(());
+    }
 
     apply_default_lock_retention_metadata(object_lock_configuration, metadata);
     Ok(())
@@ -207,7 +254,10 @@ pub(crate) async fn apply_bucket_default_lock_retention(
 /// );
 /// ```
 ///
-#[allow(dead_code)]
+#[allow(
+    dead_code,
+    reason = "exercised by ecfs_test; the lib target cannot see test-only consumers (backlog#1823)"
+)]
 pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Option<WorkloadProfile>) -> usize {
     let config = match profile {
         Some(p) => RustFSBufferConfig::new(p),
@@ -249,8 +299,8 @@ pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Opt
 /// ```
 pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     let buffer_size = if is_buffer_profile_enabled() {
-        // Use globally configured workload profile (enabled by default in Phase 3)
-        let config = get_global_buffer_config();
+        // Use the AppContext-owned profile when available, with global fallback during migration.
+        let config = runtime_sources::current_buffer_config();
         config.get_buffer_size(file_size)
     } else {
         // Opt-out mode: Use GeneralPurpose profile for consistent behavior
@@ -292,7 +342,14 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
 
     // Log debug info for keys with special characters to help diagnose encoding issues
     if key.contains([' ', '+', '%']) {
-        debug!("{} object with special characters in key: {:?}", operation, key);
+        debug!(
+            component = LOG_COMPONENT_STORAGE,
+            subsystem = LOG_SUBSYSTEM_OBJECT_KEY,
+            event = "object_key_special_characters",
+            operation,
+            key = ?key,
+            "Object key contains special characters"
+        );
     }
 
     Ok(())
@@ -361,7 +418,12 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
                     "The retain until date must be in the future".to_string(),
                 ));
             }
-            retain_until.format(&Rfc3339).unwrap()
+            retain_until.format(&Rfc3339).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The retain until date is not a supported RFC3339 timestamp".to_string(),
+                )
+            })?
         } else {
             String::default()
         };
@@ -406,30 +468,39 @@ pub(crate) fn parse_object_lock_legal_hold(legal_hold: Option<ObjectLockLegalHol
 }
 
 pub(crate) async fn validate_bucket_object_lock_enabled(bucket: &str) -> S3Result<()> {
-    match metadata_sys::get_object_lock_config(bucket).await {
-        Ok((cfg, _created)) => {
-            if cfg.object_lock_enabled != Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Object Lock is not enabled for this bucket".to_string(),
-                ));
-            }
+    let state = load_bucket_object_lock_config_state(bucket).await?;
+    validate_bucket_object_lock_enabled_state(bucket, &state)
+}
+
+pub(crate) fn validate_bucket_object_lock_enabled_state(bucket: &str, state: &ObjectLockConfigState) -> S3Result<()> {
+    match state {
+        ObjectLockConfigState::Configured { config, .. }
+            if config.object_lock_enabled == Some(ObjectLockEnabled::from_static(ObjectLockEnabled::ENABLED)) =>
+        {
+            Ok(())
         }
-        Err(err) => {
-            if err == StorageError::ConfigNotFound {
-                return Err(S3Error::with_message(
-                    S3ErrorCode::InvalidRequest,
-                    "Bucket is missing ObjectLockConfiguration".to_string(),
-                ));
-            }
-            warn!("get_object_lock_config err {:?}", err);
-            return Err(S3Error::with_message(
+        ObjectLockConfigState::Configured { .. } => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Object Lock is not enabled for this bucket".to_string(),
+        )),
+        ObjectLockConfigState::ConfirmedAbsent => Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "Bucket is missing ObjectLockConfiguration".to_string(),
+        )),
+        ObjectLockConfigState::Fabricated => {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "object_lock_config_not_authoritative",
+                bucket = %bucket,
+                "Bucket Object Lock configuration is not authoritative"
+            );
+            Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "Failed to get bucket ObjectLockConfiguration".to_string(),
-            ));
+            ))
         }
     }
-    Ok(())
 }
 
 /// Validates HTTP conditional request headers for a single object according to
@@ -624,10 +695,10 @@ pub(crate) fn extract_prefix_suffix(filter: Option<&NotificationConfigurationFil
         if let Some(rules) = &filter_rules.filter_rules {
             for rule in rules {
                 if let (Some(name), Some(value)) = (rule.name.as_ref(), rule.value.as_ref()) {
-                    match name.as_str() {
-                        "prefix" => prefix = value.clone(),
-                        "suffix" => suffix = value.clone(),
-                        _ => {}
+                    if name.as_str().eq_ignore_ascii_case("prefix") {
+                        prefix = value.clone();
+                    } else if name.as_str().eq_ignore_ascii_case("suffix") {
+                        suffix = value.clone();
                     }
                 }
             }
@@ -695,35 +766,81 @@ where
     Ok(())
 }
 
-pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelete]) -> bool {
-    let (cfg, _created) = match get_replication_config(bucket).await {
-        Ok(replication_config) => replication_config,
-        Err(_err) => {
-            return false;
-        }
-    };
+/// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
+///
+/// Backend: `RwLock<HashMap>`. A parallel opt-in starshard backend
+/// (`RUSTFS_BUCKET_CACHE_STARSHARD`) used to double-write every operation
+/// here; no deployment ever set the variable and the branch was removed in
+/// backlog#1832.
+///
+/// Entries expire after `BUCKET_VALIDATION_TTL` (checked on read).
+/// Write operations (delete/make bucket) invalidate the cache explicitly.
+const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
 
-    for object in objects {
-        if cfg.has_active_rules(&object.object_name, true) {
-            return true;
-        }
-    }
-    false
+static BUCKET_CACHE_SMALL: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+
+fn small_cache() -> &'static RwLock<HashMap<String, Instant>> {
+    BUCKET_CACHE_SMALL.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
-/// Helper function to get store and validate bucket exists
-pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<rustfs_ecstore::store::ECStore>> {
-    let Some(store) = new_object_layer_fn() else {
+/// Get a value from the cache.
+fn cache_get(bucket: &str) -> Option<Instant> {
+    small_cache().read().ok()?.get(bucket).copied()
+}
+
+/// Insert a value into the cache.
+fn cache_insert(bucket: String, ts: Instant) {
+    if let Ok(mut map) = small_cache().write() {
+        map.insert(bucket, ts);
+    }
+}
+
+/// Remove a value from the cache.
+fn cache_remove(bucket: &str) {
+    if let Ok(mut map) = small_cache().write() {
+        map.remove(bucket);
+    }
+}
+/// Invalidate the validation cache for a specific bucket.
+pub fn invalidate_bucket_validation_cache(bucket: &str) {
+    cache_remove(bucket);
+}
+/// Helper function to get store and validate bucket exists.
+///
+/// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
+/// Returns store directly on cache hit without calling get_bucket_info().
+pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
+    let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    // Validate bucket exists
+    validate_bucket_exists(&store, bucket).await?;
+
+    Ok(store)
+}
+
+/// Validate that `bucket` exists on `store`, using the same adaptive 5s-TTL
+/// positive cache as [`get_validated_store`]. Handlers that resolve their
+/// store through the request-bound server context (backlog#1052 S6) use this
+/// to keep bucket validation on that store instead of the process-global one.
+pub(crate) async fn validate_bucket_exists(store: &super::ECStore, bucket: &str) -> S3Result<()> {
+    // Check cache — TTL is checked manually.
+    if let Some(inserted_at) = cache_get(bucket)
+        && inserted_at.elapsed() < BUCKET_VALIDATION_TTL
+    {
+        return Ok(()); // Cache hit, skip validation
+    }
+
+    // Cache miss or expired, perform validation
     store
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
         .map_err(ApiError::from)?;
 
-    Ok(store)
+    // Update cache
+    cache_insert(bucket.to_string(), Instant::now());
+
+    Ok(())
 }
 
 /// Quick check if CORS processing is needed (lightweight check for Origin header)
@@ -761,7 +878,7 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
 
     // Get CORS configuration for the bucket
-    let cors_config = match metadata_sys::get_cors_config(bucket).await {
+    let cors_config = match get_bucket_cors_config(bucket).await {
         Ok((config, _)) => config,
         Err(_) => return None, // No CORS config, no headers to add
     };
@@ -971,9 +1088,9 @@ pub(crate) async fn wrap_response_with_cors<T>(
 pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'static str) -> S3Result<Option<usize>> {
     match part_number {
         None => Ok(None),
-        Some(n) if n <= 0 => Err(S3Error::with_message(
+        Some(n) if !(1..=MAX_MULTIPART_PART_NUMBER).contains(&n) => Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
-            format!("{op}: invalid partNumber {n}, must be a positive integer"),
+            format!("{op}: partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
         )),
         Some(n) => Ok(Some(n as usize)),
     }

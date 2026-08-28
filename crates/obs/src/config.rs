@@ -44,18 +44,26 @@ use rustfs_config::observability::{
 };
 use rustfs_config::{
     APP_NAME, DEFAULT_LOG_KEEP_FILES, DEFAULT_LOG_LEVEL, DEFAULT_LOG_ROTATION_TIME, DEFAULT_OBS_LOG_FILENAME,
-    DEFAULT_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED,
-    DEFAULT_OBS_PROFILING_EXPORT_ENABLED, DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO,
-    SERVICE_VERSION, USE_STDOUT,
+    DEFAULT_OBS_LOGS_EXPORT_ENABLED, DEFAULT_OBS_METRICS_EXPORT_ENABLED, DEFAULT_OBS_PROFILING_EXPORT_ENABLED,
+    DEFAULT_OBS_TRACES_EXPORT_ENABLED, ENVIRONMENT, METER_INTERVAL, SAMPLE_RATIO, SERVICE_VERSION, USE_STDOUT,
 };
 use rustfs_utils::{
-    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_str, get_env_opt_u64, get_env_str, get_env_u64,
-    get_env_usize,
+    get_env_bool, get_env_bool_with_aliases, get_env_f64, get_env_opt_bool, get_env_opt_str, get_env_opt_u64, get_env_str,
+    get_env_u64, get_env_usize,
 };
 use serde::{Deserialize, Serialize};
 use std::env;
+#[cfg(test)]
+use std::sync::{Mutex, OnceLock};
 
 const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
+
+fn get_env_nonempty_str(name: &str, default: &str) -> String {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => default.to_string(),
+    }
+}
 
 /// Full observability configuration used by all telemetry backends.
 ///
@@ -78,7 +86,7 @@ const LEGACY_ENV_OBS_PROFILING_ENABLED: &str = "RUSTFS_OBS_PROFILING_ENABLED";
 /// - All fields are `Option<T>` to allow partial configuration via environment
 ///   variables with sensible defaults provided by constants in `rustfs-config`.
 /// - `log_keep_files` is used to derive the rolling-appender's upper bound on
-///   retained files (if enabled) and to set the cleaner's minimum retention count.
+///   retained files (if enabled) and to set the cleaner's retained-file ceiling.
 ///
 /// # Example
 /// ```no_run
@@ -139,14 +147,14 @@ pub struct OtelConfig {
     pub metrics_export_enabled: Option<bool>,
     /// Whether to export logs via OTLP (default: `true`).
     pub logs_export_enabled: Option<bool>,
-    /// Whether to export profiles via pyroscope (default: `false`).
+    /// Whether to export profiles via pyroscope (default: `true`).
     pub profiling_export_enabled: Option<bool>,
     /// **[OTLP-only]** Mirror all signals to stdout in addition to OTLP export.
     /// Only applies when an OTLP endpoint is configured.
     pub use_stdout: Option<bool>,
-    /// Fraction of traces to sample, `0.0`–`1.0` (default: `0.1`).
+    /// Fraction of traces to sample, `0.0`–`1.0` (default: `1.0`).
     pub sample_ratio: Option<f64>,
-    /// Metrics export interval in seconds (default: `15`).
+    /// Metrics export interval in seconds (default: `30`).
     pub meter_interval: Option<u64>,
     /// OTel `service.name` attribute (default: `APP_NAME`).
     pub service_name: Option<String>,
@@ -156,7 +164,7 @@ pub struct OtelConfig {
     pub environment: Option<String>,
 
     // ── Local logging ─────────────────────────────────────────────────────────
-    /// Minimum log level directive (default: `info`).
+    /// Minimum log level directive (default: `error`).
     /// Respects `RUST_LOG` syntax when set via environment.
     pub logger_level: Option<String>,
     /// When `true`, a stdout JSON layer is always attached regardless of the
@@ -168,7 +176,8 @@ pub struct OtelConfig {
     /// Base name for log files (without date suffix), e.g. `rustfs`.
     /// Used for both rolling-appender naming and cleanup scanning.
     pub log_filename: Option<String>,
-    /// Rotation time granularity: `"hourly"` or `"daily"` (default: `"daily"`).
+    /// Rotation time granularity: `"minutely"`, `"hourly"`, or `"daily"`
+    /// (default: `"hourly"`; any unrecognized value falls back to `"daily"`).
     pub log_rotation_time: Option<String>,
     /// Number of rolling log files to retain (default: `30`).
     /// Used by both the rolling-appender (as a loose upper bound) and the
@@ -205,7 +214,7 @@ pub struct OtelConfig {
     pub log_delete_empty_files: Option<bool>,
     /// A file younger than this many seconds is never touched (default: `3600`).
     pub log_min_file_age_seconds: Option<u64>,
-    /// How often the background cleanup task runs, in seconds (default: `21600`).
+    /// How often the background cleanup task runs, in seconds (default: `1800`).
     pub log_cleanup_interval_seconds: Option<u64>,
     /// Log what *would* be deleted without actually removing anything
     /// (default: `false`).
@@ -300,9 +309,9 @@ impl OtelConfig {
             environment: Some(get_env_str(ENV_OBS_ENVIRONMENT, ENVIRONMENT)),
             // Local logging
             logger_level: Some(get_env_str(ENV_OBS_LOGGER_LEVEL, DEFAULT_LOG_LEVEL)),
-            log_stdout_enabled: Some(get_env_bool(ENV_OBS_LOG_STDOUT_ENABLED, DEFAULT_OBS_LOG_STDOUT_ENABLED)),
+            log_stdout_enabled: get_env_opt_bool(ENV_OBS_LOG_STDOUT_ENABLED),
             log_directory,
-            log_filename: Some(get_env_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
+            log_filename: Some(get_env_nonempty_str(ENV_OBS_LOG_FILENAME, DEFAULT_OBS_LOG_FILENAME)),
             log_rotation_time,
             log_keep_files,
             // Log cleanup
@@ -429,32 +438,74 @@ pub fn is_production_environment() -> bool {
 mod tests {
     use super::*;
 
+    static PROFILING_ENV_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn with_profiling_env_lock<F>(f: F)
+    where
+        F: FnOnce(),
+    {
+        let _guard = PROFILING_ENV_TEST_LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
+        f();
+    }
+
+    fn extract_profiling_export_enabled() -> Option<bool> {
+        OtelConfig::extract_otel_config_from_env(None).profiling_export_enabled
+    }
+
     #[test]
     fn profiling_export_defaults_to_disabled_when_unset() {
-        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
-            temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
-                let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(false));
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var_unset(LEGACY_ENV_OBS_PROFILING_ENABLED, || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(DEFAULT_OBS_PROFILING_EXPORT_ENABLED));
+                });
             });
         });
     }
 
     #[test]
     fn profiling_export_accepts_legacy_env_alias() {
-        temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
-            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
-                let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(true));
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_PROFILING_EXPORT_ENABLED, || {
+                temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(true));
+                });
             });
         });
     }
 
     #[test]
     fn canonical_profiling_toggle_has_priority_over_legacy_alias() {
-        temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
-            temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
+        with_profiling_env_lock(|| {
+            temp_env::with_var(LEGACY_ENV_OBS_PROFILING_ENABLED, Some("true"), || {
+                temp_env::with_var(ENV_OBS_PROFILING_EXPORT_ENABLED, Some("false"), || {
+                    assert_eq!(extract_profiling_export_enabled(), Some(false));
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn empty_log_filename_falls_back_to_default() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var(ENV_OBS_LOG_FILENAME, Some(""), || {
                 let config = OtelConfig::extract_otel_config_from_env(None);
-                assert_eq!(config.profiling_export_enabled, Some(false));
+                assert_eq!(config.log_filename.as_deref(), Some(DEFAULT_OBS_LOG_FILENAME));
+            });
+        });
+    }
+
+    #[test]
+    fn stdout_mirror_environment_preserves_unset_true_and_false() {
+        with_profiling_env_lock(|| {
+            temp_env::with_var_unset(ENV_OBS_LOG_STDOUT_ENABLED, || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, None);
+            });
+            temp_env::with_var(ENV_OBS_LOG_STDOUT_ENABLED, Some("true"), || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, Some(true));
+            });
+            temp_env::with_var(ENV_OBS_LOG_STDOUT_ENABLED, Some("false"), || {
+                assert_eq!(OtelConfig::extract_otel_config_from_env(None).log_stdout_enabled, Some(false));
             });
         });
     }

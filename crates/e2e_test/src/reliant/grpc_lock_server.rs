@@ -21,8 +21,11 @@ use rustfs_lock::{LockClient, LockRequest};
 use rustfs_protos::{
     models::PingBodyBuilder,
     proto_gen::node_service::{
-        BatchGenerallyLockRequest, BatchGenerallyLockResponse, GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult,
-        PingRequest, PingResponse, node_service_server::NodeService,
+        BatchGenerallyLockRequest, BatchGenerallyLockResponse, BatchReadVersionRequest, BatchReadVersionResponse,
+        GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult, PingRequest, PingResponse,
+        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseReleaseResponse, ScannerPublicationLeaseRequest,
+        ScannerPublicationLeaseResponse, SnapshotLeaseMutationResponse, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+        SnapshotLeaseRequest, SnapshotLeaseResponse, node_service_server::NodeService,
     },
 };
 use std::pin::Pin;
@@ -94,6 +97,48 @@ impl NodeService for MinimalLockNodeService {
             version: 1,
             body: Bytes::copy_from_slice(finished_data),
         }))
+    }
+
+    async fn batch_read_version(
+        &self,
+        _request: Request<BatchReadVersionRequest>,
+    ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn acquire_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn renew_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseRenewRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_snapshot_lease(
+        &self,
+        _request: Request<SnapshotLeaseReleaseRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn acquire_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
+    }
+
+    async fn release_scanner_publication_lease(
+        &self,
+        _request: Request<ScannerPublicationLeaseReleaseRequest>,
+    ) -> Result<Response<ScannerPublicationLeaseReleaseResponse>, Status> {
+        Err(Status::unimplemented("MinimalLockNodeService only supports lock RPCs"))
     }
 
     async fn lock(&self, request: Request<GenerallyLockRequest>) -> Result<Response<GenerallyLockResponse>, Status> {
@@ -392,6 +437,20 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn prepare_part_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::PreparePartTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::PreparePartTransactionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn settle_part_transaction(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::SettlePartTransactionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::SettlePartTransactionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn rename_file(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameFileRequest>,
@@ -664,6 +723,27 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn start_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::StartDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::StartDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn cancel_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::CancelDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::CancelDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn clear_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ClearDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ClearDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn get_metrics(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::GetMetricsRequest>,
@@ -769,10 +849,24 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn scanner_activity(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ScannerActivityRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ScannerActivityResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn background_heal_status(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::BackgroundHealStatusRequest>,
     ) -> Result<Response<rustfs_protos::proto_gen::node_service::BackgroundHealStatusResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn replacement_recovery_status(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ReplacementRecoveryStatusResponse>, Status> {
         Err(Status::unimplemented("lock-only test server"))
     }
 

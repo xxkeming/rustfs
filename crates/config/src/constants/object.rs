@@ -67,6 +67,42 @@ pub const DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
 /// Default is set to 64 concurrent reads.
 pub const DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS: usize = 64;
 
+/// Environment variable for the disk read permit wait timeout (seconds).
+/// - Purpose: Bound how long a GET waits for a disk read permit before proceeding without one.
+/// - Unit: seconds (u64). `0` waits indefinitely.
+/// - Example: `export RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT=5`
+pub const ENV_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT";
+
+/// Maximum time a GET request waits for a primary disk read permit (seconds).
+///
+/// Permits are held for the whole response body transfer, so slow clients can
+/// occupy all of them while the disks sit idle. Instead of stalling until the
+/// request-level timeout fires, a GET that waits longer than this falls through
+/// to a bounded degraded admission lane; if that lane is also full the request
+/// is rejected with `SlowDown`/503 rather than proceeding without any permit.
+/// Set to 0 to wait on the primary lane indefinitely (never degrade or reject).
+pub const DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: u64 = 5;
+
+/// Environment variable for the bounded degraded disk-read admission lane size.
+/// - Purpose: Cap how many GETs may proceed after the primary disk-read permit
+///   pool is saturated, giving a hard upper bound on concurrent disk-active
+///   reads (primary cap + degraded cap) instead of an unbounded pass-through.
+/// - Unit: request count (usize). `0` means "mirror the primary cap", so the
+///   absolute hard cap defaults to twice the primary disk-read cap.
+/// - Example: `export RUSTFS_OBJECT_DISK_DEGRADED_READ_CAP=16`
+pub const ENV_OBJECT_DISK_DEGRADED_READ_CAP: &str = "RUSTFS_OBJECT_DISK_DEGRADED_READ_CAP";
+
+/// Size of the bounded degraded disk-read admission lane.
+///
+/// When the primary disk-read permit pool is saturated and a GET exceeds
+/// [`DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT`], it may take one permit from this
+/// bounded overflow lane instead of reading without any admission token. The
+/// total number of GETs performing disk-active reads is therefore hard-capped at
+/// `primary_cap + degraded_cap`; beyond that a GET is rejected with `SlowDown`.
+/// The default `0` mirrors the primary cap, so the hard cap is twice the primary
+/// disk-read concurrency.
+pub const DEFAULT_OBJECT_DISK_DEGRADED_READ_CAP: usize = 0;
+
 /// Skip bitrot hash verification on GetObject reads.
 ///
 /// When enabled, GetObject reads skip the per-shard hash
@@ -79,6 +115,87 @@ pub const ENV_OBJECT_GET_SKIP_BITROT_VERIFY: &str = "RUSTFS_OBJECT_GET_SKIP_BITR
 
 /// Default: bitrot verification is enabled on GetObject reads (do not skip).
 pub const DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY: bool = false;
+
+/// Request writing the complete remote-tier version state into object metadata.
+///
+/// This remains ineffective until
+/// [`ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED`] is also enabled.
+pub const ENV_TIER_REMOTE_VERSION_STATE_WRITE: &str = "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE";
+pub const DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE: bool = false;
+
+/// Operator-attested fleet-wide confirmation for
+/// [`ENV_TIER_REMOTE_VERSION_STATE_WRITE`].
+///
+/// This flag is an operational contract, not automatic capability discovery.
+/// Operators may enable it only after every node that can write or read
+/// transitioned object metadata supports the remote version-state schema and
+/// semantics. Keeping the confirmation separate makes a single-node request or
+/// a writer whose local opt-in is removed fail closed.
+pub const ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: &str = "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED";
+pub const DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_WRITE);
+const _: () = assert!(!DEFAULT_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED);
+
+/// Request the object-transaction fencing contract used by storage-owned
+/// cleanup receipts and lock-window optimizations.
+///
+/// This is fail-closed: enabling the writer without a live fleet proof rejects
+/// the commit rather than silently using a legacy-safe path.
+pub const ENV_OBJECT_TRANSACTION_FENCING_WRITE: &str = "RUSTFS_OBJECT_TRANSACTION_FENCING_WRITE";
+pub const DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE: bool = false;
+
+/// Operator-attested confirmation that every serving node understands the
+/// object transaction fencing contract.
+pub const ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED: &str = "RUSTFS_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED";
+pub const DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_OBJECT_TRANSACTION_FENCING_WRITE);
+const _: () = assert!(!DEFAULT_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED);
+
+/// Request preserving legacy per-part checksum metadata during data movement.
+///
+/// This remains ineffective until
+/// [`ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED`] is also enabled.
+pub const ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE: &str = "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_WRITE";
+pub const DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_WRITE: bool = false;
+
+/// Operator-attested confirmation that every serving node understands the
+/// data-movement per-part checksum sidecar.
+pub const ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED: &str = "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED";
+pub const DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_WRITE);
+const _: () = assert!(!DEFAULT_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED);
+
+/// Request writing pool metadata version 2.
+///
+/// This remains ineffective until [`ENV_POOL_META_V2_FLEET_CONFIRMED`] is also enabled.
+pub const ENV_POOL_META_V2_WRITE: &str = "RUSTFS_POOL_META_V2_WRITE";
+pub const DEFAULT_POOL_META_V2_WRITE: bool = false;
+
+/// Operator-attested confirmation that every pool metadata reader and writer understands version 2.
+pub const ENV_POOL_META_V2_FLEET_CONFIRMED: &str = "RUSTFS_POOL_META_V2_FLEET_CONFIRMED";
+pub const DEFAULT_POOL_META_V2_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_POOL_META_V2_WRITE);
+const _: () = assert!(!DEFAULT_POOL_META_V2_FLEET_CONFIRMED);
+
+/// Request writing pool metadata version 3 with durable generations.
+///
+/// Existing deployments remain on their observed version until
+/// [`ENV_POOL_META_V3_FLEET_CONFIRMED`] is also enabled. Fresh deployments may
+/// initialize directly at version 3 because they have no legacy readers.
+pub const ENV_POOL_META_V3_WRITE: &str = "RUSTFS_POOL_META_V3_WRITE";
+pub const DEFAULT_POOL_META_V3_WRITE: bool = false;
+
+/// Operator-attested confirmation that every pool metadata reader and writer
+/// understands the version 3 generation and recovery protocol.
+pub const ENV_POOL_META_V3_FLEET_CONFIRMED: &str = "RUSTFS_POOL_META_V3_FLEET_CONFIRMED";
+pub const DEFAULT_POOL_META_V3_FLEET_CONFIRMED: bool = false;
+
+const _: () = assert!(!DEFAULT_POOL_META_V3_WRITE);
+const _: () = assert!(!DEFAULT_POOL_META_V3_FLEET_CONFIRMED);
 
 // =============================================================================
 // Concurrent Request Fix - Timeout and Backpressure Configuration
@@ -112,6 +229,97 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
+
+/// Environment variable for the per-shard erasure write stall timeout (seconds).
+///
+/// A single shard write (or shard-writer shutdown) that makes no forward
+/// progress for longer than this budget is failed and its disk is dropped
+/// before commit, so a black-hole peer that accepts the connection but never
+/// drains the body cannot pin an otherwise-healthy write quorum forever
+/// (see `MultiWriter` in `erasure/coding/encode.rs`). The budget is re-armed on
+/// every shard write, so it bounds a *stall* rather than the total transfer
+/// time of a large object.
+///
+/// Unit: seconds (u64). `0` disables the stall deadline (previous behavior:
+/// wait indefinitely). Default: 30 seconds.
+pub const ENV_OBJECT_DISK_WRITE_STALL_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_WRITE_STALL_TIMEOUT";
+
+/// Default per-shard erasure write stall timeout in seconds.
+pub const DEFAULT_OBJECT_DISK_WRITE_STALL_TIMEOUT: u64 = 30;
+
+/// Environment variable for the absolute per-object erasure write cap (seconds).
+///
+/// Optional administrator backstop against a "slow-drip" peer that produces
+/// just enough forward progress to reset the per-shard stall timeout on every
+/// block while never converging. When set, the shard writers for one object are
+/// engaged for at most this long in aggregate before a stalled writer is failed
+/// and dropped. It is disabled by default because a legitimate large upload
+/// over a slow-but-honest link must not be killed on total time alone; the
+/// per-shard stall timeout is the primary guarantee.
+///
+/// Unit: seconds (u64). `0` (default) disables the absolute cap.
+pub const ENV_OBJECT_DISK_WRITE_ABSOLUTE_CAP: &str = "RUSTFS_OBJECT_DISK_WRITE_ABSOLUTE_CAP";
+
+/// Default absolute per-object erasure write cap in seconds (`0` = disabled).
+pub const DEFAULT_OBJECT_DISK_WRITE_ABSOLUTE_CAP: u64 = 0;
+
+/// Enable foreground PutObject request admission.
+///
+/// This is an experimental, default-off foreground write backpressure gate for
+/// strict commit tail investigations. When disabled, PUTs follow the legacy
+/// path and only the existing request counters are updated.
+pub const ENV_PUT_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_ENABLE";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE: bool = false;
+
+/// Maximum foreground PutObject requests admitted concurrently per process.
+///
+/// The limit is used only when [`ENV_PUT_FOREGROUND_ADMISSION_ENABLE`] is true.
+/// A value of `0` disables the gate even when the enable flag is present, so a
+/// partially configured rollout cannot reject every PUT.
+pub const ENV_PUT_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_LIMIT";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_LIMIT: usize = 0;
+
+/// Time in milliseconds a foreground PutObject waits for an admission permit.
+///
+/// Once this timeout expires the request fails before body ingest/storage
+/// mutation with S3 `SlowDown`/503. `0` means fail fast when the limit is full.
+pub const ENV_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 0;
+
+const _: () = assert!(!DEFAULT_PUT_FOREGROUND_ADMISSION_ENABLE);
+
+/// Enable automatic foreground admission for large or unknown-size PutObject requests.
+///
+/// Unlike the strict experimental gate above, this default-on path only applies
+/// to requests that are large enough to create sustained erasure/RPC pressure.
+/// Small PUTs continue on the legacy path unless the strict gate is explicitly
+/// enabled.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE: bool = true;
+
+/// Maximum large foreground PutObject requests admitted concurrently per process.
+///
+/// `0` derives a conservative default from the local disk-read scheduler cap,
+/// currently clamped to protect the commit path without making ordinary high
+/// throughput uploads single-file.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_LIMIT: usize = 0;
+
+/// Minimum object size that enters automatic large PutObject admission.
+///
+/// Requests with an unknown size are treated as large because the write pressure
+/// cannot be bounded from headers.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_MIN_SIZE_BYTES: usize = 32 * 1024 * 1024;
+
+/// Time in milliseconds a large foreground PutObject waits for a permit.
+///
+/// A short wait smooths transient bursts while still returning S3
+/// `SlowDown`/503 before body ingest when the node is already saturated.
+pub const ENV_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: &str = "RUSTFS_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS";
+pub const DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_WAIT_TIMEOUT_MS: u64 = 250;
+
+const _: () = assert!(DEFAULT_PUT_LARGE_FOREGROUND_ADMISSION_ENABLE);
 
 /// Environment variable for minimum GetObject timeout in seconds.
 ///
@@ -191,9 +399,9 @@ pub const DEFAULT_OBJECT_IO_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Environment variable to enable/disable lock optimization.
 ///
-/// When enabled, read locks are released immediately after metadata
-/// is read, rather than being held for the entire data transfer.
-/// This significantly reduces lock contention under high concurrency.
+/// When enabled, read locks may be released before the reader is returned.
+/// Disable this only when streaming readers must keep the object namespace
+/// locked until EOF or drop.
 ///
 /// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE`).
 pub const ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE: &str = "RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE";
@@ -280,6 +488,66 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
+
+/// Environment variable for the experimental PUT commit namespace lock acquire timeout in milliseconds.
+///
+/// A value of `0` disables the experiment and keeps
+/// `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` as the timeout. This only bounds the
+/// `put_object_commit` namespace write-lock wait and is intended for #925
+/// tail-drain admission experiments.
+///
+/// Default: 0 milliseconds (disabled).
+pub const ENV_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS: &str = "RUSTFS_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS";
+
+/// Default: PUT commit namespace lock acquire timeout override is disabled.
+pub const DEFAULT_PUT_COMMIT_NAMESPACE_LOCK_ACQUIRE_TIMEOUT_MS: u64 = 0;
+
+/// Environment variable for remote namespace lock RPC transport timeout in milliseconds.
+///
+/// This timeout bounds the internode RPC call itself. It is intentionally
+/// separate from `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` and the distributed lock
+/// per-attempt acquire budget so short lock-contention windows do not become
+/// aggressive network deadlines.
+///
+/// Default: 3000 milliseconds (can be overridden by `RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS`).
+pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS";
+
+/// Default remote lock RPC transport timeout: 3000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
+
+/// Environment variable to enable object namespace lock diagnostics.
+///
+/// When enabled, RustFS emits slow lock acquisition and long lock hold
+/// warnings for object-level namespace locks. This is intended for
+/// production debugging of contention on hot object keys.
+///
+/// Default: false (disabled, can be overridden by `RUSTFS_OBJECT_LOCK_DIAG_ENABLE`).
+pub const ENV_OBJECT_LOCK_DIAG_ENABLE: &str = "RUSTFS_OBJECT_LOCK_DIAG_ENABLE";
+
+/// Default: object lock diagnostics are disabled.
+pub const DEFAULT_OBJECT_LOCK_DIAG_ENABLE: bool = false;
+
+/// Environment variable for the slow object lock acquisition threshold in milliseconds.
+///
+/// When a read or write namespace lock takes at least this long to acquire,
+/// RustFS emits a warning with the operation name and object key.
+///
+/// Default: 500 milliseconds.
+pub const ENV_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS: &str = "RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS";
+
+/// Default slow object lock acquisition threshold: 500 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS: u64 = 500;
+
+/// Environment variable for the long object lock hold threshold in milliseconds.
+///
+/// When a namespace lock guard is held for at least this long, RustFS emits
+/// a warning when the guard is dropped.
+///
+/// Default: 1000 milliseconds.
+pub const ENV_OBJECT_LOCK_DIAG_SLOW_HOLD_MS: &str = "RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS";
+
+/// Default long object lock hold threshold: 1000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_DIAG_SLOW_HOLD_MS: u64 = 1000;
 
 // ============================================================================
 // I/O priority scheduling configuration
@@ -501,3 +769,45 @@ pub const ENV_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: &str = "RUSTFS_OBJ
 
 /// Default read-ahead disable concurrency threshold: 4.
 pub const DEFAULT_OBJECT_IO_RANDOM_READAHEAD_DISABLE_CONCURRENCY: usize = 4;
+
+#[cfg(test)]
+mod remote_version_state_tests {
+    #[test]
+    fn remote_version_state_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_TIER_REMOTE_VERSION_STATE_WRITE, "RUSTFS_TIER_REMOTE_VERSION_STATE_WRITE");
+        assert_eq!(
+            super::ENV_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED,
+            "RUSTFS_TIER_REMOTE_VERSION_STATE_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn data_movement_part_checksum_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_DATA_MOVEMENT_PART_CHECKSUMS_WRITE, "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_WRITE");
+        assert_eq!(
+            super::ENV_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED,
+            "RUSTFS_DATA_MOVEMENT_PART_CHECKSUMS_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn object_transaction_fencing_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_OBJECT_TRANSACTION_FENCING_WRITE, "RUSTFS_OBJECT_TRANSACTION_FENCING_WRITE");
+        assert_eq!(
+            super::ENV_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED,
+            "RUSTFS_OBJECT_TRANSACTION_FENCING_FLEET_CONFIRMED"
+        );
+    }
+
+    #[test]
+    fn pool_meta_v2_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_POOL_META_V2_WRITE, "RUSTFS_POOL_META_V2_WRITE");
+        assert_eq!(super::ENV_POOL_META_V2_FLEET_CONFIRMED, "RUSTFS_POOL_META_V2_FLEET_CONFIRMED");
+    }
+
+    #[test]
+    fn pool_meta_v3_gate_uses_stable_environment_names() {
+        assert_eq!(super::ENV_POOL_META_V3_WRITE, "RUSTFS_POOL_META_V3_WRITE");
+        assert_eq!(super::ENV_POOL_META_V3_FLEET_CONFIRMED, "RUSTFS_POOL_META_V3_FLEET_CONFIRMED");
+    }
+}

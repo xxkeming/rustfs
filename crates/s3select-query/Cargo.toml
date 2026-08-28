@@ -25,18 +25,37 @@ keywords = ["s3-select", "query-engine", "rustfs", "Minio", "data-retrieval"]
 categories = ["web-programming", "development-tools", "data-structures"]
 documentation = "https://docs.rs/rustfs-s3select-query/latest/rustfs_s3select_query/"
 
+[lints]
+workspace = true
+
+[features]
+default = []
+hotpath = [
+    "hotpath/hotpath",
+    "hotpath/tokio",
+    "hotpath/futures",
+    "hotpath/parking_lot",
+    "rustfs-s3select-api/hotpath",
+]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-s3select-api/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-s3select-api/hotpath-cpu"]
+
 [dependencies]
+hotpath.workspace = true
 rustfs-s3select-api = { workspace = true }
 async-recursion = { workspace = true }
 async-trait.workspace = true
-datafusion = { workspace = true }
+bytes.workspace = true
+datafusion = { workspace = true, default-features = false, features = ["parquet", "recursive_protection", "sql"] }
 derive_builder = { workspace = true }
 futures = { workspace = true }
 parking_lot = { workspace = true }
-s3s.workspace = true
-snafu = { workspace = true, features = ["backtrace"] }
-tokio = { workspace = true }
+s3s = { workspace = true, features = ["minio"] }
+tokio = { workspace = true, features = ["fs", "rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
+
+[dev-dependencies]
+rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
 
 [lib]
 doctest = false

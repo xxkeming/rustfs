@@ -56,6 +56,7 @@ impl KeyName {
         KeyName::S3(S3KeyName::S3SignatureAge),
         KeyName::S3(S3KeyName::S3XAmzContentSha256),
         KeyName::S3(S3KeyName::S3LocationConstraint),
+        KeyName::S3(S3KeyName::S3VersionId),
         //aws
         KeyName::Aws(AwsKeyName::AWSReferer),
         KeyName::Aws(AwsKeyName::AWSSourceIP),
@@ -110,6 +111,30 @@ impl KeyName {
 
     pub fn name(&self) -> &str {
         &Into::<&str>::into(self)[self.prefix()..]
+    }
+
+    /// True when the value of this condition key must come from server-verified
+    /// state -- the authenticated identity, its validated claims, or the connection
+    /// itself -- rather than from raw request input.
+    ///
+    /// Callers assembling the policy condition map use this to refuse request-supplied
+    /// values for these keys. Without that check a caller could satisfy conditions such
+    /// as `aws:userid` or `jwt:groups` simply by sending a header of the same name.
+    ///
+    /// The `s3:` namespace is mixed: `s3:x-amz-*` keys mirror request headers by
+    /// design, while the rest (`s3:authType`, `s3:LocationConstraint`, ...) are
+    /// computed by the server.
+    pub fn is_server_derived(&self) -> bool {
+        match self {
+            KeyName::Aws(_) | KeyName::Jwt(_) | KeyName::Ldap(_) | KeyName::Sts(_) | KeyName::Svc(_) => true,
+            KeyName::S3(_) => !self.name().starts_with("x-amz-"),
+        }
+    }
+
+    /// Names (prefix stripped) of the well-known condition keys that request input
+    /// must never populate. See [`KeyName::is_server_derived`].
+    pub fn server_derived_key_names() -> impl Iterator<Item = &'static str> {
+        Self::COMMON_KEYS.iter().filter(|k| k.is_server_derived()).map(|k| k.name())
     }
 
     pub fn var_name(&self) -> String {
@@ -167,8 +192,14 @@ pub enum S3KeyName {
     #[strum(serialize = "s3:LocationConstraint")]
     S3LocationConstraint,
 
+    #[strum(to_string = "s3:versionid", serialize = "s3:VersionId")]
+    S3VersionId,
+
     #[strum(serialize = "s3:object-lock-retain-until-date")]
     S3ObjectLockRetainUntilDate,
+
+    #[strum(serialize = "s3:object-lock-mode")]
+    S3ObjectLockMode,
 
     #[strum(serialize = "s3:max-keys")]
     S3MaxKeys,
@@ -355,6 +386,9 @@ mod tests {
     use test_case::test_case;
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
+    #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]
+    #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -375,6 +409,9 @@ mod tests {
     }
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
+    #[test_case("s3:VersionId", KeyName::S3(S3KeyName::S3VersionId) ; "aws_version_id")]
+    #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId) ; "minio_version_id")]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]
@@ -392,6 +429,8 @@ mod tests {
     }
 
     #[test_case("s3:x-amz-copy-source", KeyName::S3(S3KeyName::S3XAmzCopySource))]
+    #[test_case("s3:versionid", KeyName::S3(S3KeyName::S3VersionId))]
+    #[test_case("s3:object-lock-mode", KeyName::S3(S3KeyName::S3ObjectLockMode))]
     #[test_case("aws:SecureTransport", KeyName::Aws(AwsKeyName::AWSSecureTransport))]
     #[test_case("jwt:sub", KeyName::Jwt(JwtKeyName::JWTSub))]
     #[test_case("ldap:user", KeyName::Ldap(LdapKeyName::User))]

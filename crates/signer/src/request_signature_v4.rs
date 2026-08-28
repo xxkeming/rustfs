@@ -16,17 +16,24 @@ use bytes::BytesMut;
 use http::HeaderMap;
 use http::Uri;
 use http::request;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::sync::LazyLock;
 use time::{OffsetDateTime, macros::format_description};
-use tracing::{debug, warn};
+use tracing::warn;
 
 use super::constants::UNSIGNED_PAYLOAD;
 use super::request_signature_streaming_unsigned_trailer::streaming_unsigned_v4;
 use super::utils::{HostAddrError, sign_v4_trim_all, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hex_sha256, hmac_sha256};
 use s3s::Body;
+
+const SIGNING_KEY_CACHE_CAPACITY: usize = 1024;
+type SigningKeyCacheKey = ([u8; 32], String, String, String);
+
+// Keep the cache bounded and avoid retaining raw secret access keys.
+static SIGNING_KEY_CACHE: LazyLock<std::sync::Mutex<HashMap<SigningKeyCacheKey, [u8; 32]>>> =
+    LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 pub const SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 pub const SERVICE_TYPE_S3: &str = "s3";
@@ -62,13 +69,12 @@ struct SignFailure {
 
 type SignOutcome = std::result::Result<request::Request<Body>, Box<SignFailure>>;
 
-#[allow(non_upper_case_globals)] // FIXME
-static v4_ignored_headers: LazyLock<HashMap<String, bool>> = LazyLock::new(|| {
-    let mut m = <HashMap<String, bool>>::new();
-    m.insert("accept-encoding".to_string(), true);
-    m.insert("authorization".to_string(), true);
-    m.insert("user-agent".to_string(), true);
-    m
+static V4_IGNORED_HEADERS: LazyLock<HashSet<&'static str>> = LazyLock::new(|| {
+    let mut s = HashSet::new();
+    s.insert("accept-encoding");
+    s.insert("authorization");
+    s.insert("user-agent");
+    s
 });
 
 fn fail(request: request::Request<Body>, error: SignV4Error) -> SignOutcome {
@@ -89,14 +95,40 @@ fn format_amz_datetime(t: OffsetDateTime) -> SignResult<String> {
 }
 
 pub fn get_signing_key(secret: &str, loc: &str, t: OffsetDateTime, service_type: &str) -> [u8; 32] {
+    let date_value = format_yyyymmdd(t);
+    let cache_key = (
+        hmac_sha256(b"rustfs-signing-key-cache", secret),
+        loc.to_string(),
+        date_value.clone(),
+        service_type.to_string(),
+    );
+
+    // Check cache first
+    if let Ok(cache) = SIGNING_KEY_CACHE.lock()
+        && let Some(&key) = cache.get(&cache_key)
+    {
+        return key;
+    }
+
+    // Cache miss: compute signing key
     let mut s = "AWS4".to_string();
     s.push_str(secret);
-    let date_value = format_yyyymmdd(t);
     let date = hmac_sha256(s.into_bytes(), date_value.into_bytes());
     let location = hmac_sha256(date, loc);
     let service = hmac_sha256(location, service_type);
+    let signing_key = hmac_sha256(service, "aws4_request");
 
-    hmac_sha256(service, "aws4_request")
+    if let Ok(mut cache) = SIGNING_KEY_CACHE.lock() {
+        if cache.len() >= SIGNING_KEY_CACHE_CAPACITY
+            && !cache.contains_key(&cache_key)
+            && let Some(evicted_key) = cache.keys().next().cloned()
+        {
+            cache.remove(&evicted_key);
+        }
+        cache.insert(cache_key, signing_key);
+    }
+
+    signing_key
 }
 
 pub fn get_signature(signing_key: [u8; 32], string_to_sign: &str) -> String {
@@ -136,11 +168,13 @@ fn try_get_hashed_payload(req: &request::Request<Body>) -> SignResult<String> {
     Ok(hashed_payload.to_string())
 }
 
-fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> SignResult<String> {
+/// The headers signed here carry credential material (`x-amz-security-token`, SSE-C keys),
+/// so neither the names nor the values may be written to any log sink.
+fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> SignResult<String> {
     let mut headers = Vec::<String>::new();
     let mut vals = HashMap::<String, Vec<String>>::new();
     for k in req.headers().keys() {
-        if ignored_headers.get(&k.to_string()).is_some() {
+        if ignored_headers.contains(k.as_str()) {
             continue;
         }
         headers.push(k.as_str().to_lowercase());
@@ -149,11 +183,15 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
             .get_all(k)
             .iter()
             .map(|e| {
-                e.to_str()
-                    .map(|v| v.to_string())
-                    .map_err(|_| SignV4Error::InvalidHeaderValue {
+                let value = std::str::from_utf8(e.as_bytes()).map_err(|_| SignV4Error::InvalidHeaderValue {
+                    name: k.as_str().to_lowercase(),
+                })?;
+                if value.chars().any(|ch| !ch.is_ascii() && ch.is_whitespace()) {
+                    return Err(SignV4Error::InvalidHeaderValue {
                         name: k.as_str().to_lowercase(),
-                    })
+                    });
+                }
+                Ok(value.to_string())
             })
             .collect::<SignResult<Vec<String>>>()?;
         vals.insert(k.as_str().to_lowercase(), vv);
@@ -162,9 +200,6 @@ fn try_get_canonical_headers(req: &request::Request<Body>, ignored_headers: &Has
         headers.push("host".to_string());
     }
     headers.sort();
-
-    debug!("get_canonical_headers vals: {:?}", vals);
-    debug!("get_canonical_headers headers: {:?}", headers);
 
     let mut buf = BytesMut::new();
     for k in headers {
@@ -210,12 +245,11 @@ fn header_exists(key: &str, headers: &[String]) -> bool {
     false
 }
 
-fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<String, bool>) -> String {
+fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashSet<&'static str>) -> String {
     let mut headers = Vec::<String>::new();
     let headers_ref = req.headers();
-    debug!("get_signed_headers headers: {:?}", headers_ref);
     for (k, _) in headers_ref {
-        if ignored_headers.get(&k.to_string()).is_some() {
+        if ignored_headers.contains(k.as_str()) {
             continue;
         }
         headers.push(k.as_str().to_lowercase());
@@ -229,43 +263,52 @@ fn get_signed_headers(req: &request::Request<Body>, ignored_headers: &HashMap<St
 
 fn try_get_canonical_request(
     req: &request::Request<Body>,
-    ignored_headers: &HashMap<String, bool>,
+    ignored_headers: &HashSet<&'static str>,
     hashed_payload: &str,
 ) -> SignResult<String> {
-    let mut canonical_query_string = "".to_string();
+    let mut canonical_query_string = String::new();
     if let Some(q) = req.uri().query() {
-        // Parse query string into key-value pairs
-        let mut query_params: Vec<(String, String)> = Vec::new();
+        // Parse query string into key-value pairs (zero-copy slices)
+        let mut query_params: Vec<(&str, &str)> = Vec::new();
         if !q.is_empty() {
             for param in q.split('&') {
                 if let Some((key, value)) = param.split_once('=') {
-                    query_params.push((key.to_string(), value.to_string()));
+                    query_params.push((key, value));
                 } else {
-                    query_params.push((param.to_string(), "".to_string()));
+                    query_params.push((param, ""));
                 }
             }
         }
 
         // Sort by key name
-        query_params.sort_by(|a, b| a.0.cmp(&b.0));
+        query_params.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Build canonical query string
-        //println!("query_params: {query_params:?}");
-        let sorted_params: Vec<String> = query_params.iter().map(|(k, v)| format!("{k}={v}")).collect();
-
-        canonical_query_string = sorted_params.join("&");
+        // Build canonical query string with push_str (no intermediate allocations)
+        for (i, (k, v)) in query_params.iter().enumerate() {
+            if i > 0 {
+                canonical_query_string.push('&');
+            }
+            canonical_query_string.push_str(k);
+            canonical_query_string.push('=');
+            canonical_query_string.push_str(v);
+        }
         canonical_query_string = canonical_query_string.replace("+", "%20");
     }
 
-    let canonical_request = [
-        req.method().to_string(),
-        req.uri().path().to_string(),
-        canonical_query_string,
-        try_get_canonical_headers(req, ignored_headers)?,
-        get_signed_headers(req, ignored_headers),
-        hashed_payload.to_string(),
-    ];
-    Ok(canonical_request.join("\n"))
+    // Build canonical request with a single allocation
+    let mut canonical_request = String::with_capacity(256);
+    canonical_request.push_str(req.method().as_str());
+    canonical_request.push('\n');
+    canonical_request.push_str(req.uri().path());
+    canonical_request.push('\n');
+    canonical_request.push_str(&canonical_query_string);
+    canonical_request.push('\n');
+    canonical_request.push_str(&try_get_canonical_headers(req, ignored_headers)?);
+    canonical_request.push('\n');
+    canonical_request.push_str(&get_signed_headers(req, ignored_headers));
+    canonical_request.push('\n');
+    canonical_request.push_str(hashed_payload);
+    Ok(canonical_request)
 }
 
 fn try_get_string_to_sign_v4(
@@ -298,7 +341,7 @@ fn pre_sign_v4_inner(
     }
 
     let credential = get_credential(access_key_id, location, t, SERVICE_TYPE_S3);
-    let signed_headers = get_signed_headers(&req, &v4_ignored_headers);
+    let signed_headers = get_signed_headers(&req, &V4_IGNORED_HEADERS);
 
     let mut query = <Vec<(String, String)>>::new();
     if let Some(q) = req.uri().query() {
@@ -344,7 +387,7 @@ fn pre_sign_v4_inner(
         Ok(value) => value,
         Err(err) => return fail(req, err),
     };
-    let canonical_request = match try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload) {
+    let canonical_request = match try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload) {
         Ok(value) => value,
         Err(err) => return fail(req, err),
     };
@@ -548,7 +591,7 @@ fn sign_v4_inner(
         Ok(value) => value,
         Err(err) => return fail(req, err),
     };
-    let canonical_request = match try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload) {
+    let canonical_request = match try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload) {
         Ok(value) => value,
         Err(err) => return fail(req, err),
     };
@@ -558,7 +601,7 @@ fn sign_v4_inner(
     };
     let signing_key = get_signing_key(secret_access_key, location, t, service_type);
     let credential = get_credential(access_key_id, location, t2, service_type);
-    let signed_headers = get_signed_headers(&req, &v4_ignored_headers);
+    let signed_headers = get_signed_headers(&req, &V4_IGNORED_HEADERS);
     let signature = get_signature(signing_key, &string_to_sign);
     //debug!("\n\ncanonical_request: \n{}\nstring_to_sign: \n{}\nsignature: \n{}\n\n", &canonical_request, &string_to_sign, &signature);
 
@@ -733,7 +776,7 @@ mod tests {
 
         let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
         let canonical_request =
-            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
+            try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload).expect("example request should canonicalize");
         assert_eq!(
             canonical_request,
             concat!(
@@ -810,7 +853,7 @@ mod tests {
 
         let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
         let canonical_request =
-            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
+            try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -878,7 +921,7 @@ mod tests {
         println!("{:?}", req.uri().query());
         let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
         let canonical_request =
-            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
+            try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -946,7 +989,7 @@ mod tests {
         println!("{:?}", req.uri().query());
         let hashed_payload = try_get_hashed_payload(&req).expect("example request should have valid payload header");
         let canonical_request =
-            try_get_canonical_request(&req, &v4_ignored_headers, &hashed_payload).expect("example request should canonicalize");
+            try_get_canonical_request(&req, &V4_IGNORED_HEADERS, &hashed_payload).expect("example request should canonicalize");
         println!("canonical_request: \n{canonical_request}\n");
         assert_eq!(
             canonical_request,
@@ -1015,12 +1058,12 @@ mod tests {
         canonical_request.push_str(req.uri().query().unwrap());
         canonical_request.push('\n');
         canonical_request.push_str(
-            try_get_canonical_headers(&req, &v4_ignored_headers)
+            try_get_canonical_headers(&req, &V4_IGNORED_HEADERS)
                 .expect("presigned request should canonicalize headers")
                 .as_str(),
         );
         canonical_request.push('\n');
-        canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
+        canonical_request.push_str(&get_signed_headers(&req, &V4_IGNORED_HEADERS));
         canonical_request.push('\n');
         canonical_request.push_str(
             try_get_hashed_payload(&req)
@@ -1071,12 +1114,12 @@ mod tests {
         canonical_request.push_str(req.uri().query().unwrap());
         canonical_request.push('\n');
         canonical_request.push_str(
-            try_get_canonical_headers(&req, &v4_ignored_headers)
+            try_get_canonical_headers(&req, &V4_IGNORED_HEADERS)
                 .expect("presigned request should canonicalize headers")
                 .as_str(),
         );
         canonical_request.push('\n');
-        canonical_request.push_str(&get_signed_headers(&req, &v4_ignored_headers));
+        canonical_request.push_str(&get_signed_headers(&req, &V4_IGNORED_HEADERS));
         canonical_request.push('\n');
         canonical_request.push_str(
             try_get_hashed_payload(&req)
@@ -1118,6 +1161,51 @@ mod tests {
         assert!(matches!(
             err,
             SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-invalid"
+        ));
+    }
+
+    #[test]
+    fn try_sign_v4_accepts_utf8_header_value() {
+        let mut req = request::Request::builder()
+            .method(http::Method::PUT)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("20260715/鲁A12345/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        let signed =
+            try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1").expect("valid utf8 metadata should be signed");
+
+        assert!(signed.headers().contains_key(http::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn try_sign_v4_rejects_non_ascii_whitespace_header_value() {
+        let mut req = request::Request::builder()
+            .method(http::Method::PUT)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-content-sha256", HeaderValue::from_static(UNSIGNED_PAYLOAD));
+        headers.insert(
+            "x-amz-meta-name",
+            HeaderValue::from_bytes("tier/a\u{00a0}b/object".as_bytes()).expect("valid utf8 metadata header"),
+        );
+
+        let err = try_sign_v4(req, 0, "rustfsadmin", "rustfsadmin", "", "us-east-1")
+            .expect_err("non-ascii whitespace must not be normalized differently from the wire value");
+
+        assert!(matches!(
+            err,
+            SignV4Error::InvalidHeaderValue { name } if name == "x-amz-meta-name"
         ));
     }
 
@@ -1179,5 +1267,71 @@ mod tests {
     fn format_yyyymmdd_is_zero_padded() {
         let t = datetime!(0001-01-02 03:04:05 UTC);
         assert_eq!(format_yyyymmdd(t), "00010102");
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs {
+        output: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    struct CapturedWriter(CapturedLogs);
+
+    impl std::io::Write for CapturedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.output.lock().expect("log buffer lock poisoned").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(self.clone())
+        }
+    }
+
+    impl CapturedLogs {
+        fn output(&self) -> String {
+            String::from_utf8(self.output.lock().expect("log buffer lock poisoned").clone()).expect("logs should be UTF-8")
+        }
+    }
+
+    #[test]
+    fn signing_never_logs_signed_header_material() {
+        const MARKER: &str = "CS_TEST_SECRET_DO_NOT_LOG";
+
+        let mut req = request::Request::builder()
+            .method(http::Method::GET)
+            .uri("http://examplebucket.s3.amazonaws.com/object")
+            .body(Body::empty())
+            .expect("test request should build");
+        let headers = req.headers_mut();
+        headers.insert("host", HeaderValue::from_static("examplebucket.s3.amazonaws.com"));
+        headers.insert("x-amz-security-token", HeaderValue::from_static(MARKER));
+        headers.insert("x-amz-server-side-encryption-customer-key", HeaderValue::from_static(MARKER));
+
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(logs.clone())
+            .finish();
+
+        let (canonical_headers, signed_headers) = tracing::subscriber::with_default(subscriber, || {
+            let canonical_headers = try_get_canonical_headers(&req, &V4_IGNORED_HEADERS).expect("request should canonicalize");
+            let signed_headers = get_signed_headers(&req, &V4_IGNORED_HEADERS);
+            (canonical_headers, signed_headers)
+        });
+
+        assert!(canonical_headers.contains(MARKER), "the header must still take part in signing");
+        assert!(signed_headers.contains("x-amz-security-token"));
+
+        let output = logs.output();
+        assert!(!output.contains(MARKER), "signed header value leaked into logs: {output}");
+        assert!(!output.contains("x-amz-security-token"), "signed header name leaked into logs: {output}");
     }
 }

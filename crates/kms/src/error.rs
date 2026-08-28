@@ -19,6 +19,11 @@ use thiserror::Error;
 /// Result type for KMS operations
 pub type Result<T> = std::result::Result<T, KmsError>;
 
+/// KMS runtime is unavailable for an encryption operation.
+#[derive(Error, Debug, Clone, Copy)]
+#[error("KMS encryption service is unavailable")]
+pub struct KmsUnavailableError;
+
 /// KMS error types covering all possible failure scenarios
 #[derive(Error, Debug, Clone)]
 pub enum KmsError {
@@ -85,6 +90,79 @@ pub enum KmsError {
     /// Encryption context mismatch
     #[error("Encryption context mismatch: {message}")]
     ContextMismatch { message: String },
+
+    /// Backend operation exceeded its per-attempt timeout or total deadline
+    #[error("Operation timed out: {message}")]
+    OperationTimedOut { message: String },
+
+    /// Backend operation aborted by cancellation or shutdown
+    #[error("Operation cancelled: {message}")]
+    OperationCancelled { message: String },
+
+    // New variants must be appended below (never inserted above) so that
+    // concurrent additions rebase without conflicts.
+    /// Persisted key material is absent from an otherwise readable key record
+    #[error(
+        "Key material missing for key {key_id}: the stored record has no key material; restore it from backup or repair the key explicitly"
+    )]
+    MaterialMissing { key_id: String },
+
+    /// Persisted key material exists but cannot be decoded
+    #[error("Key material corrupt for key {key_id}: {message}")]
+    MaterialCorrupt { key_id: String, message: String },
+
+    /// Persisted key material failed authenticated decryption
+    #[error(
+        "Key material authentication failed for key {key_id}: the stored material cannot be decrypted with the configured master key"
+    )]
+    MaterialAuthenticationFailed { key_id: String },
+
+    /// Persisted key record uses a format version unknown to this build
+    #[error("Unsupported key format version {version:?} for key {key_id}")]
+    UnsupportedFormatVersion { key_id: String, version: String },
+
+    /// Requested master key version has no persisted material for the key
+    #[error("Key version {version} not found for key {key_id}")]
+    KeyVersionNotFound { key_id: String, version: u32 },
+
+    /// Backup/restore bundle contract violation; see [`crate::backup::BackupError`]
+    #[error(transparent)]
+    Backup(#[from] crate::backup::BackupError),
+
+    /// Operation is not supported by the active KMS backend
+    #[error("Operation '{operation}' is not supported by KMS backend '{backend}'")]
+    UnsupportedCapability { backend: String, operation: String },
+
+    /// Backend credentials expired or could not be refreshed in time; requests
+    /// fail closed instead of being sent with credentials that may lapse mid-flight
+    #[error("KMS credentials unavailable: {message}")]
+    CredentialsUnavailable { message: String },
+
+    /// Key has master key version records but no baseline version, so envelopes
+    /// written before versioned rotation can no longer be resolved
+    #[error(
+        "Baseline version lost for key {key_id}: master key version records exist (oldest {oldest_version}) but the key record carries no baseline version, so data keys written before versioned rotation can no longer be resolved to the master key version that wrapped them. A node older than versioned rotation rewrote the key record and dropped the field. Finish upgrading every node, restore baseline_version to {oldest_version} on the key record, then retry"
+    )]
+    BaselineVersionLost { key_id: String, oldest_version: u32 },
+
+    /// Configuration still points at the key, so its material must not be
+    /// destroyed. Distinct from the generic invalid-operation errors so that
+    /// callers can tell "this key is still wired into the deployment" apart
+    /// from a malformed request and act on the listed references.
+    #[error(
+        "Key {key_id} is still referenced by configuration and its material must not be destroyed: {}. Remove or repoint the listed configuration, then retry",
+        .references.join(", ")
+    )]
+    KeyStillReferenced { key_id: String, references: Vec<String> },
+
+    /// The only available way to rewrap this envelope would pull the plaintext
+    /// data key into the RustFS process. Refused rather than performed: the
+    /// point of a backend-side rewrap is that the data key stays inside the
+    /// backend, so silently falling back to unwrap-then-rewrap would hand back
+    /// a correct envelope while quietly dropping the property that justified
+    /// the operation.
+    #[error("Cannot rewrap a data key of key {key_id} without exposing its plaintext: {reason}")]
+    RewrapWouldExposePlaintext { key_id: String, reason: String },
 }
 
 impl KmsError {
@@ -181,6 +259,91 @@ impl KmsError {
     /// Create an encryption context mismatch error
     pub fn context_mismatch<S: Into<String>>(message: S) -> Self {
         Self::ContextMismatch { message: message.into() }
+    }
+
+    /// Create an operation timed out error
+    pub fn operation_timed_out<S: Into<String>>(message: S) -> Self {
+        Self::OperationTimedOut { message: message.into() }
+    }
+
+    /// Create an operation cancelled error
+    pub fn operation_cancelled<S: Into<String>>(message: S) -> Self {
+        Self::OperationCancelled { message: message.into() }
+    }
+
+    /// Create a still-referenced error
+    pub fn key_still_referenced<S: Into<String>>(key_id: S, references: Vec<String>) -> Self {
+        Self::KeyStillReferenced {
+            key_id: key_id.into(),
+            references,
+        }
+    }
+
+    /// Create a material missing error
+    pub fn material_missing<S: Into<String>>(key_id: S) -> Self {
+        Self::MaterialMissing { key_id: key_id.into() }
+    }
+
+    /// Create a material corrupt error
+    pub fn material_corrupt<S1: Into<String>, S2: Into<String>>(key_id: S1, message: S2) -> Self {
+        Self::MaterialCorrupt {
+            key_id: key_id.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Create a material authentication failed error
+    pub fn material_authentication_failed<S: Into<String>>(key_id: S) -> Self {
+        Self::MaterialAuthenticationFailed { key_id: key_id.into() }
+    }
+
+    /// Create an unsupported format version error
+    pub fn unsupported_format_version<S1: Into<String>, S2: Into<String>>(key_id: S1, version: S2) -> Self {
+        Self::UnsupportedFormatVersion {
+            key_id: key_id.into(),
+            version: version.into(),
+        }
+    }
+
+    /// Create a key version not found error
+    pub fn key_version_not_found<S: Into<String>>(key_id: S, version: u32) -> Self {
+        Self::KeyVersionNotFound {
+            key_id: key_id.into(),
+            version,
+        }
+    }
+
+    /// Create an unsupported capability error
+    pub fn unsupported_capability<S1: Into<String>, S2: Into<String>>(backend: S1, operation: S2) -> Self {
+        Self::UnsupportedCapability {
+            backend: backend.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// Create a credentials unavailable error
+    pub fn credentials_unavailable<S: Into<String>>(message: S) -> Self {
+        Self::CredentialsUnavailable { message: message.into() }
+    }
+
+    /// Create a baseline version lost error
+    ///
+    /// `oldest_version` is the lowest master key version that still has a
+    /// material record; it is exactly the baseline that was dropped, because
+    /// version records start at the baseline the first rotation froze.
+    pub fn baseline_version_lost<S: Into<String>>(key_id: S, oldest_version: u32) -> Self {
+        Self::BaselineVersionLost {
+            key_id: key_id.into(),
+            oldest_version,
+        }
+    }
+
+    /// Create a rewrap-would-expose-plaintext error
+    pub fn rewrap_would_expose_plaintext<S1: Into<String>, S2: Into<String>>(key_id: S1, reason: S2) -> Self {
+        Self::RewrapWouldExposePlaintext {
+            key_id: key_id.into(),
+            reason: reason.into(),
+        }
     }
 }
 

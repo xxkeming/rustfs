@@ -27,6 +27,10 @@ use crate::CloudMetadataFetcher;
 #[derive(Debug, Clone)]
 pub struct AwsMetadataFetcher {
     client: Client,
+    #[allow(
+        dead_code,
+        reason = "IMDS endpoint retained beside the client it configures; requests build their own URLs (backlog#1823)"
+    )]
     metadata_endpoint: String,
 }
 
@@ -39,42 +43,11 @@ impl AwsMetadataFetcher {
     ///
     /// Returns a new instance of `AwsMetadataFetcher`.
     pub fn new(timeout: Duration) -> Self {
-        let client = Client::builder().timeout(timeout).build().unwrap_or_else(|_| Client::new());
+        let client = super::metadata_http_client(timeout);
 
         Self {
             client,
             metadata_endpoint: "http://169.254.169.254".to_string(),
-        }
-    }
-
-    /// Retrieves an IMDSv2 token for secure metadata access.
-    #[allow(dead_code)]
-    async fn get_metadata_token(&self) -> Result<String, AppError> {
-        let url = format!("{}/latest/api/token", self.metadata_endpoint);
-
-        match self
-            .client
-            .put(&url)
-            .header("X-aws-ec2-metadata-token-ttl-seconds", "21600")
-            .send()
-            .await
-        {
-            Ok(response) => {
-                if response.status().is_success() {
-                    let token = response
-                        .text()
-                        .await
-                        .map_err(|e| AppError::cloud(format!("Failed to read IMDSv2 token: {}", e)))?;
-                    Ok(token)
-                } else {
-                    debug!("IMDSv2 token request failed with status: {}", response.status());
-                    Err(AppError::cloud("Failed to obtain IMDSv2 token"))
-                }
-            }
-            Err(e) => {
-                debug!("IMDSv2 token request failed: {}", e);
-                Err(AppError::cloud(format!("IMDSv2 request failed: {}", e)))
-            }
         }
     }
 }
@@ -97,7 +70,17 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
 
         match networks {
             Ok(networks) => {
-                debug!("Using default AWS VPC network ranges");
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "aws_metadata",
+                    provider = "aws",
+                    operation = "network_cidrs",
+                    result = "fallback",
+                    source = "default_ranges",
+                    range_count = networks.len(),
+                    "trusted proxy cloud metadata fallback applied"
+                );
                 Ok(networks)
             }
             Err(e) => Err(AppError::cloud(format!("Failed to parse default AWS ranges: {}", e))),
@@ -137,15 +120,43 @@ impl CloudMetadataFetcher for AwsMetadataFetcher {
                         }
                     }
 
-                    info!("Successfully fetched {} AWS public IP ranges", networks.len());
+                    info!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "aws_metadata",
+                        provider = "aws",
+                        operation = "public_ip_ranges",
+                        result = "loaded",
+                        source = "api",
+                        range_count = networks.len(),
+                        "trusted proxy cloud metadata loaded"
+                    );
                     Ok(networks)
                 } else {
-                    debug!("Failed to fetch AWS IP ranges: HTTP {}", response.status());
+                    debug!(
+                        event = "trusted_proxies.cloud_metadata",
+                        component = "trusted_proxies",
+                        subsystem = "aws_metadata",
+                        provider = "aws",
+                        operation = "public_ip_ranges",
+                        result = "http_error",
+                        status = %response.status(),
+                        "trusted proxy cloud metadata request failed"
+                    );
                     Ok(Vec::new())
                 }
             }
             Err(e) => {
-                debug!("Failed to fetch AWS IP ranges: {}", e);
+                debug!(
+                    event = "trusted_proxies.cloud_metadata",
+                    component = "trusted_proxies",
+                    subsystem = "aws_metadata",
+                    provider = "aws",
+                    operation = "public_ip_ranges",
+                    result = "request_failed",
+                    error = %e,
+                    "trusted proxy cloud metadata request failed"
+                );
                 Ok(Vec::new())
             }
         }

@@ -25,18 +25,25 @@ keywords = ["configuration", "settings", "management", "rustfs", "Minio"]
 categories = ["web-programming", "development-tools", "config"]
 
 [dependencies]
-const-str = { workspace = true, optional = true }
+hotpath.workspace = true
+const-str = { workspace = true, optional = true, features = ["std", "proc"] }
+serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true, features = ["raw_value"] }
 
 [lints]
 workspace = true
 
 [features]
 default = ["constants"]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 audit = ["dep:const-str", "constants"]
 constants = ["dep:const-str"]
 notify = ["dep:const-str", "constants"]
 observability = ["constants"]
 opa = ["constants"]
+server-config-model = ["constants", "dep:serde", "dep:serde_json"]
 
 [lib]
 doctest = false

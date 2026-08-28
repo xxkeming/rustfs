@@ -85,6 +85,10 @@ use sha1::Sha1;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::debug;
 
+const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
+const LOG_SUBSYSTEM_SWIFT_FORMPOST: &str = "swift_formpost";
+const EVENT_SWIFT_FORMPOST_STATE: &str = "swift_formpost_state";
+
 type HmacSha1 = Hmac<Sha1>;
 
 /// FormPost request parameters
@@ -178,7 +182,7 @@ pub fn generate_signature(
     mac.update(message.as_bytes());
 
     let result = mac.finalize();
-    let signature = hex::encode(result.into_bytes());
+    let signature = hex_simd::encode_to_string(result.into_bytes(), hex_simd::AsciiCase::Lower);
 
     Ok(signature)
 }
@@ -205,8 +209,26 @@ pub fn validate_formpost(path: &str, request: &FormPostRequest, key: &str) -> Sw
         key,
     )?;
 
-    if request.signature != expected_sig {
-        debug!("FormPost signature mismatch: expected={}, got={}", expected_sig, request.signature);
+    // Compare signatures in constant time to avoid a timing side-channel, matching
+    // the sibling TempURL/SFTP checks. Decode the hex first so the comparison runs
+    // over the raw HMAC bytes and does not leak via string length; a non-hex
+    // provided signature can never match and is rejected the same way.
+    let expected_bytes = hex_simd::decode_to_vec(&expected_sig)
+        .map_err(|e| SwiftError::InternalServerError(format!("Signature encoding error: {}", e)))?;
+
+    let signatures_match = match hex_simd::decode_to_vec(request.signature.trim()) {
+        Ok(provided_bytes) => super::tempurl::constant_time_compare(&provided_bytes, &expected_bytes),
+        Err(_) => false,
+    };
+
+    if !signatures_match {
+        debug!(
+            event = EVENT_SWIFT_FORMPOST_STATE,
+            component = LOG_COMPONENT_PROTOCOLS,
+            subsystem = LOG_SUBSYSTEM_SWIFT_FORMPOST,
+            result = "signature_mismatch",
+            "swift formpost state changed"
+        );
         return Err(SwiftError::Unauthorized("Invalid FormPost signature".to_string()));
     }
 
@@ -433,7 +455,16 @@ pub async fn handle_formpost(
 
         match super::object::put_object(account, container, object_name, credentials, reader, &upload_headers).await {
             Ok(_) => {
-                debug!("FormPost uploaded: {}/{}/{}", account, container, object_name);
+                debug!(
+                    event = EVENT_SWIFT_FORMPOST_STATE,
+                    component = LOG_COMPONENT_PROTOCOLS,
+                    subsystem = LOG_SUBSYSTEM_SWIFT_FORMPOST,
+                    state = "uploaded",
+                    account = %account,
+                    container = %container,
+                    object = %object_name,
+                    "swift formpost state changed"
+                );
             }
             Err(e) => {
                 upload_errors.push(format!("{}: {}", file.filename, e));
@@ -666,6 +697,30 @@ mod tests {
             Err(SwiftError::Unauthorized(msg)) => assert!(msg.contains("Invalid")),
             _ => panic!("Expected Unauthorized error"),
         }
+    }
+
+    #[test]
+    fn test_validate_formpost_wrong_hex_signature() {
+        // A well-formed hex signature that does not match the expected one must still
+        // be rejected. This exercises the constant-time comparison path (the decoded
+        // bytes differ) rather than the hex-decode failure path.
+        let key = "mykey";
+        let path = "/v1/AUTH_test/container";
+        let expires = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 3600;
+
+        let request = FormPostRequest {
+            redirect: "https://example.com/success".to_string(),
+            redirect_error: None,
+            max_file_size: 10485760,
+            max_file_count: 5,
+            expires,
+            // Valid 40-char hex, but not the correct signature for these params.
+            signature: "da39a3ee5e6b4b0d3255bfef95601890afd80709".to_string(),
+        };
+
+        let result = validate_formpost(path, &request, key);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), SwiftError::Unauthorized(_)));
     }
 
     #[test]

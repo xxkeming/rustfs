@@ -15,23 +15,31 @@
 //! Quota admin handlers for HTTP API
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
+use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_bucket_metadata_handle, resolve_object_store_handle};
+use crate::admin::runtime_sources::{current_bucket_metadata_handle, current_object_store_handle};
+use crate::admin::storage_api::bucket::metadata_sys::{self, BucketMetadataSys};
+use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
+use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::auth::{check_key_valid, get_session_token};
+use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
+use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_ecstore::bucket::metadata_sys::BucketMetadataSys;
-use rustfs_ecstore::bucket::quota::checker::QuotaChecker;
-use rustfs_ecstore::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
+use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use serde::{Deserialize, Serialize};
 use serde_json;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 use url::form_urlencoded;
+
+const LOG_COMPONENT_ADMIN: &str = "admin";
+const LOG_SUBSYSTEM_QUOTA: &str = "quota";
+const EVENT_ADMIN_QUOTA_STATE: &str = "admin_quota_state";
 
 #[derive(Debug, Deserialize)]
 pub struct SetBucketQuotaRequest {
@@ -120,6 +128,16 @@ fn compat_bucket_quota_response(quota: &BucketQuota) -> CompatibleBucketQuotaRes
     }
 }
 
+fn map_quota_query_error(error: QuotaError, bucket: &str, operation: &str) -> S3Error {
+    match error {
+        QuotaError::ConfigNotFound { .. } => s3_error!(NoSuchBucket, "bucket not found: {}", bucket),
+        QuotaError::UsageUnavailable { .. } => {
+            s3_error!(ServiceUnavailable, "authoritative bucket usage is not available yet")
+        }
+        error => s3_error!(InternalError, "failed to {}: {}", operation, error),
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct BucketQuotaResponse {
     pub bucket: String,
@@ -163,15 +181,15 @@ pub struct GetBucketQuotaStatsHandler;
 pub struct CheckBucketQuotaHandler;
 
 fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    resolve_bucket_metadata_handle()
+    current_bucket_metadata_handle()
 }
 
 async fn current_usage_from_context(bucket: &str) -> u64 {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = current_object_store_handle() else {
         return 0;
     };
 
-    match rustfs_ecstore::data_usage::load_data_usage_from_backend(store).await {
+    match crate::admin::storage_api::data_usage::load_data_usage_from_backend(store).await {
         Ok(data_usage_info) => data_usage_info
             .buckets_usage
             .get(bucket)
@@ -231,7 +249,14 @@ pub fn register_quota_route(r: &mut S3Router<AdminOperation>) -> std::io::Result
 impl Operation for SetBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
     async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle SetBucketQuota");
+        warn!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "set_bucket_quota",
+            state = "requested",
+            "admin quota state"
+        );
 
         let Some(ref cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -240,13 +265,14 @@ impl Operation for SetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            None,
+            remote_addr,
         )
         .await?;
 
@@ -254,6 +280,9 @@ impl Operation for SetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
         let body = req
             .input
@@ -267,16 +296,60 @@ impl Operation for SetBucketQuotaHandler {
             return Err(s3_error!(InvalidArgument, "{}", rustfs_config::QUOTA_INVALID_TYPE_ERROR_MSG));
         }
 
+        let fleet_proof = if request.quota.is_some() {
+            Some(crate::admin::storage_api::acquire_cross_pool_fence_fleet_proof().ok_or_else(|| {
+                S3Error::with_message(
+                    s3s::S3ErrorCode::ServiceUnavailable,
+                    "durable quota capability is not confirmed across the cluster".to_string(),
+                )
+            })?)
+        } else {
+            None
+        };
+
         let quota = BucketQuota::new(request.quota);
 
         let metadata_sys_lock = bucket_metadata_from_context()
             .ok_or_else(|| s3_error!(InternalError, "{}", rustfs_config::QUOTA_METADATA_SYSTEM_ERROR_MSG))?;
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        quota_checker
-            .set_quota_config(&bucket, quota.clone())
-            .await
-            .map_err(|e| s3_error!(InternalError, "Failed to set quota: {}", e))?;
+        let updated_at = match fleet_proof.as_ref() {
+            Some(fleet_proof) => {
+                quota_checker
+                    .set_durable_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id, fleet_proof)
+                    .await
+            }
+            None => {
+                quota_checker
+                    .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
+                    .await
+            }
+        }
+        .map_err(ApiError::from)?;
+
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "quota-config".to_string(),
+            quota: Some(
+                serde_json::to_value(&quota).map_err(|e| s3_error!(InternalError, "failed to encode quota payload: {}", e))?,
+            ),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                action = "set_bucket_quota",
+                bucket = %bucket,
+                state = "site_replication_hook_failed",
+                error = ?err,
+                "admin quota state"
+            );
+        }
 
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
@@ -291,7 +364,7 @@ impl Operation for SetBucketQuotaHandler {
                 quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
             };
 
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?
         };
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
@@ -302,7 +375,14 @@ impl Operation for SetBucketQuotaHandler {
 impl Operation for GetBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle GetBucketQuota");
+        warn!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "get_bucket_quota",
+            state = "requested",
+            "admin quota state"
+        );
 
         let Some(ref cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -315,43 +395,50 @@ impl Operation for GetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;
 
-        let metadata_sys_lock =
-            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock = bucket_metadata_from_context()
+            .ok_or_else(|| s3_error!(InternalError, "bucket metadata system is not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let (quota, current_usage) = quota_checker.get_quota_stats(&bucket).await.map_err(|e| match e {
-            QuotaError::ConfigNotFound { .. } => {
-                s3_error!(NoSuchBucket, "Bucket not found: {}", bucket)
+        if is_compat_get_bucket_quota_path(req.uri.path()) {
+            if !quota_checker.bucket_exists(&bucket).await {
+                return Err(s3_error!(NoSuchBucket, "bucket not found: {}", bucket));
             }
-            _ => s3_error!(InternalError, "Failed to get quota: {}", e),
-        })?;
+            let quota = quota_checker
+                .get_quota_config(&bucket)
+                .await
+                .map_err(|e| s3_error!(InternalError, "failed to get quota: {}", e))?;
+            let json = serde_json::to_string(&compat_bucket_quota_response(&quota))
+                .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
+            return Ok(S3Response::new((StatusCode::OK, Body::from(json))));
+        }
 
-        let json = if is_compat_get_bucket_quota_path(req.uri.path()) {
-            serde_json::to_string(&compat_bucket_quota_response(&quota))
-                .map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
-        } else {
-            let response = BucketQuotaResponse {
-                bucket,
-                quota: quota.quota,
-                size: current_usage.unwrap_or(0),
-                quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
-            };
+        let (quota, current_usage) = quota_checker
+            .get_quota_stats(&bucket)
+            .await
+            .map_err(|error| map_quota_query_error(error, &bucket, "get quota"))?;
 
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?
+        let response = BucketQuotaResponse {
+            bucket,
+            quota: quota.quota,
+            size: current_usage.unwrap_or(0),
+            quota_type: rustfs_config::QUOTA_TYPE_HARD.to_string(),
         };
+
+        let json =
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -361,7 +448,14 @@ impl Operation for GetBucketQuotaHandler {
 impl Operation for ClearBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle ClearBucketQuota");
+        warn!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "clear_bucket_quota",
+            state = "requested",
+            "admin quota state"
+        );
 
         let Some(ref cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -370,13 +464,14 @@ impl Operation for ClearBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::AdminAction(AdminAction::SetBucketQuotaAdminAction)],
-            None,
+            remote_addr,
         )
         .await?;
 
@@ -384,22 +479,65 @@ impl Operation for ClearBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
+        let expected_incarnation_id = metadata_sys::capture_bucket_metadata_incarnation(&bucket)
+            .await
+            .map_err(|e| s3_error!(InternalError, "failed to capture bucket incarnation: {}", e))?;
 
-        info!("Clearing quota for bucket: {}", bucket);
+        info!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "clear_bucket_quota",
+            bucket = %bucket,
+            state = "clearing",
+            "admin quota state"
+        );
 
-        let metadata_sys_lock =
-            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock = bucket_metadata_from_context()
+            .ok_or_else(|| s3_error!(InternalError, "bucket metadata system is not initialized"))?;
 
         let mut quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
         // Clear quota (set to None)
         let quota = BucketQuota::new(None);
-        quota_checker
-            .set_quota_config(&bucket, quota.clone())
+        let updated_at = quota_checker
+            .set_quota_config_if_incarnation(&bucket, quota.clone(), expected_incarnation_id)
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to clear quota: {}", e))?;
+            .map_err(|e| s3_error!(InternalError, "failed to clear quota: {}", e))?;
 
-        info!("Successfully cleared quota for bucket: {}", bucket);
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "quota-config".to_string(),
+            quota: Some(
+                serde_json::to_value(&quota).map_err(|e| s3_error!(InternalError, "failed to encode quota payload: {}", e))?,
+            ),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                event = EVENT_ADMIN_QUOTA_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_QUOTA,
+                action = "clear_bucket_quota",
+                bucket = %bucket,
+                state = "site_replication_hook_failed",
+                error = ?err,
+                "admin quota state"
+            );
+        }
+
+        info!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "clear_bucket_quota",
+            bucket = %bucket,
+            state = "cleared",
+            "admin quota state"
+        );
 
         // Get real-time usage from data usage system
         let current_usage = current_usage_from_context(&bucket).await;
@@ -412,7 +550,7 @@ impl Operation for ClearBucketQuotaHandler {
         };
 
         let json =
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -422,7 +560,14 @@ impl Operation for ClearBucketQuotaHandler {
 impl Operation for GetBucketQuotaStatsHandler {
     #[tracing::instrument(skip_all)]
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle GetBucketQuotaStats");
+        warn!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "get_bucket_quota_stats",
+            state = "requested",
+            "admin quota state"
+        );
 
         let Some(ref cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -436,28 +581,27 @@ impl Operation for GetBucketQuotaStatsHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;
 
-        let metadata_sys_lock =
-            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock = bucket_metadata_from_context()
+            .ok_or_else(|| s3_error!(InternalError, "bucket metadata system is not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
-        let (quota, current_usage_opt) = quota_checker.get_quota_stats(&bucket).await.map_err(|e| match e {
-            QuotaError::ConfigNotFound { .. } => {
-                s3_error!(NoSuchBucket, "Bucket not found: {}", bucket)
-            }
-            _ => s3_error!(InternalError, "Failed to get quota stats: {}", e),
-        })?;
+        let (quota, current_usage_opt) = quota_checker
+            .get_quota_stats(&bucket)
+            .await
+            .map_err(|error| map_quota_query_error(error, &bucket, "get quota stats"))?;
 
         let current_usage = current_usage_opt.unwrap_or(0);
         let usage_percentage = quota.quota.and_then(|limit| {
@@ -479,7 +623,7 @@ impl Operation for GetBucketQuotaStatsHandler {
         };
 
         let json =
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -489,7 +633,14 @@ impl Operation for GetBucketQuotaStatsHandler {
 impl Operation for CheckBucketQuotaHandler {
     #[tracing::instrument(skip_all)]
     async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle CheckBucketQuota");
+        warn!(
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "check_bucket_quota",
+            state = "requested",
+            "admin quota state"
+        );
 
         let Some(ref cred) = req.credentials else {
             return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -503,13 +654,14 @@ impl Operation for CheckBucketQuotaHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
+        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
             owner,
             false,
             vec![Action::S3Action(S3Action::GetBucketQuotaAction)],
-            None,
+            remote_addr,
             &bucket,
         )
         .await?;
@@ -527,12 +679,19 @@ impl Operation for CheckBucketQuotaHandler {
         };
 
         debug!(
-            "Checking quota for bucket: {}, operation: {}, size: {}",
-            bucket, request.operation_type, request.operation_size
+            event = EVENT_ADMIN_QUOTA_STATE,
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_QUOTA,
+            action = "check_bucket_quota",
+            bucket = %bucket,
+            operation = %request.operation_type,
+            operation_size = request.operation_size,
+            state = "checking",
+            "admin quota state"
         );
 
-        let metadata_sys_lock =
-            bucket_metadata_from_context().ok_or_else(|| s3_error!(InternalError, "Bucket metadata system not initialized"))?;
+        let metadata_sys_lock = bucket_metadata_from_context()
+            .ok_or_else(|| s3_error!(InternalError, "bucket metadata system is not initialized"))?;
 
         let quota_checker = QuotaChecker::new(metadata_sys_lock.clone());
 
@@ -547,7 +706,7 @@ impl Operation for CheckBucketQuotaHandler {
         let result = quota_checker
             .check_quota_with_usage_reporting(&bucket, operation, request.operation_size, true)
             .await
-            .map_err(|e| s3_error!(InternalError, "Failed to check quota: {}", e))?;
+            .map_err(|error| map_quota_query_error(error, &bucket, "check quota"))?;
 
         let response = CheckQuotaResponse {
             bucket,
@@ -560,7 +719,7 @@ impl Operation for CheckBucketQuotaHandler {
         };
 
         let json =
-            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "Failed to serialize response: {}", e))?;
+            serde_json::to_string(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         Ok(S3Response::new((StatusCode::OK, Body::from(json))))
     }
@@ -601,6 +760,19 @@ mod tests {
         assert!(json.contains("\"quota\":1024"));
         assert!(json.contains("\"size\":1024"));
         assert!(json.contains("\"quotatype\":\"hard\""));
+    }
+
+    #[test]
+    fn unknown_authoritative_usage_is_retryable() {
+        let error = map_quota_query_error(
+            QuotaError::UsageUnavailable {
+                bucket: "test-bucket".to_string(),
+            },
+            "test-bucket",
+            "check quota",
+        );
+
+        assert_eq!(error.code(), &s3s::S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]

@@ -43,20 +43,9 @@ pub trait LogicalOptimizer: Send + Sync {
 }
 
 pub struct DefaultLogicalOptimizer {
-    // fit datafusion
-    // TODO refactor
     analyzer: AnalyzerRef,
     rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>,
 }
-
-impl DefaultLogicalOptimizer {
-    #[allow(dead_code)]
-    fn with_optimizer_rules(mut self, rules: Vec<Arc<dyn OptimizerRule + Send + Sync>>) -> Self {
-        self.rules = rules;
-        self
-    }
-}
-
 impl Default for DefaultLogicalOptimizer {
     fn default() -> Self {
         let analyzer = Arc::new(DefaultAnalyzer::default());

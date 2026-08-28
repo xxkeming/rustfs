@@ -16,15 +16,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::DataType;
-use datafusion::common::Result as DFResult;
-use datafusion::datasource::listing::ListingTable;
+use datafusion::common::{Result as DFResult, TableReference};
+use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::var_provider::is_system_variables;
-use datafusion::logical_expr::{AggregateUDF, ScalarUDF, TableSource, WindowUDF};
+use datafusion::logical_expr::{AggregateUDF, HigherOrderUDF, ScalarUDF, TableSource, WindowUDF, planner::ExprPlanner};
 use datafusion::variable::VarType;
-use datafusion::{
-    config::ConfigOptions,
-    sql::{TableReference, planner::ContextProvider},
-};
+use datafusion::{config::ConfigOptions, sql::planner::ContextProvider};
 use rustfs_s3select_api::query::{function::FuncMetaManagerRef, session::SessionCtx};
 
 use crate::data_source::table_source::{TableHandle, TableSourceAdapter};
@@ -39,11 +36,11 @@ pub trait ContextProviderExtension: ContextProvider {
 pub type TableHandleProviderRef = Arc<dyn TableHandleProvider + Send + Sync>;
 
 pub trait TableHandleProvider {
-    fn build_table_handle(&self, provider: Arc<ListingTable>) -> DFResult<TableHandle>;
+    fn build_table_handle(&self, provider: Arc<dyn TableProvider>) -> DFResult<TableHandle>;
 }
 
 pub struct MetadataProvider {
-    provider: Arc<ListingTable>,
+    provider: Arc<dyn TableProvider>,
     session: SessionCtx,
     config_options: ConfigOptions,
     func_manager: FuncMetaManagerRef,
@@ -53,7 +50,7 @@ pub struct MetadataProvider {
 impl MetadataProvider {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        provider: Arc<ListingTable>,
+        provider: Arc<dyn TableProvider>,
         current_session_table_provider: TableHandleProviderRef,
         func_manager: FuncMetaManagerRef,
         session: SessionCtx,
@@ -79,11 +76,15 @@ impl ContextProviderExtension for MetadataProvider {
 
         let table_handle = self.build_table_handle()?;
 
-        Ok(Arc::new(TableSourceAdapter::try_new(table_ref.clone(), table_name, table_handle)?))
+        Ok(Arc::new(TableSourceAdapter::try_new(table_ref, table_name, table_handle)?))
     }
 }
 
 impl ContextProvider for MetadataProvider {
+    fn get_expr_planners(&self) -> &[Arc<dyn ExprPlanner>] {
+        self.session.inner().expr_planners()
+    }
+
     fn get_function_meta(&self, name: &str) -> Option<Arc<ScalarUDF>> {
         self.func_manager
             .udf(name)
@@ -93,6 +94,10 @@ impl ContextProvider for MetadataProvider {
 
     fn get_aggregate_meta(&self, name: &str) -> Option<Arc<AggregateUDF>> {
         self.func_manager.udaf(name).ok()
+    }
+
+    fn get_higher_order_meta(&self, _name: &str) -> Option<Arc<HigherOrderUDF>> {
+        None
     }
 
     fn get_variable_type(&self, variable_names: &[String]) -> Option<DataType> {
@@ -114,7 +119,6 @@ impl ContextProvider for MetadataProvider {
     }
 
     fn options(&self) -> &ConfigOptions {
-        // TODO refactor
         &self.config_options
     }
 
@@ -128,6 +132,10 @@ impl ContextProvider for MetadataProvider {
 
     fn udf_names(&self) -> Vec<String> {
         self.func_manager.udfs()
+    }
+
+    fn higher_order_function_names(&self) -> Vec<String> {
+        Vec::new()
     }
 
     fn udaf_names(&self) -> Vec<String> {

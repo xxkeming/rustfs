@@ -62,6 +62,61 @@ pub fn record_contention_event() {
     counter!("rustfs_lock_contentions").increment(1);
 }
 
+/// Record object namespace lock diagnostics being enabled.
+#[inline(always)]
+pub fn record_object_lock_diag_enabled(enabled: bool) {
+    use metrics::gauge;
+    gauge!("rustfs_object_lock_diag_enabled").set(if enabled { 1.0 } else { 0.0 });
+}
+
+/// Record object namespace lock acquire duration.
+#[inline(always)]
+pub fn record_object_lock_diag_acquire_duration(op: &'static str, mode: &'static str, duration: Duration) {
+    use metrics::histogram;
+    histogram!(
+        "rustfs_object_lock_diag_acquire_duration_seconds",
+        "op" => op,
+        "mode" => mode
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record object namespace lock hold duration.
+#[inline(always)]
+pub fn record_object_lock_diag_hold_duration(op: &'static str, mode: &'static str, duration: Duration) {
+    use metrics::histogram;
+    histogram!(
+        "rustfs_object_lock_diag_hold_duration_seconds",
+        "op" => op,
+        "mode" => mode
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Record an object namespace lock slow-acquire event.
+#[inline(always)]
+pub fn record_object_lock_diag_slow_acquire(op: &'static str, mode: &'static str) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_diag_slow_acquire_total",
+        "op" => op,
+        "mode" => mode
+    )
+    .increment(1);
+}
+
+/// Record an object namespace lock slow-hold event.
+#[inline(always)]
+pub fn record_object_lock_diag_slow_hold(op: &'static str, mode: &'static str) {
+    use metrics::counter;
+    counter!(
+        "rustfs_object_lock_diag_slow_hold_total",
+        "op" => op,
+        "mode" => mode
+    )
+    .increment(1);
+}
+
 /// Lock statistics summary.
 #[derive(Debug, Clone, Default)]
 pub struct LockMetricsSummary {
@@ -109,38 +164,189 @@ impl LockMetricsSummary {
 mod tests {
     use super::*;
 
+    /// Replaces the per-helper smoke tests that called the record_* helpers
+    /// and asserted nothing: the calls (same literals) now run against a local
+    /// DebuggingRecorder and every metric name the helpers own must actually
+    /// be emitted (rustfs/backlog#1836 PR3).
     #[test]
-    fn test_record_lock_optimization_enabled() {
-        record_lock_optimization_enabled(true);
-        record_lock_optimization_enabled(false);
+    fn record_helpers_emit_their_metrics() {
+        let recorder = metrics_util::debugging::DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            record_lock_optimization_enabled(true);
+            record_lock_optimization_enabled(false);
+            record_spin_attempt(true);
+            record_spin_attempt(false);
+            record_spin_count_change(100);
+            record_spin_count_change(200);
+            record_lock_hold_time(Duration::from_millis(10));
+            record_lock_hold_time(Duration::from_millis(100));
+            record_early_release();
+            record_contention_event();
+        });
+
+        let emitted: std::collections::HashSet<String> = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .map(|(composite, _, _, _)| composite.key().name().to_string())
+            .collect();
+        for expected in [
+            "rustfs_lock_optimization_enabled",
+            "rustfs_lock_spin_successes",
+            "rustfs_lock_spin_failures",
+            "rustfs_lock_spin_count",
+            "rustfs_lock_hold_time_secs",
+            "rustfs_lock_early_releases",
+            "rustfs_lock_contentions",
+        ] {
+            assert!(emitted.contains(expected), "{expected} must be emitted by its record helper");
+        }
+    }
+    use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct SeenMetricsRecorder {
+        counters: Arc<Mutex<Vec<Key>>>,
+        gauges: Arc<Mutex<Vec<Key>>>,
+        histograms: Arc<Mutex<Vec<Key>>>,
+    }
+
+    impl SeenMetricsRecorder {
+        fn saw_counter_named(&self, name: &str) -> bool {
+            self.counters
+                .lock()
+                .expect("counter key collection should be lockable")
+                .iter()
+                .any(|key| key.name() == name)
+        }
+
+        fn saw_gauge_named(&self, name: &str) -> bool {
+            self.gauges
+                .lock()
+                .expect("gauge key collection should be lockable")
+                .iter()
+                .any(|key| key.name() == name)
+        }
+
+        fn saw_histogram_named(&self, name: &str) -> bool {
+            self.histograms
+                .lock()
+                .expect("histogram key collection should be lockable")
+                .iter()
+                .any(|key| key.name() == name)
+        }
+    }
+
+    impl metrics::Recorder for SeenMetricsRecorder {
+        fn describe_counter(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_gauge(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn describe_histogram(&self, _key: KeyName, _unit: Option<Unit>, _description: SharedString) {}
+
+        fn register_counter(&self, key: &Key, _metadata: &Metadata<'_>) -> Counter {
+            self.counters
+                .lock()
+                .expect("counter key collection should be lockable")
+                .push(key.clone());
+            Counter::from_arc(Arc::new(NoopCounter))
+        }
+
+        fn register_gauge(&self, key: &Key, _metadata: &Metadata<'_>) -> Gauge {
+            self.gauges
+                .lock()
+                .expect("gauge key collection should be lockable")
+                .push(key.clone());
+            Gauge::from_arc(Arc::new(NoopGauge))
+        }
+
+        fn register_histogram(&self, key: &Key, _metadata: &Metadata<'_>) -> Histogram {
+            self.histograms
+                .lock()
+                .expect("histogram key collection should be lockable")
+                .push(key.clone());
+            Histogram::from_arc(Arc::new(NoopHistogram))
+        }
+    }
+
+    struct NoopCounter;
+
+    impl CounterFn for NoopCounter {
+        fn increment(&self, _value: u64) {}
+
+        fn absolute(&self, _value: u64) {}
+    }
+
+    struct NoopGauge;
+
+    impl GaugeFn for NoopGauge {
+        fn increment(&self, _value: f64) {}
+
+        fn decrement(&self, _value: f64) {}
+
+        fn set(&self, _value: f64) {}
+    }
+
+    struct NoopHistogram;
+
+    impl HistogramFn for NoopHistogram {
+        fn record(&self, _value: f64) {}
     }
 
     #[test]
-    fn test_record_spin_attempt() {
-        record_spin_attempt(true);
-        record_spin_attempt(false);
+    fn test_record_object_lock_diag_enabled() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_diag_enabled(true);
+            record_object_lock_diag_enabled(false);
+        });
+        assert!(
+            recorder.saw_gauge_named("rustfs_object_lock_diag_enabled"),
+            "expected object lock diagnostics enabled gauge to be emitted"
+        );
     }
 
     #[test]
-    fn test_record_spin_count_change() {
-        record_spin_count_change(100);
-        record_spin_count_change(200);
+    fn test_record_object_lock_diag_acquire_duration() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_diag_acquire_duration("get_object", "read", Duration::from_millis(10));
+        });
+        assert!(
+            recorder.saw_histogram_named("rustfs_object_lock_diag_acquire_duration_seconds"),
+            "expected object lock diagnostics acquire histogram to be emitted"
+        );
     }
 
     #[test]
-    fn test_record_lock_hold_time() {
-        record_lock_hold_time(Duration::from_millis(10));
-        record_lock_hold_time(Duration::from_millis(100));
+    fn test_record_object_lock_diag_hold_duration() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_diag_hold_duration("put_object_commit", "write", Duration::from_millis(20));
+        });
+        assert!(
+            recorder.saw_histogram_named("rustfs_object_lock_diag_hold_duration_seconds"),
+            "expected object lock diagnostics hold histogram to be emitted"
+        );
     }
 
     #[test]
-    fn test_record_early_release() {
-        record_early_release();
-    }
-
-    #[test]
-    fn test_record_contention_event() {
-        record_contention_event();
+    fn test_record_object_lock_diag_slow_events() {
+        let recorder = SeenMetricsRecorder::default();
+        metrics::with_local_recorder(&recorder, || {
+            record_object_lock_diag_slow_acquire("get_object_info", "read");
+            record_object_lock_diag_slow_hold("complete_multipart_upload_commit", "write");
+        });
+        assert!(
+            recorder.saw_counter_named("rustfs_object_lock_diag_slow_acquire_total"),
+            "expected object lock diagnostics slow-acquire counter to be emitted"
+        );
+        assert!(
+            recorder.saw_counter_named("rustfs_object_lock_diag_slow_hold_total"),
+            "expected object lock diagnostics slow-hold counter to be emitted"
+        );
     }
 
     #[test]

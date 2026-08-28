@@ -13,16 +13,14 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use crate::app::context::resolve_endpoints_handle;
+use crate::admin::runtime_sources::current_endpoints_handle;
+use crate::admin::storage_api::runtime::PeerRestClient;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;
-use rustfs_ecstore::rpc::PeerRestClient;
 use rustfs_madmin::service_commands::ServiceTraceOpts;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
-use tracing::warn;
 
-#[allow(dead_code)]
 fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     let mut st_opts = ServiceTraceOpts::default();
     st_opts
@@ -32,18 +30,15 @@ fn extract_trace_options(uri: &Uri) -> S3Result<ServiceTraceOpts> {
     Ok(st_opts)
 }
 
-#[allow(dead_code)]
 pub struct Trace {}
 
 #[async_trait::async_trait]
 impl Operation for Trace {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        warn!("handle Trace");
-
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _peers = match resolve_endpoints_handle() {
+        let _peers = match current_endpoints_handle() {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };

@@ -12,12 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use rustfs_rio::{InternodeHttpError, InternodeHttpErrorKind};
+use std::error::Error as StdError;
 use std::hash::{Hash, Hasher};
 use std::io::{self};
 use std::path::PathBuf;
 
 pub type Error = DiskError;
 pub type Result<T> = core::result::Result<T, Error>;
+
+const METACACHE_OUTPUT_STREAM_CLOSED: &str = "metacache output stream closed";
+
+/// Marker carried by a shard-read `io::Error` when the underlying reader can
+/// no longer be realigned after a fresh remote open failed.  The marker is
+/// deliberately separate from the `ErrorKind`: a terminal read must retire
+/// its reader, while its original typed disk error and I/O kind still need to
+/// survive quorum/error mapping.
+#[derive(Debug)]
+pub(crate) struct TerminalReadError {
+    source: DiskError,
+}
 
 // DiskError == StorageErr
 #[derive(Debug, thiserror::Error)]
@@ -109,6 +123,9 @@ pub enum DiskError {
     #[error("bit-rot hash algorithm is invalid")]
     BitrotHashAlgoInvalid,
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("Rename across devices not allowed, please fix your backend configuration")]
     CrossDeviceLink,
 
@@ -137,8 +154,11 @@ pub enum DiskError {
     ErasureReadQuorum,
 
     #[error("io error {0}")]
-    Io(io::Error),
+    Io(#[source] io::Error),
 
+    /// Never constructed locally by RustFS (only reachable through wire
+    /// decoding, and no current node sends it). The wire code is kept for
+    /// cross-version compatibility — do not renumber or remove (backlog#1831).
     #[error("source stalled")]
     SourceStalled,
 
@@ -147,6 +167,82 @@ pub enum DiskError {
 
     #[error("invalid path")]
     InvalidPath,
+
+    /// Internode RPC client acquisition failed (channel build, auth setup, or
+    /// the peer is marked offline). The detail is diagnostic only: equality and
+    /// hashing use the wire code alone, so N disks failing for this same cause
+    /// land in one `reduce_errs` quorum bucket regardless of per-peer detail
+    /// (backlog#1845). Keep the detail in the rendered message — substring
+    /// classifiers (network needles, heal recoverability) read it from there.
+    #[error("remote rpc client unavailable: {0}")]
+    RemoteClientUnavailable(String),
+}
+
+impl TerminalReadError {
+    pub(crate) fn new(source: DiskError) -> Self {
+        Self { source }
+    }
+
+    fn into_source(self) -> DiskError {
+        self.source
+    }
+}
+
+impl std::fmt::Display for TerminalReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(f)
+    }
+}
+
+impl StdError for TerminalReadError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn classify_internode_missing_error(error: &InternodeHttpError) -> Option<DiskError> {
+    if error.is_remote_file_not_found() {
+        return Some(DiskError::FileNotFound);
+    }
+    if error.is_remote_volume_not_found() {
+        return Some(DiskError::VolumeNotFound);
+    }
+    None
+}
+
+/// Wrap a terminal shard-read failure without changing its typed
+/// classification.  Timeout-like disk errors retain `TimedOut`; other errors
+/// retain their inner I/O kind or use `Other` when no more specific kind exists.
+pub(crate) fn terminal_read_error_to_io(error: DiskError) -> io::Error {
+    let kind = match &error {
+        DiskError::Io(inner) => inner.kind(),
+        DiskError::SourceStalled | DiskError::Timeout => io::ErrorKind::TimedOut,
+        DiskError::DiskNotFound
+        | DiskError::FileNotFound
+        | DiskError::FileVersionNotFound
+        | DiskError::PathNotFound
+        | DiskError::VolumeNotFound => io::ErrorKind::NotFound,
+        DiskError::DiskAccessDenied | DiskError::FileAccessDenied | DiskError::VolumeAccessDenied => {
+            io::ErrorKind::PermissionDenied
+        }
+        DiskError::DiskFull => io::ErrorKind::StorageFull,
+        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt | DiskError::BitrotHashAlgoInvalid => io::ErrorKind::InvalidData,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, TerminalReadError::new(error))
+}
+
+/// Whether an I/O error marks a shard reader as terminal for adaptive decode.
+pub(crate) fn is_terminal_read_error(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|source| source.downcast_ref::<TerminalReadError>().is_some())
+}
+
+impl From<crate::erasure::coding::ErasureConstructionError> for DiskError {
+    fn from(error: crate::erasure::coding::ErasureConstructionError) -> Self {
+        Self::Io(error.into_io_error())
+    }
 }
 
 impl DiskError {
@@ -155,6 +251,26 @@ impl DiskError {
         E: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
         DiskError::Io(std::io::Error::other(error))
+    }
+
+    pub(crate) fn metacache_output_stream_closed() -> Self {
+        DiskError::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, METACACHE_OUTPUT_STREAM_CLOSED))
+    }
+
+    pub(crate) fn is_metacache_output_stream_closed(&self) -> bool {
+        matches!(
+            self,
+            DiskError::Io(io_error)
+                if io_error.kind() == std::io::ErrorKind::BrokenPipe
+                    && io_error.to_string() == METACACHE_OUTPUT_STREAM_CLOSED
+        )
+    }
+
+    pub(crate) fn contains_io_error_kind(&self, kind: std::io::ErrorKind) -> bool {
+        match self {
+            DiskError::Io(io_error) => io_error_chain_contains_kind(io_error, kind),
+            _ => false,
+        }
     }
 
     pub fn is_all_not_found(errs: &[Option<DiskError>]) -> bool {
@@ -179,6 +295,33 @@ impl DiskError {
 
     pub fn is_err_version_not_found(err: &DiskError) -> bool {
         matches!(err, &DiskError::FileVersionNotFound)
+    }
+
+    pub fn is_retryable_internode_write_failure(&self) -> bool {
+        match self {
+            DiskError::Io(io_error) => io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .is_some_and(|err| err.kind().is_retryable()),
+            _ => false,
+        }
+    }
+
+    pub fn internode_http_error_kind(&self) -> Option<InternodeHttpErrorKind> {
+        match self {
+            DiskError::Io(io_error) => io_error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                .map(InternodeHttpError::kind),
+            _ => None,
+        }
+    }
+
+    pub fn is_internode_http_status(&self, status: u16) -> bool {
+        matches!(
+            self.internode_http_error_kind(),
+            Some(InternodeHttpErrorKind::HttpStatus(actual)) if actual.as_u16() == status
+        )
     }
 
     // /// If all errors are of the same fatal disk error type, returns the corresponding error.
@@ -229,7 +372,7 @@ impl DiskError {
 impl From<rustfs_filemeta::Error> for DiskError {
     fn from(e: rustfs_filemeta::Error) -> Self {
         match e {
-            rustfs_filemeta::Error::Io(e) => DiskError::other(e),
+            rustfs_filemeta::Error::Io(e) => DiskError::Io(e),
             rustfs_filemeta::Error::FileNotFound => DiskError::FileNotFound,
             rustfs_filemeta::Error::FileVersionNotFound => DiskError::FileVersionNotFound,
             rustfs_filemeta::Error::FileCorrupt => DiskError::FileCorrupt,
@@ -239,9 +382,65 @@ impl From<rustfs_filemeta::Error> for DiskError {
     }
 }
 
+fn io_error_chain_contains_kind(io_error: &std::io::Error, kind: std::io::ErrorKind) -> bool {
+    if io_error.kind() == kind {
+        return true;
+    }
+
+    let mut source = StdError::source(io_error);
+    while let Some(err) = source {
+        if let Some(io_error) = err.downcast_ref::<std::io::Error>()
+            && io_error.kind() == kind
+        {
+            return true;
+        }
+        if let Some(disk_error) = err.downcast_ref::<DiskError>()
+            && disk_error.contains_io_error_kind(kind)
+        {
+            return true;
+        }
+        source = err.source();
+    }
+
+    false
+}
+
 impl From<std::io::Error> for DiskError {
     fn from(e: std::io::Error) -> Self {
-        e.downcast::<DiskError>().unwrap_or_else(DiskError::Io)
+        if let Some(error) = e.get_ref().and_then(|source| source.downcast_ref::<InternodeHttpError>()) {
+            if error.is_remote_file_not_found() {
+                return DiskError::FileNotFound;
+            }
+            if error.is_remote_volume_not_found() {
+                return DiskError::VolumeNotFound;
+            }
+        }
+        let e = match e.downcast::<TerminalReadError>() {
+            Ok(terminal_error) => {
+                let source = terminal_error.into_source();
+                if let DiskError::Io(io_error) = &source
+                    && let Some(internode_error) = io_error
+                        .get_ref()
+                        .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+                    && let Some(classified) = classify_internode_missing_error(internode_error)
+                {
+                    return classified;
+                }
+                return source;
+            }
+            Err(e) => e,
+        };
+        match e.downcast::<DiskError>() {
+            Ok(disk_error) => disk_error,
+            // Mirror `From<io::Error> for StorageError`: a StorageError boxed
+            // through `From<StorageError> for io::Error` must recover its typed
+            // classification instead of degrading to `DiskError::Io`, which
+            // quorum aggregation (`reduce_errs`) would count as a distinct error.
+            Err(io_error) => match io_error.downcast::<crate::error::StorageError>() {
+                Ok(storage_error) => storage_error.narrow_to_disk().unwrap_or_else(DiskError::other),
+                Err(io_error) => DiskError::Io(io_error),
+            },
+        }
     }
 }
 
@@ -254,19 +453,64 @@ impl From<DiskError> for std::io::Error {
     }
 }
 
+/// The single in-band representation of a failed internode RPC: it carries the
+/// typed `tonic::Status` so failure classifiers can read the gRPC code instead
+/// of substring-matching the rendered message (see `is_network_like_status`).
+/// Both `DiskError` and `StorageError` wrap statuses in this type, so one
+/// downcast recovers the status regardless of which error the status was
+/// converted into first.
+pub(crate) struct RpcStatusError(tonic::Status);
+
+impl RpcStatusError {
+    pub(crate) fn status(&self) -> &tonic::Status {
+        &self.0
+    }
+}
+
+impl From<tonic::Status> for RpcStatusError {
+    fn from(status: tonic::Status) -> Self {
+        Self(status)
+    }
+}
+
+impl std::fmt::Display for RpcStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+/// `tonic::Status`'s own `Debug` prints its `MetadataMap`, i.e. every response
+/// header and trailer the peer sent. Those are remote-controlled and can carry
+/// credentials injected by a proxy in front of the peer, so keep them out of
+/// anything that reaches a log.
+impl std::fmt::Debug for RpcStatusError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RpcStatusError")
+            .field("code", &self.0.code())
+            .field("message", &self.0.message())
+            .finish()
+    }
+}
+
+impl StdError for RpcStatusError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(&self.0)
+    }
+}
+
 impl From<tonic::Status> for DiskError {
     fn from(e: tonic::Status) -> Self {
-        DiskError::other(e.message().to_string())
+        DiskError::Io(io::Error::other(RpcStatusError(e)))
     }
 }
 
 impl From<rustfs_protos::proto_gen::node_service::Error> for DiskError {
     fn from(e: rustfs_protos::proto_gen::node_service::Error) -> Self {
         if let Some(err) = DiskError::from_u32(e.code) {
-            if matches!(err, DiskError::Io(_)) {
-                DiskError::other(e.error_info)
-            } else {
-                err
+            match err {
+                DiskError::Io(_) => DiskError::other(e.error_info),
+                DiskError::RemoteClientUnavailable(_) => DiskError::RemoteClientUnavailable(e.error_info),
+                err => err,
             }
         } else {
             DiskError::other(e.error_info)
@@ -376,6 +620,7 @@ impl Clone for DiskError {
             DiskError::SourceStalled => DiskError::SourceStalled,
             DiskError::Timeout => DiskError::Timeout,
             DiskError::InvalidPath => DiskError::InvalidPath,
+            DiskError::RemoteClientUnavailable(detail) => DiskError::RemoteClientUnavailable(detail.clone()),
         }
     }
 }
@@ -425,6 +670,7 @@ impl DiskError {
             DiskError::SourceStalled => 0x28,
             DiskError::Timeout => 0x29,
             DiskError::InvalidPath => 0x2A,
+            DiskError::RemoteClientUnavailable(_) => 0x2B,
         }
     }
 
@@ -472,6 +718,7 @@ impl DiskError {
             0x28 => Some(DiskError::SourceStalled),
             0x29 => Some(DiskError::Timeout),
             0x2A => Some(DiskError::InvalidPath),
+            0x2B => Some(DiskError::RemoteClientUnavailable(String::new())),
             _ => None,
         }
     }
@@ -499,19 +746,6 @@ impl Hash for DiskError {
 // is currently commented out to avoid complexity. These can be re-enabled
 // when needed for specific disk quorum checking and error aggregation logic.
 
-/// Bitrot errors
-#[derive(Debug, thiserror::Error)]
-pub enum BitrotErrorType {
-    #[error("bitrot checksum verification failed")]
-    BitrotChecksumMismatch { expected: String, got: String },
-}
-
-impl From<BitrotErrorType> for DiskError {
-    fn from(e: BitrotErrorType) -> Self {
-        DiskError::other(e)
-    }
-}
-
 /// Context wrapper for file access errors
 #[derive(Debug, thiserror::Error)]
 pub struct FileAccessDeniedWithContext {
@@ -530,6 +764,52 @@ impl std::fmt::Display for FileAccessDeniedWithContext {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn terminal_read_error_preserves_kind_and_disk_classification() {
+        let timeout = terminal_read_error_to_io(DiskError::Timeout);
+        assert_eq!(timeout.kind(), io::ErrorKind::TimedOut);
+        assert!(is_terminal_read_error(&timeout));
+        assert!(matches!(DiskError::from(timeout), DiskError::Timeout));
+
+        let missing = terminal_read_error_to_io(DiskError::FileNotFound);
+        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
+        assert!(is_terminal_read_error(&missing));
+        assert!(matches!(DiskError::from(missing), DiskError::FileNotFound));
+
+        let reset = terminal_read_error_to_io(DiskError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "connection reset")));
+        assert_eq!(reset.kind(), io::ErrorKind::ConnectionReset);
+        assert!(is_terminal_read_error(&reset));
+        assert!(matches!(DiskError::from(reset), DiskError::Io(error) if error.kind() == io::ErrorKind::ConnectionReset));
+
+        for (remote_error, expected) in [
+            (rustfs_rio::new_test_remote_file_not_found_http_io_error(), DiskError::FileNotFound),
+            (rustfs_rio::new_test_remote_volume_not_found_http_io_error(), DiskError::VolumeNotFound),
+        ] {
+            let wrapped = terminal_read_error_to_io(DiskError::Io(remote_error));
+            assert_eq!(DiskError::from(wrapped), expected);
+        }
+    }
+
+    #[test]
+    fn other_preserves_erasure_construction_source_chain() {
+        use crate::erasure::coding::ErasureConstructionError;
+        use std::error::Error as _;
+
+        let error = DiskError::from(ErasureConstructionError::ModernEncoder {
+            source: reed_solomon_erasure::Error::TooManyShards,
+        });
+        let io_source = error.source().expect("DiskError::Io must expose its io::Error source");
+        assert!(io_source.is::<io::Error>());
+        let construction_source = io_source
+            .source()
+            .expect("io::Error must expose the erasure construction error");
+        assert!(construction_source.is::<ErasureConstructionError>());
+        let encoder_source = construction_source
+            .source()
+            .expect("construction error must expose the encoder error");
+        assert!(encoder_source.is::<reed_solomon_erasure::Error>());
+    }
 
     #[test]
     fn test_disk_error_variants() {
@@ -697,26 +977,32 @@ mod tests {
 
     #[test]
     fn test_error_conversions() {
-        // Test From implementations
+        // A plain io::Error carries no typed payload to recover, so it lands in
+        // `Io` rather than being guessed at from its kind — `NotFound` here must
+        // not silently become `FileNotFound`, which quorum aggregation counts as
+        // a different error (rustfs/backlog#1836).
         let io_error = std::io::Error::new(std::io::ErrorKind::NotFound, "test");
-        let _disk_error: DiskError = io_error.into();
+        let disk_error: DiskError = io_error.into();
+        match &disk_error {
+            DiskError::Io(inner) => assert_eq!(inner.kind(), std::io::ErrorKind::NotFound),
+            other => panic!("a plain io::Error must stay typed as Io, got {other:?}"),
+        }
 
-        let json_str = r#"{"invalid": json}"#; // Invalid JSON
+        // A typed DiskError boxed through io::Error round-trips back to itself
+        // instead of degrading to `Io`.
+        let boxed: std::io::Error = std::io::Error::other(DiskError::VolumeNotFound);
+        assert_eq!(DiskError::from(boxed), DiskError::VolumeNotFound);
+
+        // serde_json errors have no dedicated variant and fold into `other`,
+        // keeping the original message.
+        let json_str = r#"{"invalid": json}"#;
         let json_error = serde_json::from_str::<serde_json::Value>(json_str).unwrap_err();
-        let _disk_error: DiskError = json_error.into();
-    }
-
-    #[test]
-    fn test_bitrot_error_type() {
-        let bitrot_error = BitrotErrorType::BitrotChecksumMismatch {
-            expected: "abc123".to_string(),
-            got: "def456".to_string(),
-        };
-
-        assert!(bitrot_error.to_string().contains("bitrot checksum verification failed"));
-
-        let disk_error: DiskError = bitrot_error.into();
-        assert!(matches!(disk_error, DiskError::Io(_)));
+        let json_message = json_error.to_string();
+        let disk_error: DiskError = json_error.into();
+        assert!(
+            disk_error.to_string().contains(&json_message),
+            "the json error message must survive the conversion: {disk_error}"
+        );
     }
 
     #[test]
@@ -795,6 +1081,27 @@ mod tests {
         // Convert io::Error back to DiskError
         let recovered_disk_error: DiskError = io_with_disk_error.into();
         assert_eq!(original_disk_error, recovered_disk_error);
+    }
+
+    #[test]
+    fn test_io_error_with_storage_error_inside() {
+        use crate::error::StorageError;
+
+        // An io::Error boxing a disk-representable StorageError (as produced by
+        // `From<StorageError> for io::Error`) must recover the typed DiskError
+        // variant instead of degrading to an opaque DiskError::Io.
+        let io_with_storage_error: std::io::Error = StorageError::FaultyRemoteDisk.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FaultyRemoteDisk);
+
+        let io_with_storage_error: std::io::Error = StorageError::FileAccessDenied.into();
+        let recovered: DiskError = io_with_storage_error.into();
+        assert_eq!(recovered, DiskError::FileAccessDenied);
+
+        // A StorageError with no DiskError analog stays an opaque Io error.
+        let io_with_bucket_error: std::io::Error = StorageError::BucketNotFound("bucket".to_string()).into();
+        let recovered: DiskError = io_with_bucket_error.into();
+        assert!(matches!(recovered, DiskError::Io(_)));
     }
 
     #[test]
@@ -877,6 +1184,49 @@ mod tests {
     }
 
     #[test]
+    fn test_wrapped_io_error_kind_detection() {
+        let filemeta_error = rustfs_filemeta::Error::Io(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe"));
+        let disk_error = DiskError::from(filemeta_error);
+
+        assert!(disk_error.contains_io_error_kind(std::io::ErrorKind::BrokenPipe));
+        assert!(!disk_error.contains_io_error_kind(std::io::ErrorKind::TimedOut));
+    }
+
+    #[test]
+    fn test_internode_http_status_classification() {
+        let too_many_requests = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::TOO_MANY_REQUESTS),
+        ));
+
+        assert!(too_many_requests.is_internode_http_status(429));
+        assert!(!too_many_requests.is_internode_http_status(500));
+        assert!(!DiskError::FileNotFound.is_internode_http_status(429));
+    }
+
+    #[test]
+    fn test_internode_missing_errors_preserve_disk_error_types() {
+        let file_missing = DiskError::from(rustfs_rio::new_test_remote_file_not_found_http_io_error());
+        let volume_missing = DiskError::from(rustfs_rio::new_test_remote_volume_not_found_http_io_error());
+        let unmarked_server_error = DiskError::from(rustfs_rio::new_test_internode_http_io_error(
+            rustfs_rio::InternodeHttpErrorKind::HttpStatus(http::StatusCode::INTERNAL_SERVER_ERROR),
+        ));
+
+        assert_eq!(file_missing, DiskError::FileNotFound);
+        assert_eq!(volume_missing, DiskError::VolumeNotFound);
+        assert!(matches!(unmarked_server_error, DiskError::Io(_)));
+    }
+
+    #[test]
+    fn test_metacache_output_stream_closed_classification_survives_clone() {
+        let disk_error = DiskError::metacache_output_stream_closed();
+        let cloned_error = disk_error.clone();
+
+        assert!(disk_error.is_metacache_output_stream_closed());
+        assert!(cloned_error.is_metacache_output_stream_closed());
+        assert_eq!(disk_error, cloned_error);
+    }
+
+    #[test]
     fn test_error_display_preservation() {
         let disk_errors = vec![
             DiskError::MaxVersionsExceeded,
@@ -893,5 +1243,80 @@ mod tests {
             // The io::Error should contain the original error message
             assert!(io_error.to_string().contains(&original_message));
         }
+    }
+
+    #[test]
+    fn remote_client_unavailable_buckets_ignore_per_peer_detail() {
+        // The reason this variant exists (backlog#1845): equality and hashing
+        // use the wire code alone, so N disks failing because their peer's
+        // client could not be built land in ONE reduce_errs bucket even though
+        // each carries different diagnostic detail.
+        let a = DiskError::RemoteClientUnavailable("connection refused to peer 1".to_string());
+        let b = DiskError::RemoteClientUnavailable("connection refused to peer 2".to_string());
+        assert_eq!(a, b);
+
+        let errors: Vec<Option<DiskError>> = (0..3)
+            .map(|peer| Some(DiskError::RemoteClientUnavailable(format!("transport error: peer {peer} unreachable"))))
+            .collect();
+        let (count, err) = crate::disk::error_reduce::reduce_errs(&errors, &[]);
+        assert_eq!(count, 3);
+        assert!(matches!(err, Some(DiskError::RemoteClientUnavailable(_))));
+    }
+
+    #[test]
+    fn remote_client_unavailable_display_keeps_detail_for_substring_classifiers() {
+        // Heal recoverability and the peer network classifiers read needles
+        // ("transport error", "connection refused", "temporarily offline")
+        // from the rendered message; the typed variant must keep feeding them.
+        let err = DiskError::RemoteClientUnavailable("transport error: connection refused".to_string());
+        let rendered = err.to_string();
+        assert!(rendered.contains("remote rpc client unavailable"));
+        assert!(rendered.contains("transport error: connection refused"));
+    }
+
+    #[test]
+    fn remote_client_unavailable_wire_roundtrip_keeps_variant_and_detail() {
+        let original = DiskError::RemoteClientUnavailable("dial tcp: connection refused".to_string());
+
+        let wire: rustfs_protos::proto_gen::node_service::Error = original.clone().into();
+        assert_eq!(wire.code, 0x2B);
+        assert_eq!(wire.error_info, "remote rpc client unavailable: dial tcp: connection refused");
+
+        let back: DiskError = wire.into();
+        // The variant (and therefore quorum bucketing) survives the hop; the
+        // detail gains the display prefix, mirroring the Io re-wrap behavior.
+        assert_eq!(back, original);
+        assert!(matches!(
+            &back,
+            DiskError::RemoteClientUnavailable(detail) if detail.contains("dial tcp: connection refused")
+        ));
+    }
+
+    #[test]
+    fn remote_client_unavailable_survives_layer_and_io_bridges() {
+        let original = DiskError::RemoteClientUnavailable("handshake timed out".to_string());
+
+        let storage: crate::error::StorageError = original.clone().into();
+        assert!(matches!(
+            &storage,
+            crate::error::StorageError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        let narrowed: DiskError = storage.narrow_to_disk().expect("typed variant must narrow");
+        assert_eq!(narrowed, original);
+        assert!(matches!(
+            &narrowed,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+
+        let io_err: std::io::Error = original.clone().into();
+        let recovered: DiskError = io_err.into();
+        assert_eq!(recovered, original);
+
+        let cloned = original.clone();
+        assert!(matches!(
+            &cloned,
+            DiskError::RemoteClientUnavailable(detail) if detail == "handshake timed out"
+        ));
+        assert_eq!(cloned, original);
     }
 }

@@ -28,16 +28,29 @@ documentation = "https://docs.rs/rustfs-madmin/latest/rustfs_madmin/"
 [lints]
 workspace = true
 
+[features]
+default = []
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
+
 [dependencies]
-chrono.workspace = true
+hotpath.workspace = true
 humantime.workspace = true
-hyper.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-time.workspace = true
+http.workspace = true
+hyper = { workspace = true, features = ["http2", "http1", "server"] }
+reqwest = { workspace = true, features = ["json"] }
+rustfs-signer.workspace = true
+s3s.workspace = true
+jiff = { workspace = true, features = ["serde"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+sysinfo.workspace = true
+time = { workspace = true, features = ["parsing", "formatting", "macros", "serde"] }
 
 [lib]
 doctest = false
 
 [dev-dependencies]
 rmp-serde.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net"] }

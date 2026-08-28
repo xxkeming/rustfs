@@ -15,7 +15,7 @@
 use rustfs_iam::error::Error as IamError;
 use s3s::{S3Error, S3ErrorCode};
 
-pub(super) fn iam_error_to_s3_error(err: IamError) -> S3Error {
+pub(crate) fn iam_error_to_s3_error(err: IamError) -> S3Error {
     let code = match &err {
         IamError::NoSuchUser(_)
         | IamError::NoSuchAccount(_)
@@ -23,6 +23,10 @@ pub(super) fn iam_error_to_s3_error(err: IamError) -> S3Error {
         | IamError::NoSuchTempAccount(_)
         | IamError::NoSuchGroup(_)
         | IamError::NoSuchPolicy => S3ErrorCode::NoSuchResource,
+        IamError::InvalidAccessKeyLength
+        | IamError::InvalidSecretKeyLength
+        | IamError::AccessKeyAlreadyExists
+        | IamError::GroupNameContainsReservedChars => S3ErrorCode::InvalidArgument,
         _ => S3ErrorCode::InternalError,
     };
 
@@ -54,7 +58,35 @@ mod tests {
     }
 
     #[test]
-    fn non_not_found_iam_errors_remain_internal_errors() {
+    fn credential_length_errors_map_to_invalid_argument() {
+        let errors = [IamError::InvalidAccessKeyLength, IamError::InvalidSecretKeyLength];
+
+        for err in errors {
+            let s3_error = iam_error_to_s3_error(err);
+            assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        }
+    }
+
+    #[test]
+    fn duplicate_access_key_maps_to_invalid_argument() {
+        let s3_error = iam_error_to_s3_error(IamError::AccessKeyAlreadyExists);
+
+        assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(s3_error.message(), Some("access key is already in use"));
+    }
+
+    #[test]
+    fn reserved_group_name_maps_to_invalid_argument() {
+        let s3_error = iam_error_to_s3_error(IamError::GroupNameContainsReservedChars);
+
+        assert_eq!(s3_error.code(), &S3ErrorCode::InvalidArgument);
+        assert_eq!(s3_error.status_code(), Some(http::StatusCode::BAD_REQUEST));
+        assert_eq!(s3_error.message(), Some("group name contains reserved characters =,"));
+    }
+
+    #[test]
+    fn non_validation_iam_errors_remain_internal_errors() {
         let s3_error = iam_error_to_s3_error(IamError::IamSysNotInitialized);
 
         assert_eq!(s3_error.code(), &S3ErrorCode::InternalError);

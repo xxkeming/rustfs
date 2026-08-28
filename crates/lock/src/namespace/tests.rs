@@ -65,6 +65,50 @@ impl crate::client::LockClient for FailingClient {
 }
 
 #[derive(Debug)]
+struct FailureResponseClient {
+    error: &'static str,
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FailureResponseClient {
+    async fn acquire_lock(&self, _request: &LockRequest) -> crate::Result<LockResponse> {
+        Ok(LockResponse::failure(self.error, Duration::ZERO))
+    }
+
+    async fn release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn force_release(&self, _lock_id: &LockId) -> crate::Result<bool> {
+        Ok(false)
+    }
+
+    async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        Ok(None)
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        Ok(LockStats::default())
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    async fn is_online(&self) -> bool {
+        true
+    }
+
+    async fn is_local(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Debug)]
 struct DelayedClient {
     inner: Arc<dyn crate::client::LockClient>,
     delay: Duration,
@@ -74,6 +118,75 @@ struct DelayedClient {
 impl crate::client::LockClient for DelayedClient {
     async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
         tokio::time::sleep(self.delay).await;
+        self.inner.acquire_lock(request).await
+    }
+
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.release(lock_id).await
+    }
+
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.refresh(lock_id).await
+    }
+
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.inner.force_release(lock_id).await
+    }
+
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.inner.check_status(lock_id).await
+    }
+
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.inner.get_stats().await
+    }
+
+    async fn close(&self) -> crate::Result<()> {
+        self.inner.close().await
+    }
+
+    async fn is_online(&self) -> bool {
+        self.inner.is_online().await
+    }
+
+    async fn is_local(&self) -> bool {
+        self.inner.is_local().await
+    }
+}
+
+#[derive(Debug)]
+struct FlakyAcquireClient {
+    inner: LocalClient,
+    failed_acquires_remaining: AtomicUsize,
+    acquire_attempts: AtomicUsize,
+}
+
+impl FlakyAcquireClient {
+    fn new(manager: Arc<GlobalLockManager>, failed_acquires: usize) -> Self {
+        Self {
+            inner: LocalClient::with_manager(manager),
+            failed_acquires_remaining: AtomicUsize::new(failed_acquires),
+            acquire_attempts: AtomicUsize::new(0),
+        }
+    }
+
+    fn acquire_attempts(&self) -> usize {
+        self.acquire_attempts.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for FlakyAcquireClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        self.acquire_attempts.fetch_add(1, Ordering::SeqCst);
+        if self
+            .failed_acquires_remaining
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| remaining.checked_sub(1))
+            .is_ok()
+        {
+            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
+        }
+
         self.inner.acquire_lock(request).await
     }
 
@@ -241,6 +354,16 @@ async fn test_namespace_lock_with_local_manager() {
     let manager = Arc::new(GlobalLockManager::new());
     let lock = NamespaceLock::with_local_manager("local-ns".to_string(), manager);
     assert_eq!(lock.namespace(), "local-ns");
+}
+
+#[tokio::test]
+async fn namespace_lock_preserves_shared_namespace_storage() {
+    let namespace: Arc<str> = Arc::from("shared-namespace");
+    let namespace_ptr = Arc::as_ptr(&namespace);
+    let local = LocalLock::new_shared(namespace.clone(), Arc::new(GlobalLockManager::new()));
+
+    assert_eq!(local.namespace(), namespace.as_ref());
+    assert_eq!(local.namespace().as_ptr(), namespace_ptr.cast::<u8>());
 }
 
 #[tokio::test]
@@ -633,10 +756,10 @@ async fn test_namespace_lock_distributed_eight_node_write_releases_all_nodes() {
         .get_write_lock(resource.clone(), "owner-b", Duration::from_millis(100))
         .await
         .expect_err("owner-b should not acquire while owner-a holds all node locks");
-    let err_str = err.to_string();
+    let err_str = err.to_string().to_lowercase();
     assert!(
-        err_str.contains("required 5") && err_str.contains("achieved"),
-        "expected 8-node quorum failure below required write quorum, got: {err}"
+        err_str.contains("timeout"),
+        "expected owner-b contention to exhaust acquire timeout, got: {err}"
     );
 
     assert!(guard.release(), "distributed guard should enqueue release");
@@ -670,6 +793,225 @@ async fn test_namespace_lock_distributed_unlock_retries_release_false() {
         flaky_clients.iter().all(|client| client.release_attempts() >= 2),
         "each simulated node should be retried after an initial false release"
     );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_reclaims_expired_same_resource_after_failed_unlocks() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyReleaseClient::new(manager.clone(), 8)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients("expired-unlock-recovery".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-expired-unlock-recovery");
+    let request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(100))
+        .with_ttl(Duration::from_millis(50));
+
+    let mut guard = lock
+        .acquire_guard(&request)
+        .await
+        .expect("initial owner should acquire the distributed lock")
+        .expect("distributed acquire should return a guard");
+
+    assert!(guard.release(), "distributed guard should enqueue unlock retries");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let recovered_request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+        .with_acquire_timeout(Duration::from_millis(200))
+        .with_ttl(Duration::from_millis(50));
+
+    let recovered_guard = lock
+        .acquire_guard(&recovered_request)
+        .await
+        .expect("expired stale distributed guards should be reclaimed")
+        .expect("recovered acquire should return a guard");
+
+    drop(recovered_guard);
+
+    assert!(
+        flaky_clients.iter().all(|client| client.release_attempts() >= 1),
+        "unlock retries should have been attempted before TTL-based reclamation"
+    );
+}
+
+#[tokio::test]
+async fn four_node_failed_release_converges_without_replica_repair() {
+    let managers = (0..4).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| {
+            Arc::new(FlakyReleaseClient {
+                inner: LocalClient::with_manager_and_reaper_interval(manager.clone(), Duration::from_millis(5)),
+                failed_releases_remaining: AtomicUsize::new(usize::MAX),
+                release_attempts: AtomicUsize::new(0),
+            })
+        })
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::Distributed(DistributedLock::new("four-node-expired-lease".to_string(), clients, 3));
+    let resource = create_test_object_key("bucket", "object-four-node-expired");
+    let request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(300))
+        .with_ttl(Duration::from_millis(40));
+
+    let mut guard = lock
+        .acquire_guard(&request)
+        .await
+        .expect("initial acquire should not error")
+        .expect("initial acquire should reach quorum");
+    assert!(guard.release(), "release should be acknowledged while RPC cleanup is pending");
+
+    for _ in 0..40 {
+        if flaky_clients.iter().all(|client| client.release_attempts() >= 3) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let all_reaped =
+            futures::future::join_all(flaky_clients.iter().map(|client| client.inner.check_status(&request.lock_id)))
+                .await
+                .into_iter()
+                .all(|status| status.expect("status should not error").is_none());
+        if all_reaped {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "all four local lease entries must converge");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    for suffix in ["chunk-0", "chunk-1", ".rustfs.sys/multipart/upload-0"] {
+        for client in &flaky_clients {
+            let orphan = LockRequest::new(create_test_object_key("bucket", suffix), LockType::Exclusive, "orphan")
+                .with_ttl(Duration::from_millis(25));
+            assert!(client.inner.acquire_lock(&orphan).await.expect("orphan acquire").success);
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    let recovered = lock
+        .acquire_guard(
+            &LockRequest::new(resource, LockType::Exclusive, "owner-b")
+                .with_acquire_timeout(Duration::from_millis(300))
+                .with_ttl(Duration::from_millis(40)),
+        )
+        .await
+        .expect("recovery acquire should not error")
+        .expect("four-node quorum should recover after local reapers run");
+    drop(recovered);
+}
+
+#[tokio::test]
+async fn four_node_stale_quorum_contention_respects_acquire_deadline() {
+    let managers = (0..4).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let node_clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager_and_reaper_interval(manager.clone(), Duration::from_millis(5))))
+        .collect::<Vec<_>>();
+    let resource = create_test_object_key("bucket", "stale-quorum");
+    let stale = LockRequest::new(resource.clone(), LockType::Exclusive, "stale-owner").with_ttl(Duration::from_millis(180));
+    for client in &node_clients {
+        assert!(client.acquire_lock(&stale).await.expect("stale acquire").success);
+    }
+
+    let clients = node_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::Distributed(DistributedLock::new("stale-quorum-deadline".to_string(), clients, 3));
+    let contender = LockRequest::new(resource.clone(), LockType::Exclusive, "new-owner")
+        .with_acquire_timeout(Duration::from_millis(150))
+        .with_ttl(Duration::from_millis(100));
+    let started = tokio::time::Instant::now();
+    let response = lock.acquire_guard(&contender).await.expect("contention should not error");
+    assert!(response.is_none(), "unexpired leases must not be force-reclaimed");
+    assert!(started.elapsed() < Duration::from_millis(350), "acquire must respect its deadline");
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let recovered = lock
+        .acquire_guard(
+            &LockRequest::new(resource, LockType::Exclusive, "new-owner")
+                .with_acquire_timeout(Duration::from_millis(300))
+                .with_ttl(Duration::from_millis(100)),
+        )
+        .await
+        .expect("post-expiry acquire should not error")
+        .expect("quorum should recover after local reapers clear stale leases");
+    drop(recovered);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyAcquireClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = NamespaceLock::with_clients("flaky-acquire".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-flaky-acquire");
+
+    let guard = lock
+        .get_write_lock(resource, "owner-a", Duration::from_secs(1))
+        .await
+        .expect("transient timeout should be retried before the acquire budget expires");
+
+    assert!(
+        flaky_clients.iter().all(|client| client.acquire_attempts() >= 2),
+        "each simulated node should be retried after an initial timeout"
+    );
+
+    drop(guard);
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_waits_full_timeout_for_late_release() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|manager| Arc::new(LocalClient::with_manager(manager.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+
+    let lock = Arc::new(NamespaceLock::with_clients("late-release".to_string(), clients));
+    let resource = create_test_object_key("bucket", "object-late-release");
+
+    let guard_a = lock
+        .get_write_lock(resource.clone(), "owner-a", Duration::from_secs(1))
+        .await
+        .expect("owner-a should acquire the initial distributed lock");
+
+    let lock_for_owner_b = lock.clone();
+    let resource_for_owner_b = resource.clone();
+    let waiter = tokio::spawn(async move {
+        lock_for_owner_b
+            .get_write_lock(resource_for_owner_b, "owner-b", Duration::from_secs(1))
+            .await
+    });
+
+    tokio::time::sleep(Duration::from_millis(950)).await;
+    drop(guard_a);
+
+    let guard_b = waiter
+        .await
+        .expect("owner-b wait task should complete")
+        .expect("owner-b should acquire after a late release within the original timeout");
+
+    drop(guard_b);
 }
 
 #[test]
@@ -742,6 +1084,68 @@ async fn test_namespace_lock_distributed_write_lock_fails_with_two_nodes_one_off
     assert!(
         err_str.contains("quorum") || err_str.contains("not reached"),
         "expected quorum error, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_remote_rpc_failures_retry_before_final_quorum_failure() {
+    let manager = Arc::new(GlobalLockManager::new());
+    let client_ok: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(manager));
+    let client_rpc_failed: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC failed: connection refused",
+    });
+    let client_rpc_timed_out: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC timed out: RPC timed out after 50ms",
+    });
+    let client_rpc_failed_2: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Remote lock RPC failed: transport error",
+    });
+    let clients: Vec<Arc<dyn LockClient>> = vec![client_ok, client_rpc_failed, client_rpc_timed_out, client_rpc_failed_2];
+    let lock = NamespaceLock::with_clients("remote-rpc-hard-failure".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-rpc-hard-failure");
+
+    let started = tokio::time::Instant::now();
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_secs(1))
+        .await
+        .expect_err("persistent remote RPC failures should end as quorum failure");
+
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "remote RPC failures should be retried before final quorum failure"
+    );
+    let err_str = err.to_string().to_lowercase();
+    assert!(
+        err_str.contains("quorum") || err_str.contains("not reached"),
+        "expected final quorum failure, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_namespace_lock_distributed_contention_quorum_miss_times_out() {
+    let client_timeout_1: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let client_timeout_2: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let client_timeout_3: Arc<dyn LockClient> = Arc::new(FailureResponseClient {
+        error: "Lock acquisition timeout",
+    });
+    let clients: Vec<Arc<dyn LockClient>> = vec![client_timeout_1, client_timeout_2, client_timeout_3];
+    let lock = NamespaceLock::with_clients("contention-timeout".to_string(), clients);
+    let resource = create_test_object_key("bucket", "object-contention-timeout");
+
+    let err = lock
+        .get_write_lock(resource, "owner-a", Duration::from_millis(40))
+        .await
+        .expect_err("ordinary contention should exhaust acquire timeout");
+
+    let err_str = err.to_string().to_lowercase();
+    assert!(err_str.contains("timeout"), "expected timeout after contention retries, got: {err}");
+    assert!(
+        !err_str.contains("quorum not reached"),
+        "ordinary contention should not surface as quorum loss: {err}"
     );
 }
 
@@ -908,7 +1312,7 @@ async fn test_namespace_lock_distributed_read_lock_returns_after_quorum_without_
 }
 
 #[tokio::test]
-async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_late_successes() {
+async fn test_namespace_lock_distributed_failure_retries_and_cleans_up_late_successes() {
     let manager_fast = Arc::new(GlobalLockManager::new());
     let manager_slow = Arc::new(GlobalLockManager::new());
 
@@ -933,8 +1337,8 @@ async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_lat
         .expect_err("write lock should fail when quorum becomes impossible");
 
     assert!(
-        started.elapsed() < Duration::from_millis(150),
-        "write lock should fail as soon as quorum becomes impossible"
+        started.elapsed() >= Duration::from_millis(250),
+        "write lock should retry before final quorum failure"
     );
     let err_str = err.to_string().to_lowercase();
     assert!(
@@ -951,4 +1355,95 @@ async fn test_namespace_lock_distributed_failure_returns_early_and_cleans_up_lat
         .expect("late successful write lock should be cleaned up after early quorum failure");
 
     drop(write_guard);
+}
+
+// C1 -- a long-held write lock survives past its ttl thanks to the heartbeat; a
+// contender fails to steal it while it is held (#899 direct regression).
+// Without a heartbeat: owner-a's per-node entries expire after ttl, owner-b triggers
+// reclaim and steals it -> contended.is_some() -> assertion fails (red). Once fixed the
+// entries stay refreshed -> is_none() (green).
+#[tokio::test]
+async fn distributed_write_lock_survives_past_ttl_with_heartbeat() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let clients = managers
+        .iter()
+        .map(|m| Arc::new(LocalClient::with_manager(m.clone())) as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = Arc::new(NamespaceLock::with_clients("heartbeat-keepalive".to_string(), clients));
+    let resource = create_test_object_key("bucket", "object-heartbeat-keepalive");
+
+    let req_a = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-a")
+        .with_acquire_timeout(Duration::from_millis(200))
+        .with_ttl(Duration::from_millis(150))
+        .with_refresh_interval(Duration::from_millis(40)); // < ttl -> spawn heartbeat
+
+    let guard_a = lock
+        .acquire_guard(&req_a)
+        .await
+        .expect("owner-a acquire should not error")
+        .expect("owner-a should hold the distributed write lock");
+
+    tokio::time::sleep(Duration::from_millis(400)).await; // hold well past a single ttl window
+
+    let req_b = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+        .with_acquire_timeout(Duration::from_millis(150))
+        .with_ttl(Duration::from_millis(150));
+    let contended = lock.acquire_guard(&req_b).await.expect("owner-b acquire should not error");
+    assert!(
+        contended.is_none(),
+        "heartbeat must keep owner-a's lock alive; owner-b must not steal it past ttl"
+    );
+
+    drop(guard_a);
+    let mut acquired_after_release = false;
+    for _ in 0..20 {
+        let req_c = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-b")
+            .with_acquire_timeout(Duration::from_millis(150))
+            .with_ttl(Duration::from_millis(150));
+        if let Some(g) = lock.acquire_guard(&req_c).await.expect("acquire should not error") {
+            drop(g);
+            acquired_after_release = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(acquired_after_release, "after owner-a releases, owner-b must eventually acquire");
+}
+
+// C2 -- a crashed owner (leaving orphan entries that are never refreshed again) has its
+// lock eventually reclaimed; no permanent deadlock (#698 scavenger). Must stay green.
+#[tokio::test]
+async fn crashed_owner_distributed_lock_is_reclaimed() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let node_clients = managers
+        .iter()
+        .map(|m| Arc::new(LocalClient::with_manager(m.clone())))
+        .collect::<Vec<_>>();
+    let resource = create_test_object_key("bucket", "object-crashed-owner");
+
+    // Simulate a dead coordinator: plant short-ttl orphan entries on each node backend,
+    // then never refresh them.
+    for c in &node_clients {
+        let orphan = LockRequest::new(resource.clone(), LockType::Exclusive, "dead-owner").with_ttl(Duration::from_millis(60));
+        let resp = c.acquire_lock(&orphan).await.expect("orphan acquire");
+        assert!(resp.success, "orphan entry should be planted on each node");
+    }
+
+    tokio::time::sleep(Duration::from_millis(120)).await; // ttl elapses
+
+    let clients = node_clients
+        .iter()
+        .map(|c| c.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::with_clients("crashed-owner-recovery".to_string(), clients);
+
+    let req_new = LockRequest::new(resource.clone(), LockType::Exclusive, "owner-live")
+        .with_acquire_timeout(Duration::from_millis(300))
+        .with_ttl(Duration::from_millis(150));
+    let recovered = lock
+        .acquire_guard(&req_new)
+        .await
+        .expect("acquire should not error")
+        .expect("stale orphan entries must be reclaimed; no permanent deadlock (#698)");
+    drop(recovered);
 }

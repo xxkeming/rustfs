@@ -30,7 +30,6 @@
       systems = [
         "x86_64-linux"
         "aarch64-linux"
-        "x86_64-darwin"
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
@@ -60,7 +59,7 @@
         {
           default = rustPlatform.buildRustPackage {
             pname = "rustfs";
-            version = "0.0.5";
+            version = "1.0.0-rc.4";
 
             src = ./.;
 
@@ -85,7 +84,6 @@
 
             # Set environment variables for build
             PROTOC = "${pkgs.protobuf}/bin/protoc";
-            RUSTFLAGS = "--cfg tokio_unstable";
 
             doCheck = false;
 
@@ -123,7 +121,6 @@
             ];
 
             PROTOC = "${pkgs.protobuf}/bin/protoc";
-            RUSTFLAGS = "--cfg tokio_unstable";
           };
         }
       );

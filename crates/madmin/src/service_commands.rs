@@ -19,7 +19,6 @@ use hyper::Uri;
 use crate::{trace::TraceType, utils::parse_duration};
 
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct ServiceTraceOpts {
     s3: bool,
     internal: bool,
@@ -41,9 +40,8 @@ pub struct ServiceTraceOpts {
     threshold: Duration,
 }
 
-#[allow(dead_code)]
 impl ServiceTraceOpts {
-    fn trace_types(&self) -> TraceType {
+    pub fn trace_types(&self) -> TraceType {
         let mut tt = TraceType::default();
         tt.set_if(self.s3, &TraceType::S3);
         tt.set_if(self.internal, &TraceType::INTERNAL);
@@ -72,6 +70,14 @@ impl ServiceTraceOpts {
         tt
     }
 
+    pub fn only_errors(&self) -> bool {
+        self.only_errors
+    }
+
+    pub fn threshold(&self) -> Duration {
+        self.threshold
+    }
+
     pub fn parse_params(&mut self, uri: &Uri) -> Result<(), String> {
         let query_pairs: HashMap<_, _> = uri
             .query()
@@ -93,13 +99,6 @@ impl ServiceTraceOpts {
         self.batch_replication = query_pairs.get("batch-replication").is_some_and(|v| v == "true");
         self.batch_key_rotation = query_pairs.get("batch-keyrotation").is_some_and(|v| v == "true");
         self.batch_expire = query_pairs.get("batch-expire").is_some_and(|v| v == "true");
-        if query_pairs.get("all").is_some_and(|v| v == "true") {
-            self.s3 = true;
-            self.internal = true;
-            self.storage = true;
-            self.os = true;
-        }
-
         self.rebalance = query_pairs.get("rebalance").is_some_and(|v| v == "true");
         self.storage = query_pairs.get("storage").is_some_and(|v| v == "true");
         self.internal = query_pairs.get("internal").is_some_and(|v| v == "true");
@@ -109,11 +108,37 @@ impl ServiceTraceOpts {
         self.ftp = query_pairs.get("ftp").is_some_and(|v| v == "true");
         self.ilm = query_pairs.get("ilm").is_some_and(|v| v == "true");
 
+        if query_pairs.get("all").is_some_and(|v| v == "true") {
+            self.s3 = true;
+            self.internal = true;
+            self.storage = true;
+            self.os = true;
+        }
+
         if let Some(threshold) = query_pairs.get("threshold") {
             let duration = parse_duration(threshold)?;
             self.threshold = duration;
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_params_all_true_keeps_internal_and_storage_enabled() {
+        let uri: Uri = "/trace?all=true".parse().expect("valid uri");
+        let mut opts = ServiceTraceOpts::default();
+
+        opts.parse_params(&uri).expect("all=true should parse");
+        let trace_types = opts.trace_types();
+
+        assert!(trace_types.contains(&TraceType::S3));
+        assert!(trace_types.contains(&TraceType::INTERNAL));
+        assert!(trace_types.contains(&TraceType::STORAGE));
+        assert!(trace_types.contains(&TraceType::OS));
     }
 }

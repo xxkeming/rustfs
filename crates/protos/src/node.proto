@@ -21,6 +21,17 @@ message Error {
   string error_info = 2;
 }
 
+// Typed control-plane error discriminants carried alongside the legacy
+// error_info string on control-plane responses. Rolling-upgrade compat:
+// old peers ignore the field and keep reading error_info.
+// RUSTFS_COMPAT_TODO(not-initialized-error-code-v1): legacy string dual-write. Remove after the minimum supported RustFS peer version always sends error_code.
+enum ControlPlaneErrorCode {
+  CONTROL_PLANE_ERROR_UNSPECIFIED = 0;
+  // The peer answered but its storage/IAM layer is not initialized yet
+  // (legacy string form: "errServerNotInitialized").
+  CONTROL_PLANE_ERROR_NOT_INITIALIZED = 1;
+}
+
 message PingRequest {
   uint64 version = 1;
   bytes body = 2;
@@ -74,6 +85,7 @@ message GetBucketInfoResponse {
 
 message DeleteBucketRequest {
   string bucket = 1;
+  string options = 2;
 }
 
 message DeleteBucketResponse {
@@ -110,6 +122,9 @@ message DeleteRequest {
   string volume = 2;
   string path = 3;
   string options = 4;
+  // Optional scanner publication lease token. When present, the target binds
+  // the complete delete operation to its movement read admission.
+  bytes scanner_publication_lease_token = 5;
 }
 
 message DeleteResponse {
@@ -165,6 +180,32 @@ message RenamePartRequest {
 }
 
 message RenamePartResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
+message PreparePartTransactionRequest {
+  string disk = 1;
+  string src_volume = 2;
+  string src_path = 3;
+  string dst_volume = 4;
+  string dst_path = 5;
+  bytes meta = 6;
+}
+
+message PreparePartTransactionResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
+message SettlePartTransactionRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bool rollback = 4;
+}
+
+message SettlePartTransactionResponse {
   bool success = 1;
   optional Error error = 2;
 }
@@ -253,12 +294,18 @@ message RenameDataRequest {
   string file_info = 4;
   string dst_volume = 5;
   string dst_path = 6;
+  bytes file_info_bin = 7;
+  // Optional target-side scanner publication lease.  Empty preserves the
+  // legacy rename request body; a non-empty token is checked at the target's
+  // rename linearization point.
+  bytes scanner_publication_lease_token = 8;
 }
 
 message RenameDataResponse {
   bool success = 1;
   string rename_data_resp = 2;
   optional Error error = 3;
+  bytes rename_data_resp_bin = 4;
 }
 
 message MakeVolumesRequest {
@@ -309,6 +356,40 @@ message DeletePathsRequest {
 }
 
 message DeletePathsResponse {
+  bool success = 1;
+  optional Error error = 2;
+}
+
+message SnapshotLeaseRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  uint64 ttl_ms = 4;
+}
+
+message SnapshotLeaseRenewRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bytes token = 4;
+  uint64 ttl_ms = 5;
+}
+
+message SnapshotLeaseReleaseRequest {
+  string disk = 1;
+  string volume = 2;
+  string path = 3;
+  bytes token = 4;
+}
+
+message SnapshotLeaseResponse {
+  bool success = 1;
+  bytes token = 2;
+  uint32 protocol_version = 3;
+  optional Error error = 4;
+}
+
+message SnapshotLeaseMutationResponse {
   bool success = 1;
   optional Error error = 2;
 }
@@ -369,6 +450,19 @@ message ReadVersionResponse {
   bytes file_info_bin = 4;
 }
 
+message BatchReadVersionRequest {
+  string disk = 1;
+  string batch_read_version_req = 2;
+  bytes batch_read_version_req_bin = 3;
+}
+
+message BatchReadVersionResponse {
+  bool success = 1;
+  repeated string batch_read_version_resps = 2;
+  optional Error error = 3;
+  repeated bytes batch_read_version_resps_bin = 4;
+}
+
 message ReadXLRequest {
   string disk = 1;
   string volume = 2;
@@ -390,6 +484,10 @@ message DeleteVersionRequest {
   string file_info = 4;
   bool force_del_marker = 5;
   string opts = 6;
+  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
+  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  bytes file_info_bin = 7;
+  bytes opts_bin = 8;
 }
 
 message DeleteVersionResponse {
@@ -403,12 +501,19 @@ message DeleteVersionsRequest {
   string volume = 2;
   repeated string versions = 3;
   string opts = 4;
+  // msgpack payloads mirroring the JSON fields above (grpc-optimization P2). Senders dual-write
+  // both; receivers prefer the *_bin form and fall back to the JSON string when it is empty.
+  repeated bytes versions_bin = 5;
+  bytes opts_bin = 6;
 }
 
 message DeleteVersionsResponse {
   bool success = 1;
   repeated string errors = 2;
   optional Error error = 3;
+  // Senders dual-write the legacy strings and typed entries. Receivers prefer typed entries
+  // when present and fall back to strings for peers that predate this field. Code zero means success.
+  repeated Error item_errors = 4;
 }
 
 message ReadMultipleRequest {
@@ -427,6 +532,10 @@ message ReadMultipleResponse {
 message DeleteVolumeRequest {
   string disk = 1;
   string volume = 2;
+  // When false (default), a non-empty volume is refused (VolumeNotEmpty); when
+  // true, the volume is deleted recursively. Old peers omit this field, which
+  // decodes to false — the safe, non-recursive behavior (backlog#799 B1).
+  bool force = 3;
 }
 
 message DeleteVolumeResponse {
@@ -482,6 +591,7 @@ message LocalStorageInfoResponse {
   bool success = 1;
   bytes storage_info = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
 }
 
 message ServerInfoRequest {
@@ -622,11 +732,13 @@ message GetAllBucketStatsResponse {
 
 message LoadBucketMetadataRequest {
   string bucket = 1;
+  bool scanner_maintenance_change = 2;
 }
 
 message LoadBucketMetadataResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteBucketMetadataRequest {
@@ -645,6 +757,7 @@ message DeletePolicyRequest {
 message DeletePolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyRequest {
@@ -654,6 +767,7 @@ message LoadPolicyRequest {
 message LoadPolicyResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadPolicyMappingRequest {
@@ -665,6 +779,7 @@ message LoadPolicyMappingRequest {
 message LoadPolicyMappingResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteUserRequest {
@@ -674,6 +789,7 @@ message DeleteUserRequest {
 message DeleteUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message DeleteServiceAccountRequest {
@@ -683,6 +799,7 @@ message DeleteServiceAccountRequest {
 message DeleteServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadUserRequest {
@@ -693,6 +810,7 @@ message LoadUserRequest {
 message LoadUserResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadServiceAccountRequest {
@@ -702,6 +820,7 @@ message LoadServiceAccountRequest {
 message LoadServiceAccountResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadGroupRequest {
@@ -711,6 +830,7 @@ message LoadGroupRequest {
 message LoadGroupResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message ReloadSiteReplicationConfigRequest {}
@@ -718,6 +838,7 @@ message ReloadSiteReplicationConfigRequest {}
 message ReloadSiteReplicationConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message SignalServiceRequest {
@@ -727,14 +848,110 @@ message SignalServiceRequest {
 message SignalServiceResponse {
   bool success = 1;
   optional string error_info = 2;
+  uint32 protocol_version = 3;
+  // Redacted fingerprint of the KMS configuration this node is running.
+  // Only set for the "kms" dynamic config subsystem, and left unset when the
+  // responder has no KMS configuration. Peers built before that subsystem
+  // reject the signal outright rather than answering without this field.
+  optional string config_fingerprint = 4;
 }
 
-message BackgroundHealStatusRequest {}
+message ScannerActivityRequest {
+  bytes challenge = 1;
+  uint32 protocol_version = 2;
+  string acknowledge_instance_id = 3;
+  uint64 acknowledge_dirty_usage_generation = 4;
+}
+
+message ScannerActivityResponse {
+  string instance_id = 1;
+  uint64 namespace_generation = 2;
+  uint64 maintenance_generation = 3;
+  uint32 protocol_version = 4;
+  bytes topology_digest = 5;
+  bool data_movement_active = 6;
+  bytes response_proof = 7;
+  uint64 dirty_usage_generation = 8;
+  bool dirty_usage_pending = 9;
+  // v7 fields.  They are optional so v6 peers can continue to decode the
+  // response shape while newer readers fail closed when they are absent.
+  optional uint64 movement_generation = 10;
+  optional bool publication_blocked = 11;
+}
+
+// A short-lived storage-owned read admission used only around a final
+// scanner metadata publication.  It is intentionally separate from the
+// ScannerActivity observation wire so v6/v7 rolling compatibility remains
+// unchanged.
+message ScannerPublicationLeaseRequest {
+  bytes challenge = 1;
+  uint64 expected_movement_generation = 2;
+  uint64 ttl_ms = 3;
+  // The activity instance is a process session nonce.  It is intentionally
+  // separate from the storage-owned deployment identity returned by the
+  // lease response so a restart cannot reuse an old session token.
+  string expected_session_id = 4;
+  // A non-empty token turns the acquire RPC into an in-place validation of an
+  // existing lease.  Keeping this on the existing RPC lets old peers reject
+  // the proof without changing the v7 activity wire shape.
+  bytes token = 5;
+}
+
+message ScannerPublicationLeaseResponse {
+  bool success = 1;
+  bytes token = 2;
+  uint64 movement_generation = 3;
+  uint64 lease_ttl_ms = 4;
+  optional Error error = 5;
+  bytes response_proof = 6;
+  string owner_id = 7;
+  string session_id = 8;
+}
+
+message ScannerPublicationLeaseReleaseRequest {
+  bytes challenge = 1;
+  bytes token = 2;
+  string owner_id = 3;
+  string session_id = 4;
+}
+
+message ScannerPublicationLeaseReleaseResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes response_proof = 3;
+}
+
+message BackgroundHealStatusRequest {
+  uint32 protocol_version = 1;
+}
 
 message BackgroundHealStatusResponse {
   bool success = 1;
   bytes bg_heal_state = 2;
   optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
+}
+
+message ReplacementRecoveryStatusRequest {}
+
+message ReplacementRecoveryStatusResponse {
+  bool success = 1;
+  bytes recovery_status = 2;
+  optional string error_info = 3;
+  optional ControlPlaneErrorCode error_code = 4;
+}
+
+message HealControlRequest {
+  uint32 version = 1;
+  string topology_fingerprint = 2;
+  bytes command = 3;
+}
+
+message HealControlResponse {
+  bool success = 1;
+  bytes result = 2;
+  optional string error_info = 3;
+  bytes response_proof = 4;
 }
 
 message GetMetacacheListingRequest {
@@ -762,13 +979,17 @@ message ReloadPoolMetaRequest {}
 message ReloadPoolMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
-message StopRebalanceRequest {}
+message StopRebalanceRequest {
+  string expected_rebalance_id = 1;
+}
 
 message StopRebalanceResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadRebalanceMetaRequest {
@@ -778,6 +999,37 @@ message LoadRebalanceMetaRequest {
 message LoadRebalanceMetaResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
+}
+
+message StartDecommissionRequest {
+  repeated uint32 pool_indices = 1;
+}
+
+message StartDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
+}
+
+message CancelDecommissionRequest {
+  uint32 pool_index = 1;
+}
+
+message CancelDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
+}
+
+message ClearDecommissionRequest {
+  uint32 pool_index = 1;
+}
+
+message ClearDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
 }
 
 message LoadTransitionTierConfigRequest {}
@@ -785,6 +1037,40 @@ message LoadTransitionTierConfigRequest {}
 message LoadTransitionTierConfigResponse {
   bool success = 1;
   optional string error_info = 2;
+  optional ControlPlaneErrorCode error_code = 3;
+}
+
+message TierMutationPrepareRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+message TierMutationCommitRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+message TierMutationAbortRequest {
+  uint32 version = 1;
+  string mutation_id = 2;
+  bytes canonical_payload = 3;
+}
+
+enum TierMutationPeerState {
+  TIER_MUTATION_PEER_STATE_UNSPECIFIED = 0;
+  TIER_MUTATION_PEER_STATE_PREPARED = 1;
+  TIER_MUTATION_PEER_STATE_COMMITTED = 2;
+  TIER_MUTATION_PEER_STATE_ABORTED = 3;
+}
+
+message TierMutationControlResponse {
+  bool success = 1;
+  TierMutationPeerState state = 2;
+  bool applied = 3;
+  optional string error_info = 4;
+  bytes response_proof = 5;
 }
 
 message GetLiveEventsRequest {
@@ -804,95 +1090,118 @@ message GetLiveEventsResponse {
 
 service NodeService {
 /* -------------------------------meta service-------------------------- */
-  rpc Ping(PingRequest) returns (PingResponse) {};
-  rpc HealBucket(HealBucketRequest) returns (HealBucketResponse) {};
-  rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {};
-  rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {};
-  rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {};
-  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse) {};
+  rpc Ping(PingRequest) returns (PingResponse) {}; // auth-policy: read-only
+  rpc HealBucket(HealBucketRequest) returns (HealBucketResponse) {}; // auth-policy: body-bound
+  rpc ListBucket(ListBucketRequest) returns (ListBucketResponse) {}; // auth-policy: read-only
+  rpc MakeBucket(MakeBucketRequest) returns (MakeBucketResponse) {}; // auth-policy: body-bound
+  rpc GetBucketInfo(GetBucketInfoRequest) returns (GetBucketInfoResponse) {}; // auth-policy: read-only
+  rpc DeleteBucket(DeleteBucketRequest) returns (DeleteBucketResponse) {}; // auth-policy: body-bound
 
 /* -------------------------------disk service-------------------------- */
 
-  rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {};
-  rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {};
-  rpc Delete(DeleteRequest) returns (DeleteResponse) {};
-  rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {};
-  rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {};
-  rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {};
-  rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {};
-  rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {};
-  rpc Write(WriteRequest) returns (WriteResponse) {};
-  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {};
+  rpc ReadAll(ReadAllRequest) returns (ReadAllResponse) {}; // auth-policy: read-only
+  rpc WriteAll(WriteAllRequest) returns (WriteAllResponse) {}; // auth-policy: body-bound
+  rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
+  rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc ReleaseSnapshotLease(SnapshotLeaseReleaseRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
+  rpc VerifyFile(VerifyFileRequest) returns (VerifyFileResponse) {}; // auth-policy: read-only
+  rpc ReadParts(ReadPartsRequest) returns (ReadPartsResponse) {}; // auth-policy: read-only
+  rpc CheckParts(CheckPartsRequest) returns (CheckPartsResponse) {}; // auth-policy: read-only
+  rpc PreparePartTransaction(PreparePartTransactionRequest) returns (PreparePartTransactionResponse) {}; // auth-policy: body-bound
+  rpc RenamePart(RenamePartRequest) returns (RenamePartResponse) {}; // auth-policy: body-bound
+  rpc SettlePartTransaction(SettlePartTransactionRequest) returns (SettlePartTransactionResponse) {}; // auth-policy: body-bound
+  rpc RenameFile(RenameFileRequest) returns (RenameFileResponse) {}; // auth-policy: body-bound
+  rpc Write(WriteRequest) returns (WriteResponse) {}; // auth-policy: unimplemented
+  rpc WriteStream(stream WriteRequest) returns (stream WriteResponse) {}; // auth-policy: streaming
 //  rpc Append(AppendRequest) returns (AppendResponse) {};
-  rpc ReadAt(stream ReadAtRequest) returns (stream ReadAtResponse) {};
-  rpc ListDir(ListDirRequest) returns (ListDirResponse) {};
-  rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {};
-  rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {};
-  rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {};
-  rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {};
-  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {};
-  rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {};
-  rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse) {};
-  rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {};
-  rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {};
-  rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
-  rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
-  rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
-  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {};
-  rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};
-  rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {};
-  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {};
-  rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {};
+  rpc ReadAt(stream ReadAtRequest) returns (stream ReadAtResponse) {}; // auth-policy: streaming
+  rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
+  rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
+  rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
+  rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
+  rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only
+  rpc StatVolume(StatVolumeRequest) returns (StatVolumeResponse) {}; // auth-policy: read-only
+  rpc DeletePaths(DeletePathsRequest) returns (DeletePathsResponse) {}; // auth-policy: body-bound
+  rpc UpdateMetadata(UpdateMetadataRequest) returns (UpdateMetadataResponse) {}; // auth-policy: body-bound
+  rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {}; // auth-policy: read-only
+  rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {}; // auth-policy: body-bound
+  rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {}; // auth-policy: read-only
+  rpc BatchReadVersion(BatchReadVersionRequest) returns (BatchReadVersionResponse) {}; // auth-policy: read-only
+  rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {}; // auth-policy: read-only
+  rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
+  rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {}; // auth-policy: body-bound
+  rpc ReadMultiple(ReadMultipleRequest) returns (ReadMultipleResponse) {}; // auth-policy: read-only
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}; // auth-policy: body-bound
+  rpc DiskInfo(DiskInfoRequest) returns (DiskInfoResponse) {}; // auth-policy: read-only
   
 
 /* -------------------------------lock service-------------------------- */
 
-  rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {};
-  rpc LockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
-  rpc UnLockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {};
+  rpc Lock(GenerallyLockRequest) returns (GenerallyLockResponse) {}; // auth-policy: body-bound
+  rpc UnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {}; // auth-policy: body-bound
+  rpc ForceUnLock(GenerallyLockRequest) returns (GenerallyLockResponse) {}; // auth-policy: body-bound
+  rpc Refresh(GenerallyLockRequest) returns (GenerallyLockResponse) {}; // auth-policy: body-bound
+  rpc LockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {}; // auth-policy: body-bound
+  rpc UnLockBatch(BatchGenerallyLockRequest) returns (BatchGenerallyLockResponse) {}; // auth-policy: body-bound
 
 /* -------------------------------peer rest service-------------------------- */
 
-  rpc LocalStorageInfo(LocalStorageInfoRequest) returns (LocalStorageInfoResponse) {};
-  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse) {};
-  rpc GetCpus(GetCpusRequest) returns (GetCpusResponse) {};
-  rpc GetNetInfo(GetNetInfoRequest) returns (GetNetInfoResponse) {};
-  rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse) {};
-  rpc GetOsInfo(GetOsInfoRequest) returns (GetOsInfoResponse) {};
-  rpc GetSELinuxInfo(GetSELinuxInfoRequest) returns (GetSELinuxInfoResponse) {};
-  rpc GetSysConfig(GetSysConfigRequest) returns (GetSysConfigResponse) {};
-  rpc GetSysErrors(GetSysErrorsRequest) returns (GetSysErrorsResponse) {};
-  rpc GetMemInfo(GetMemInfoRequest) returns (GetMemInfoResponse) {};
-  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse) {};
-  rpc GetProcInfo(GetProcInfoRequest) returns (GetProcInfoResponse) {};
-  rpc StartProfiling(StartProfilingRequest) returns (StartProfilingResponse) {};
-  rpc DownloadProfileData(DownloadProfileDataRequest) returns (DownloadProfileDataResponse) {};
-  rpc GetBucketStats(GetBucketStatsDataRequest) returns (GetBucketStatsDataResponse) {};
-  rpc GetSRMetrics(GetSRMetricsDataRequest) returns (GetSRMetricsDataResponse) {};
-  rpc GetAllBucketStats(GetAllBucketStatsRequest) returns (GetAllBucketStatsResponse) {};
-  rpc LoadBucketMetadata(LoadBucketMetadataRequest) returns (LoadBucketMetadataResponse) {};
-  rpc DeleteBucketMetadata(DeleteBucketMetadataRequest) returns (DeleteBucketMetadataResponse) {};
-  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {};
-  rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse) {};
-  rpc LoadPolicyMapping(LoadPolicyMappingRequest) returns (LoadPolicyMappingResponse) {};
-  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {};
-  rpc DeleteServiceAccount(DeleteServiceAccountRequest) returns (DeleteServiceAccountResponse) {};
-  rpc LoadUser(LoadUserRequest) returns (LoadUserResponse) {};
-  rpc LoadServiceAccount(LoadServiceAccountRequest) returns (LoadServiceAccountResponse) {};
-  rpc LoadGroup(LoadGroupRequest) returns (LoadGroupResponse) {};
-  rpc ReloadSiteReplicationConfig(ReloadSiteReplicationConfigRequest) returns (ReloadSiteReplicationConfigResponse) {};
+  rpc LocalStorageInfo(LocalStorageInfoRequest) returns (LocalStorageInfoResponse) {}; // auth-policy: read-only
+  rpc ServerInfo(ServerInfoRequest) returns (ServerInfoResponse) {}; // auth-policy: read-only
+  rpc GetCpus(GetCpusRequest) returns (GetCpusResponse) {}; // auth-policy: read-only
+  rpc GetNetInfo(GetNetInfoRequest) returns (GetNetInfoResponse) {}; // auth-policy: read-only
+  rpc GetPartitions(GetPartitionsRequest) returns (GetPartitionsResponse) {}; // auth-policy: read-only
+  rpc GetOsInfo(GetOsInfoRequest) returns (GetOsInfoResponse) {}; // auth-policy: read-only
+  rpc GetSELinuxInfo(GetSELinuxInfoRequest) returns (GetSELinuxInfoResponse) {}; // auth-policy: read-only
+  rpc GetSysConfig(GetSysConfigRequest) returns (GetSysConfigResponse) {}; // auth-policy: read-only
+  rpc GetSysErrors(GetSysErrorsRequest) returns (GetSysErrorsResponse) {}; // auth-policy: read-only
+  rpc GetMemInfo(GetMemInfoRequest) returns (GetMemInfoResponse) {}; // auth-policy: read-only
+  rpc GetMetrics(GetMetricsRequest) returns (GetMetricsResponse) {}; // auth-policy: read-only
+  rpc GetProcInfo(GetProcInfoRequest) returns (GetProcInfoResponse) {}; // auth-policy: read-only
+  rpc StartProfiling(StartProfilingRequest) returns (StartProfilingResponse) {}; // auth-policy: unimplemented
+  rpc DownloadProfileData(DownloadProfileDataRequest) returns (DownloadProfileDataResponse) {}; // auth-policy: unimplemented
+  rpc GetBucketStats(GetBucketStatsDataRequest) returns (GetBucketStatsDataResponse) {}; // auth-policy: read-only
+  rpc GetSRMetrics(GetSRMetricsDataRequest) returns (GetSRMetricsDataResponse) {}; // auth-policy: unimplemented
+  rpc GetAllBucketStats(GetAllBucketStatsRequest) returns (GetAllBucketStatsResponse) {}; // auth-policy: unimplemented
+  rpc LoadBucketMetadata(LoadBucketMetadataRequest) returns (LoadBucketMetadataResponse) {}; // auth-policy: body-bound
+  rpc DeleteBucketMetadata(DeleteBucketMetadataRequest) returns (DeleteBucketMetadataResponse) {}; // auth-policy: body-bound
+  rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {}; // auth-policy: body-bound
+  rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse) {}; // auth-policy: body-bound
+  rpc LoadPolicyMapping(LoadPolicyMappingRequest) returns (LoadPolicyMappingResponse) {}; // auth-policy: body-bound
+  rpc DeleteUser(DeleteUserRequest) returns (DeleteUserResponse) {}; // auth-policy: body-bound
+  rpc DeleteServiceAccount(DeleteServiceAccountRequest) returns (DeleteServiceAccountResponse) {}; // auth-policy: body-bound
+  rpc LoadUser(LoadUserRequest) returns (LoadUserResponse) {}; // auth-policy: body-bound
+  rpc LoadServiceAccount(LoadServiceAccountRequest) returns (LoadServiceAccountResponse) {}; // auth-policy: body-bound
+  rpc LoadGroup(LoadGroupRequest) returns (LoadGroupResponse) {}; // auth-policy: body-bound
+  rpc ReloadSiteReplicationConfig(ReloadSiteReplicationConfigRequest) returns (ReloadSiteReplicationConfigResponse) {}; // auth-policy: body-bound
   // rpc VerifyBinary() returns () {};
   // rpc CommitBinary() returns () {};
-  rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {};
-  rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {};
-  rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {};
-  rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {};
-  rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {};
-  rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {};
-  rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {};
-  rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
-  rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
+  rpc SignalService(SignalServiceRequest) returns (SignalServiceResponse) {}; // auth-policy: body-bound
+  rpc ScannerActivity(ScannerActivityRequest) returns (ScannerActivityResponse) {}; // auth-policy: body-bound
+  rpc AcquireScannerPublicationLease(ScannerPublicationLeaseRequest) returns (ScannerPublicationLeaseResponse) {}; // auth-policy: body-bound
+  rpc ReleaseScannerPublicationLease(ScannerPublicationLeaseReleaseRequest) returns (ScannerPublicationLeaseReleaseResponse) {}; // auth-policy: body-bound
+  rpc BackgroundHealStatus(BackgroundHealStatusRequest) returns (BackgroundHealStatusResponse) {}; // auth-policy: read-only
+  rpc ReplacementRecoveryStatus(ReplacementRecoveryStatusRequest) returns (ReplacementRecoveryStatusResponse) {}; // auth-policy: read-only
+  rpc GetMetacacheListing(GetMetacacheListingRequest) returns (GetMetacacheListingResponse) {}; // auth-policy: unimplemented
+  rpc UpdateMetacacheListing(UpdateMetacacheListingRequest) returns (UpdateMetacacheListingResponse) {}; // auth-policy: unimplemented
+  rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {}; // auth-policy: body-bound
+  rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {}; // auth-policy: body-bound
+  rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {}; // auth-policy: body-bound
+  rpc StartDecommission(StartDecommissionRequest) returns (StartDecommissionResponse) {}; // auth-policy: body-bound
+  rpc CancelDecommission(CancelDecommissionRequest) returns (CancelDecommissionResponse) {}; // auth-policy: body-bound
+  rpc ClearDecommission(ClearDecommissionRequest) returns (ClearDecommissionResponse) {}; // auth-policy: body-bound
+  rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {}; // auth-policy: body-bound
+  rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {}; // auth-policy: read-only
+}
+
+service HealControlService {
+  rpc HealControl(HealControlRequest) returns (HealControlResponse) {};
+}
+
+service TierMutationControlService {
+  rpc PrepareTierMutation(TierMutationPrepareRequest) returns (TierMutationControlResponse) {};
+  rpc CommitTierMutation(TierMutationCommitRequest) returns (TierMutationControlResponse) {};
+  rpc AbortTierMutation(TierMutationAbortRequest) returns (TierMutationControlResponse) {};
 }
